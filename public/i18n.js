@@ -1,5 +1,20 @@
 // UI-only language preference. Model IDs, provider names and user input are never translated.
 export const messages = {
+"设置正在保存，请稍后重试": "Settings are being saved. Try again shortly.",
+"启用后使用设置的用户名和密码登录。关闭后，能够访问此地址的人都可以管理模型港。": "When enabled, use the configured username and password. When disabled, anyone who can reach this address can manage Model Harbor.",
+"登录用户名": "Login username",
+"新密码": "New password",
+"确认新密码": "Confirm new password",
+"留空保留当前密码": "Leave blank to keep current password",
+"新密码至少 8 个字符，留空保留当前密码。修改账号后需重新登录。": "Use at least 8 characters. Leave blank to keep the current password. Sign in again after changing credentials.",
+"两次输入的新密码不一致": "The new passwords do not match.",
+"设置已保存，请使用新账号密码重新登录。": "Settings saved. Sign in again with your new credentials.",
+"重新登录": "Sign in again",
+"登录开关必须为布尔值": "The login setting must be a boolean.",
+"用户名须为 1–64 个字符，不能包含空格、冒号或控制字符": "Use 1\u201364 characters without whitespace, colons or control characters for the username.",
+"新密码须为 8–256 个字符，不能包含控制字符": "Use 8\u2013256 characters without control characters for the new password.",
+"请先设置登录密码": "Set a login password first.",
+
 "设置": "Settings",
 "登录设置": "Login settings",
 "控制管理页面是否需要用户名和密码。": "Choose whether administration requires a username and password.",

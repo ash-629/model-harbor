@@ -18,7 +18,7 @@ cd model-harbor
 npm start
 ```
 
-打开 http://127.0.0.1:8317/。默认仅监听回环地址，未配置管理密码时本机管理页面无需登录。需要登录时，在启动进程的环境变量中设置 `GATEWAY_ADMIN_PASSWORD`；用户名为 `admin`。Node 启动不会自动加载 `.env`，可用 Node 22 的 `node --env-file=.env src/server.js`。
+打开 http://127.0.0.1:8317/。默认仅监听回环地址，未配置管理密码时本机管理页面无需登录。需要登录时，在启动进程的环境变量中设置 `GATEWAY_ADMIN_PASSWORD`；初始用户名为 `admin`。可在“设置”中修改用户名和密码，密码留空保留当前值。新密码至少 8 个字符，保存后需使用新凭据重新登录。Node 启动不会自动加载 `.env`，可用 Node 22 的 `node --env-file=.env src/server.js`。
 
 在“供应商”页填写自己的上游配置并刷新模型。在“接入 CC Switch”中复制网关地址和网关 API Key。调用 ID 形如 `provider/model-id`；客户端 API Key 与上游密钥分别管理。
 
@@ -62,7 +62,7 @@ Codex 桥接要求完整历史和 `store=false`；不支持持久 Responses 查�
 
 ## 数据与凭据
 
-运行时自动生成 `data/config.json` 和 `data/master.key`。上游密钥和网关密钥使用 AES-256-GCM 加密；能同时读取主密钥和配置的人仍可解密，因此必须保护整个数据目录。生图任务和输出也保存在 data/，备份请保存在私有位置。
+运行时自动生成 `data/config.json` 和 `data/master.key`。管理密码修改后保存为加盐 scrypt 哈希，优先于启动环境变量中的初始密码；用户名和密码配置重启后保留。上游密钥和网关密钥使用 AES-256-GCM 加密；能同时读取主密钥和配置的人仍可解密，因此必须保护整个数据目录。生图任务和输出也保存在 data/，备份请保存在私有位置。
 
 仓库不包含生产数据、真实密钥、密码、SSH 文件、登录缓存、图片历史或个人部署记录。`.env.example` 只有占位配置。测试中的 `test-password`、`upstream-test-key` 等都是本地模拟值。
 

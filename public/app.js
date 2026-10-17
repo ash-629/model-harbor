@@ -148,21 +148,30 @@ async function loadSettings() {
   try {
     const settings = await api('/settings');
     $('login-enabled').checked = settings.loginEnabled;
-    $('login-enabled').disabled = !settings.canEnableLogin;
+    $('login-username').value = settings.username;
+    $('login-password').value = ''; $('login-password-confirm').value = '';
     errorBox('settings-error');
   } catch (e) { errorBox('settings-error', e.message); }
   finally { settingsLoading = false; $('save-settings').disabled = false; }
 }
 $('settings-form').addEventListener('submit', async event => {
   event.preventDefault(); if (settingsLoading) return;
+  if ($('login-password').value !== $('login-password-confirm').value) { errorBox('settings-error', t('两次输入的新密码不一致')); return; }
   settingsLoading = true; $('save-settings').disabled = true; errorBox('settings-error');
   try {
-    await api('/settings', {method:'PUT', body:JSON.stringify({loginEnabled:$('login-enabled').checked})});
-    csrf = (await api('/session')).csrf;
-    $('settings-status').textContent = t('设置已保存');
+    const result = await api('/settings', {method:'PUT', body:JSON.stringify({loginEnabled:$('login-enabled').checked, username:$('login-username').value, password:$('login-password').value})});
+    $('login-password').value = ''; $('login-password-confirm').value = '';
+    if (result.credentialsChanged && result.loginEnabled) {
+      csrf = ''; $('settings-relogin').hidden = false;
+      $('settings-status').textContent = t('设置已保存，请使用新账号密码重新登录。');
+    } else {
+      csrf = (await api('/session')).csrf;
+      $('settings-status').textContent = t('设置已保存');
+    }
   } catch (e) { errorBox('settings-error', e.message); }
   finally { settingsLoading = false; $('save-settings').disabled = false; }
 });
+$('settings-relogin').addEventListener('click', () => location.reload());
 function typeFields() {
   const remoteCodex = $('p-type').value === 'nas-codex';
   $('remote-codex-fields').hidden = !remoteCodex; $('http-fields').hidden = remoteCodex;

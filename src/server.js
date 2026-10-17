@@ -5,6 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Store, HttpError } from './store.js';
+import { AdminAuth } from './admin-auth.js';
 import { route, discover } from './upstream.js';
 import { writeSSE } from './protocol.js';
 import { NasAgentBridge } from './nas-agent.js';
@@ -28,8 +29,10 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
   if (!Number.isInteger(apiBodyLimitMb) || apiBodyLimitMb < 1 || apiBodyLimitMb > 256) throw new Error('GATEWAY_API_BODY_LIMIT_MB 必须是 1–256 的整数');
   const external = publicUrl ? new URL(publicUrl) : null;
   if (external && (!['http:', 'https:'].includes(external.protocol) || external.username || external.password || external.pathname !== '/' || external.search || external.hash)) throw new Error('GATEWAY_PUBLIC_URL 必须是服务根地址');
-  if (external && !adminPassword) throw new Error('局域网部署必须设置 GATEWAY_ADMIN_PASSWORD');
   const store = new Store(dataDir), sessions = new Map(), logs = [];
+  const adminAuth = new AdminAuth(store, adminPassword);
+  let settingsSaving = false;
+  if (external && !adminAuth.configured) throw new Error('局域网部署必须设置 GATEWAY_ADMIN_PASSWORD 或已保存的管理密码');
   const imageProviders = new ImageProviders(store), imageJobs = new ImageJobs(store, imageProviders, dataDir);
   const log = value => { logs.unshift({ time: new Date().toISOString(), ...value }); if (logs.length > 100) logs.pop(); };
   const server = http.createServer(async (req, res) => {
@@ -51,9 +54,8 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
       if (origin && ![`http://127.0.0.1:${actualPort}`, `http://localhost:${actualPort}`, external?.origin].includes(origin)) throw new HttpError(403, '不允许跨站请求');
       const url = new URL(req.url, 'http://' + req.headers.host), pathname = url.pathname;
       const method = req.method;
-      if ((store.data.settings?.loginEnabled ?? Boolean(adminPassword)) && adminPassword && pathname !== '/health' && !/^\/v1(?:\/|$)/.test(pathname)) {
-        const expected = 'Basic ' + Buffer.from('admin:' + adminPassword).toString('base64');
-        if (!equal(req.headers.authorization, expected)) {
+      if (adminAuth.enabled && pathname !== '/health' && !/^\/v1(?:\/|$)/.test(pathname)) {
+        if (!await adminAuth.accepts(req.headers.authorization)) {
           res.setHeader('www-authenticate', 'Basic realm="Model Harbor", charset="UTF-8"');
           throw new HttpError(401, '请输入管理账号和密码');
         }
@@ -72,16 +74,16 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
         const sessionId = /(?:^|;\s*)mh_session=([a-f0-9]+)/.exec(req.headers.cookie || '')?.[1], session = sessions.get(sessionId);
         if (!session || session.expires < Date.now()) throw new HttpError(401, '管理会话已过期，请刷新页面');
         if (method !== 'GET' && !equal(req.headers['x-csrf-token'], session.csrf)) throw new HttpError(403, '无效的管理请求');
-        if (pathname === '/api/settings' && method === 'GET') return json(res, 200, { loginEnabled: store.data.settings?.loginEnabled ?? Boolean(adminPassword), canEnableLogin: Boolean(adminPassword), username: 'admin' });
+        if (pathname === '/api/settings' && method === 'GET') return json(res, 200, adminAuth.public());
         if (pathname === '/api/settings' && method === 'PUT') {
           const input = await readBody(req);
-          if (typeof input.loginEnabled !== 'boolean') throw new HttpError(400, 'loginEnabled must be a boolean');
-          if (input.loginEnabled && !adminPassword) throw new HttpError(400, 'Configure GATEWAY_ADMIN_PASSWORD before enabling login');
-          const previous = store.data.settings;
-          store.data.settings = { ...previous, loginEnabled: input.loginEnabled };
-          try { store.save(); } catch (error) { store.data.settings = previous; throw error; }
-          sessions.clear();
-          return json(res, 200, { loginEnabled: input.loginEnabled });
+          if (settingsSaving) throw new HttpError(409, '设置正在保存，请稍后重试');
+          settingsSaving = true;
+          try {
+            const result = await adminAuth.update(input);
+            sessions.clear();
+            return json(res, 200, result);
+          } finally { settingsSaving = false; }
         }
         if (pathname === '/api/image/providers' && method === 'GET') return json(res, 200, { providers: imageProviders.list() });
         if (pathname === '/api/image/providers' && method === 'POST') return json(res, 201, imageProviders.upsert(await readBody(req)));
@@ -182,7 +184,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const port = Number(process.env.PORT || 8317);
   const host = process.env.HOST || '127.0.0.1';
-  if (!['127.0.0.1', 'localhost', '::1'].includes(host) && (!process.env.GATEWAY_PUBLIC_URL || !process.env.GATEWAY_ADMIN_PASSWORD)) throw new Error('非本机监听必须配置公开地址及管理密码');
+  if (!['127.0.0.1', 'localhost', '::1'].includes(host) && !process.env.GATEWAY_PUBLIC_URL) throw new Error('非本机监听必须配置公开地址及管理密码');
   const { server } = createGateway({ port, dataDir: process.env.GATEWAY_DATA_DIR || path.join(root, 'data'), publicUrl: process.env.GATEWAY_PUBLIC_URL, adminPassword: process.env.GATEWAY_ADMIN_PASSWORD, apiBodyLimitMb: Number(process.env.GATEWAY_API_BODY_LIMIT_MB || 64) });
   server.on('error', e => { console.error(e.code === 'EADDRINUSE' ? `端口 ${port} 已被占用，请设置 PORT 环境变量` : '服务启动失败：' + e.message); process.exit(1); });
   server.listen(port, host, () => console.log(`Model Harbor ready: ${process.env.GATEWAY_PUBLIC_URL || `http://${host}:${port}`}`));
