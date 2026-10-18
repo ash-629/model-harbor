@@ -3,11 +3,11 @@ import { t, getLanguage, setLanguage, captureStaticText, translateError } from '
 // P-01/P-02: provider CRUD, model directory, connection instructions, real request test.
 const $ = id => document.getElementById(id);
 const h = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
-let csrf, state = { providers: [], models: [], logs: [] }, editing = null, busy = false, testBusy = false, keyVisible = false;
+let csrf, state = { providers: [], models: [], logs: [] }, editing = null, busy = false, testBusy = false, keyVisible = false, connectionKey = '';
 let toastTimer, currentView = 'overview', saving = false, refreshing = false;
 const translateStatic = captureStaticText();
 const errorsById = new Map();
-let testResult = null;
+let testResult = null, connectionProtocol = 'anthropic';
 const imageUI = createImageUI({api, toast});
 const usageById = new Map();
 const resetKeys = new Map();
@@ -92,7 +92,7 @@ async function load() {
   state = await api('/config');
   $('stat-providers').textContent = state.providers.filter(p => p.enabled).length;
   $('stat-models').textContent = state.models.length;
-  $('base-url').textContent = state.baseUrl; $('connect-url').textContent = state.baseUrl;
+  $('base-url').textContent = state.baseUrl; renderConnection();
   renderSelectors();
   renderModels(); renderProviders(); renderLogs(); capability();
 }
@@ -129,7 +129,13 @@ function capability() {
   const model = state.models.find(m => m.id === $('test-model').value);
   $('test-capability').textContent = model?.source === 'nas-codex' ? t('远程 Codex 支持客户端工具调用；由客户端执行工具，远端负责推理。') : '';
 }
-function view(name) {
+const views = new Set(['overview', 'providers', 'images', 'logs', 'settings']);
+function viewFromLocation() {
+  const name = location.hash.replace(/^#\/?/, '');
+  return views.has(name) ? name : 'overview';
+}
+function view(name, { updateUrl = true } = {}) {
+  if (!views.has(name)) name = 'overview';
   currentView = name;
   document.querySelector('.stats').hidden = ['images', 'settings'].includes(name);
   $('add-btn').hidden = ['images', 'settings'].includes(name);
@@ -140,6 +146,7 @@ function view(name) {
   [$('page-name').textContent, $('heading').textContent, $('subtitle').textContent] = names[name];
   if (name === 'settings') loadSettings();
   if (name === 'providers') for (const p of state.providers) if (p.type === 'nas-codex' && p.enabled) loadUsage(p.id);
+  if (updateUrl && location.hash !== '#' + name) history.pushState({ view: name }, '', '#' + name);
 }
 let settingsLoading = false;
 async function loadSettings() {
@@ -252,17 +259,53 @@ $('test-form').addEventListener('submit', async event => {
   } catch (e) { testResult = {status:'error', error:e.message}; renderTestOutput(); }
   finally { testBusy = false; $('test-submit').disabled = !state.models.length; $('test-submit').textContent = t('发送测试消息 →'); try { await load(); } catch {} }
 });
-async function copy(text) { try { await navigator.clipboard.writeText(text); toast('已复制到剪贴板'); } catch { toast('无法访问剪贴板，请手动选择并复制'); } }
-function openConnection() { keyVisible = false; $('connect-key').textContent = '••••••••••••••••••••••••'; $('reveal-key').textContent = t('显示'); $('connection-dialog').showModal(); }
+function fallbackCopy(value) {
+  const area = document.createElement('textarea');
+  area.value = value; area.setAttribute('readonly', ''); area.style.position = 'fixed'; area.style.top = '0'; area.style.left = '-9999px'; area.style.opacity = '0';
+  document.body.appendChild(area);
+  const selection = document.getSelection(), previous = selection && selection.rangeCount ? selection.getRangeAt(0) : null;
+  let copied = false;
+  try { area.select(); area.setSelectionRange(0, area.value.length); copied = document.execCommand('copy'); }
+  catch {}
+  finally { area.remove(); if (previous && selection) { selection.removeAllRanges(); selection.addRange(previous); } }
+  return copied;
+}
+async function copy(text) {
+  const value = String(text ?? '');
+  let copied = false;
+  if (window.isSecureContext && navigator.clipboard?.writeText) {
+    try { await navigator.clipboard.writeText(value); copied = true; } catch {}
+  }
+  if (!copied) copied = fallbackCopy(value);
+  toast(copied ? '已复制到剪贴板' : '无法访问剪贴板，请手动选择并复制');
+}
+function connectionURL() {return connectionProtocol === 'anthropic' ? (state.baseUrl || '').replace(/\/v1\/?$/, '') : state.baseUrl || '';}
+function renderConnection() {
+  $('connect-url').textContent = connectionURL();
+  const base=(state.baseUrl || '').replace(/\/v1\/?$/, ''),model=state.models[0]?.id || 'provider/model';
+  for(const protocol of ['anthropic','openai']) {
+    const selected=protocol===connectionProtocol,tab=$('guide-tab-'+protocol);
+    tab.setAttribute('aria-selected',String(selected));tab.tabIndex=selected?0:-1;$('guide-'+protocol).hidden=!selected;
+  }
+  $('guide-anthropic-example').textContent = `curl ${base}/v1/messages \\\n  -H "content-type: application/json" \\\n  -H "x-api-key: YOUR_GATEWAY_KEY" \\\n  -H "anthropic-version: 2023-06-01" \\\n  -d '${JSON.stringify({model,max_tokens:1024,messages:[{role:'user',content:'Hello'}],stream:true},null,2)}'`;
+  $('guide-openai-example').textContent = `curl ${base}/v1/responses \\\n  -H "content-type: application/json" \\\n  -H "Authorization: Bearer YOUR_GATEWAY_KEY" \\\n  -d '${JSON.stringify({model,input:'Hello',store:false,stream:true},null,2)}'`;
+}
+for(const protocol of ['anthropic','openai']) {
+  const tab=$('guide-tab-'+protocol);
+  tab.addEventListener('click',()=>{connectionProtocol=protocol;renderConnection();});
+  tab.addEventListener('keydown',event=>{if(['ArrowLeft','ArrowRight','Home','End'].includes(event.key)){event.preventDefault();connectionProtocol=event.key==='Home'?'anthropic':event.key==='End'?'openai':connectionProtocol==='anthropic'?'openai':'anthropic';renderConnection();$('guide-tab-'+connectionProtocol).focus();}});
+}
+function openConnection() { renderConnection(); keyVisible = false; connectionKey = ''; $('connect-key').textContent = '••••••••••••••••••••••••'; $('reveal-key').textContent = t('显示'); $('connection-dialog').showModal(); api('/key').then(({key}) => { connectionKey = key; }).catch(() => {}); }
 $('reveal-key').addEventListener('click', async () => {
   try { keyVisible = !keyVisible; $('connect-key').textContent = keyVisible ? (await api('/key')).key : '••••••••••••••••••••••••'; $('reveal-key').textContent = keyVisible ? t('隐藏') : t('显示'); }
   catch (e) { toast(e.message); }
 });
-$('copy-key').addEventListener('click', async () => { try { await copy((await api('/key')).key); } catch (e) { toast(e.message); } });
-$('connection-dialog').addEventListener('close', () => { $('connect-key').textContent = '••••••••••••••••••••••••'; keyVisible = false; });
+$('copy-key').addEventListener('click', async () => { try { const key = connectionKey || (await api('/key')).key; connectionKey = key; await copy(key); } catch (e) { toast(e.message); } });
+$('connection-dialog').addEventListener('close', () => { $('connect-key').textContent = '••••••••••••••••••••••••'; keyVisible = false; connectionKey = ''; });
 $('provider-dialog').addEventListener('close', () => { $('p-key').value = ''; });
 ['connection-btn', 'tip-connect'].forEach(id => $(id).addEventListener('click', openConnection));
-['copy-url', 'connect-copy-url'].forEach(id => $(id).addEventListener('click', () => copy(state.baseUrl)));
+$('copy-url').addEventListener('click', () => copy(state.baseUrl));
+$('connect-copy-url').addEventListener('click', () => copy(connectionURL()));
 ['add-btn', 'empty-add'].forEach(id => $(id).addEventListener('click', () => openEditor()));
 $('search').addEventListener('input', renderModels); $('provider-filter').addEventListener('change', renderModels);
 $('test-model').addEventListener('change', capability);
@@ -299,6 +342,15 @@ $('language-toggle').addEventListener('click', () => {
   setLanguage(getLanguage() === 'en' ? 'zh-CN' : 'en');
   applyLanguage();
 });
+function syncViewFromLocation() {
+  const name = viewFromLocation();
+  if (location.hash !== '#' + name) history.replaceState({ view: name }, '', '#' + name);
+  if (name !== currentView) view(name, { updateUrl: false });
+}
+window.addEventListener('hashchange', syncViewFromLocation);
+window.addEventListener('popstate', syncViewFromLocation);
+currentView = viewFromLocation();
+if (location.hash !== '#' + currentView) history.replaceState({ view: currentView }, '', '#' + currentView);
 applyLanguage();
 
-try { csrf = (await api('/session')).csrf; await load(); } catch (e) { errorBox('global-error', e.message); }
+try { csrf = (await api('/session')).csrf; await load(); view(currentView, { updateUrl: false }); } catch (e) { errorBox('global-error', e.message); }

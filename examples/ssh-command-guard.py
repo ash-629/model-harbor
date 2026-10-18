@@ -29,6 +29,9 @@ agent_tail = ['timeout', '--signal=TERM', '--kill-after=5s', '1200s', 'codex', '
 if args == prefix + agent_tail:
     allowed = True
 
+if args == prefix + ['timeout', '--signal=TERM', '--kill-after=5s', '610s', 'python3', '/workspace/model-harbor/codex-responses-runner.py']:
+    allowed = True
+
 if not allowed:
     sys.stderr.write('Model Harbor SSH command denied\n')
     sys.exit(126)

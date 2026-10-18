@@ -8,6 +8,10 @@ import { normalizeUsage } from './codex-usage.js';
 import { isWebSearch, nativeSearch, searchItem } from './native-search.js';
 
 const bad = message => { throw new HttpError(400, message, 'unsupported_parameter'); };
+// Native userMessage events echo serialized history; allow JSON escaping
+// overhead above the default 64 MiB HTTP request limit.
+const RPC_MESSAGE_LIMIT = 128 * 1024 * 1024;
+const rpcTooLarge = () => new HttpError(502, 'Remote Codex RPC message exceeds 128 MiB; compact history or reduce attachments', 'remote_message_too_large');
 const failed = () => new HttpError(502, '远程 Codex 工具桥接失败，请检查登录、模型权限和 app-server 版本');
 const quote = s => "'" + String(s).replace(/'/g, "'\\''") + "'";
 export const agentTail = ['timeout', '--signal=TERM', '--kill-after=5s', '1200s', 'codex', 'app-server', '--listen', 'stdio://',
@@ -134,6 +138,8 @@ export function validateAgent(body) {
       if (typeof item.content !== 'string' && (!Array.isArray(item.content) || item.content.some(p => !['input_text', 'output_text', 'text', 'input_image'].includes(p.type)))) bad('远程工具桥接不支持此消息内容');
     } else bad('远程工具桥接不支持此输入项: ' + String(item.type || item.role).slice(0, 80));
   }
+  const transcript = input.map(i => Array.isArray(i.content) ? { ...i, content: i.content.map(c => c.type === 'input_image' ? { type: 'text', text: '[attached image]' } : c) } : i);
+  if (Array.from(JSON.stringify(transcript)).length > 1048576) throw new HttpError(413, 'Remote Codex input exceeds 1,048,576 characters. Compact conversation history or start a new chat with a summary before switching models.', 'remote_input_too_large');
   return { input, outputs, budget };
 }
 
@@ -145,9 +151,9 @@ class RPC {
     child.stdin.on('error', () => {}); child.stderr.on('data', () => {});
     child.stdout.on('data', bytes => {
       buffer += decoder.write(bytes);
-      if (buffer.length > 8 * 1024 * 1024) return this.fail(failed());
       let index;
       while ((index = buffer.indexOf('\n')) >= 0) {
+        if (index > RPC_MESSAGE_LIMIT) return this.fail(rpcTooLarge());
         const line = buffer.slice(0, index); buffer = buffer.slice(index + 1); if (!line.trim()) continue;
         let event; try { event = JSON.parse(line); } catch { this.fail(failed()); return; }
         if (!event.method && this.pending.has(event.id)) {
@@ -155,6 +161,7 @@ class RPC {
         } else if (this.waiter) { const w = this.waiter; this.waiter = null; w.resolve(event); }
         else { this.events.push(event); if (this.events.length > 10000) return this.fail(failed()); }
       }
+      if (buffer.length > RPC_MESSAGE_LIMIT) return this.fail(rpcTooLarge());
     });
     child.on('error', () => this.fail(failed())); child.on('close', () => this.fail(failed()));
   }
@@ -172,6 +179,7 @@ class RPC {
 
 export class NasAgentBridge {
   constructor({ launch = (p) => { const c = agentCommand(p); return spawn(c.command, c.args, { windowsHide: true }); }, idleMs = 10 * 60 * 1000, maxSessions = 8 } = {}) {
+    this.directResponses = arguments[0]?.directResponses ?? !arguments[0]?.launch;
     this.launch = launch; this.idleMs = idleMs; this.maxSessions = maxSessions; this.sessions = new Set(); this.calls = new Map(); this.completedCalls = new Map();
     this.usageReaders = new Set(); this.usageCache = new Map(); this.usageGeneration = 0;
   }

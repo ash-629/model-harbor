@@ -15,7 +15,7 @@ const tools = [{ type: 'namespace', name: 'functions', tools: [
   { type: 'custom', name: 'apply_patch', format: { type: 'grammar', syntax: 'lark', definition: 'start: /.+/s' } },
   { type: 'function', name: 'read_file', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
 ] }];
-function fakeLaunch({ hang = false, malformed = false, webSearch = false } = {}) {
+function fakeLaunch({ hang = false, malformed = false, webSearch = false, echoInput = false } = {}) {
   const children = [], exchanges = []; let counter = 0;
   const launch = () => {
     const child = new EventEmitter(), serial = ++counter; let specs, step = 0;
@@ -34,7 +34,7 @@ function fakeLaunch({ hang = false, malformed = false, webSearch = false } = {})
         if (malformed) { queueMicrotask(() => child.stdout.write('invalid-json\n')); continue; }
         if (request.method === 'initialize') emit({ id: request.id, result: {} });
         else if (request.method === 'thread/start') { specs = request.params.dynamicTools; emit({ id: request.id, result: { thread: { id: 'thread' } } }); }
-        else if (request.method === 'turn/start') { emit({ id: request.id, result: { turn: { id: 'turn' } } }); if (webSearch) emit({method:'item/completed',params:{item:{type:'webSearch',id:'ws_test',query:'Python official',action:{type:'search',queries:['Python official'],query:'Python official'}}}}); call(); }
+        else if (request.method === 'turn/start') { if (echoInput) emit({ method: 'item/started', params: { item: { type: 'userMessage', content: request.params.input } } }); emit({ id: request.id, result: { turn: { id: 'turn' } } }); if (webSearch) emit({method:'item/completed',params:{item:{type:'webSearch',id:'ws_test',query:'Python official',action:{type:'search',queries:['Python official'],query:'Python official'}}}}); call(); }
         else if (request.result) { assert.equal(request.result.contentItems[0].text, step ? 'READ_OK' : 'PATCH_OK'); step++; call(); }
       }
       done();
@@ -228,4 +228,13 @@ test('GUI max_tokens aliases are validated, disclosed and sent as a generation b
       assert.equal(start.params.config.max_tokens,undefined);assert.equal(start.params.config.model_max_output_tokens,undefined,'do not invent an unsupported native setting');
     } finally {bridge.close();}
   }
+});
+
+
+test('model switch rejects oversized history before launching remote inference', async () => {
+  const fake = fakeLaunch(), bridge = new NasAgentBridge({ launch: fake.launch });
+  try {
+    await assert.rejects(bridge.run(p, 'model', {model:'nas/model',input:'x'.repeat(1048576)}, 'responses'), e => e.code === 'remote_input_too_large');
+    assert.equal(fake.children.length, 0);
+  } finally { bridge.close(); }
 });

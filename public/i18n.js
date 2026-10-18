@@ -1,5 +1,25 @@
 // UI-only language preference. Model IDs, provider names and user input are never translated.
 export const messages = {
+"支持文本、图片、工具调用、流式 Messages 和 thinking 参数；思考内容以普通文本历史保留，服务端工具、提示缓存控制和 token 计数接口暂不支持。": "Supports text, images, tool calls, streaming Messages and thinking parameters. Thinking text is retained as ordinary history; hosted tools, prompt-cache controls and token counting are not supported yet.",
+
+"接入指南 ↗": "Connection guide \u2197",
+"接入指南": "Connection guide",
+"查看接入指南 ↗": "View connection guide \u2197",
+"选择客户端支持的协议，填写网关地址与密钥。": "Choose your client protocol and enter the gateway URL and key.",
+"选择客户端支持的 API 标准，模型调用 ID 均使用「前缀/模型 ID」。": "Choose the API standard supported by your client. Use prefix/model IDs for every protocol.",
+"接入协议": "Connection protocol",
+"Anthropic Messages 标准": "Anthropic Messages standard",
+"OpenAI 标准": "OpenAI standard",
+"请求示例": "Request example",
+"客户端选择 Anthropic 兼容协议，Base URL 填服务根地址，不加 /v1。": "Select an Anthropic-compatible protocol. Set Base URL to the service root without /v1.",
+"API Key 填上方网关密钥，模型选择已有的「前缀/模型 ID」。": "Use the gateway key above and select an existing prefix/model ID.",
+"请求使用 x-api-key 和 anthropic-version: 2023-06-01；也支持 Bearer 认证。": "Send x-api-key and anthropic-version: 2023-06-01 headers. Bearer authentication is also supported.",
+"支持文本、图片、工具调用和流式 Messages。扩展思考、服务端工具、提示缓存控制和 token 计数接口暂不支持。": "Supports text, images, tool calls and streaming Messages. Extended thinking, server tools, prompt cache controls and token counting are not supported yet.",
+"客户端选择 OpenAI 兼容协议，Base URL 使用包含 /v1 的地址。": "Select an OpenAI-compatible protocol. Include /v1 in Base URL.",
+"Codex 使用 Responses；其他客户端可按能力选择 Chat Completions 或 Responses。": "Use Responses for Codex. Other clients can use Chat Completions or Responses as supported.",
+"支持文本、图片与客户端工具。远程 Codex 使用完整历史和 store=false，不支持 previous_response_id 持久会话。": "Supports text, images and client tools. Remote Codex requires full history and store=false; persistent previous_response_id sessions are unsupported.",
+"模型能力取决于上游。远程 Codex 的输出 token 预算为生成提示，不是硬性截断。": "Model capabilities depend on the upstream. Remote Codex output token budgets are generation hints, not hard caps.",
+
 "设置正在保存，请稍后重试": "Settings are being saved. Try again shortly.",
 "启用后使用设置的用户名和密码登录。关闭后，能够访问此地址的人都可以管理模型港。": "When enabled, use the configured username and password. When disabled, anyone who can reach this address can manage Model Harbor.",
 "登录用户名": "Login username",

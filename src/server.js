@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Store, HttpError } from './store.js';
 import { AdminAuth } from './admin-auth.js';
+import { sendMessages, errorType as anthropicErrorType } from './anthropic.js';
 import { route, discover } from './upstream.js';
 import { writeSSE } from './protocol.js';
 import { NasAgentBridge } from './nas-agent.js';
@@ -43,7 +44,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
     res.setHeader('x-content-type-options', 'nosniff');
     res.setHeader('referrer-policy', 'no-referrer');
     res.setHeader('content-security-policy', "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
-    let requestModel, requestEndpoint;
+    let requestModel, requestEndpoint, anthropicRequest = req.url?.split('?')[0] === '/v1/messages';
     try {
       const address = server.address();
       const actualPort = typeof address === 'object' ? address.port : port;
@@ -142,9 +143,19 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
         throw new HttpError(404, '管理接口不存在');
       }
       if (pathname === '/v1' || pathname === '/v1/' || pathname.startsWith('/v1/')) {
-        if (!equal(req.headers.authorization, `Bearer ${store.gatewayKey()}`)) throw new HttpError(401, '无效的网关 API Key', 'invalid_api_key');
+        if (!(req.headers.authorization && equal(req.headers.authorization, `Bearer ${store.gatewayKey()}`)) && !(req.headers['x-api-key'] && equal(req.headers['x-api-key'], store.gatewayKey()))) throw new HttpError(401, '无效的网关 API Key', 'invalid_api_key');
         if (pathname.replace(/\/$/, '') === '/v1' && method === 'GET') return json(res, 200, { service: 'Model Harbor', models: '/v1/models' });
         if (pathname === '/v1/models' && method === 'GET') return json(res, 200, { object: 'list', data: store.models() });
+        if (pathname === '/v1/messages' && method === 'POST') {
+          const body = await readBody(req, apiBodyLimitMb * 1024 * 1024);
+          requestModel = body.model; requestEndpoint = 'messages';
+          if (req.headers['anthropic-version'] && req.headers['anthropic-version'] !== '2023-06-01') throw new HttpError(400, 'Unsupported anthropic-version; use 2023-06-01');
+          const {provider, model} = store.resolve(body.model);
+          const result = await sendMessages(body, res, (request, target) => route(store, provider, model, request, 'responses', target, controller.signal, nasAgent));
+          log({model:body.model,endpoint:'messages',status:200,duration:Date.now()-started});
+          if (result) json(res,200,result);
+          return;
+        }
         if (['/v1/chat/completions', '/v1/responses'].includes(pathname) && method === 'POST') {
           const body = await readBody(req, apiBodyLimitMb * 1024 * 1024);
           if (body.stream !== undefined && typeof body.stream !== 'boolean') throw new HttpError(400, 'stream 必须为布尔值');
@@ -166,13 +177,14 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
     } catch (e) {
       const status = e.status || (e.name === 'TimeoutError' ? 504 : 502);
       const error = { message: e instanceof HttpError ? e.message : '请求处理失败，请检查上游响应格式与协议配置', type: e.code || 'gateway_error', code: e.code || 'gateway_error' };
+      if (anthropicRequest) { error.type = anthropicErrorType(status); delete error.code; }
       if (requestModel) log({ model: requestModel, endpoint: requestEndpoint, status, duration: Date.now() - started, error: error.message });
       if (res.destroyed || res.writableEnded) return;
       if (res.headersSent) {
-        try { await writeSSE(res, { type: 'error', error }, requestEndpoint === 'responses' ? 'error' : undefined); res.end(); } catch { res.destroy(); }
+        try { await writeSSE(res, { type: 'error', error }, requestEndpoint === 'responses' || anthropicRequest ? 'error' : undefined); res.end(); } catch { res.destroy(); }
       } else {
         if (e.retryAfter && /^[\w ,:-]{1,80}$/.test(e.retryAfter)) res.setHeader('retry-after', e.retryAfter);
-        json(res, status === 499 ? 408 : status, { error });
+        json(res, status === 499 ? 408 : status, anthropicRequest ? { type:'error', error } : { error });
       }
     }
   });

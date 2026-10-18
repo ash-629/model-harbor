@@ -1,0 +1,9 @@
+title = "Model Harbor secret scanning"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documented gateway key placeholders, not credentials"
+regexes = ['''YOUR_GATEWAY_KEY''']
+paths = ['''^public/app\.js$''']
