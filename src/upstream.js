@@ -1,9 +1,9 @@
 // F-03/F-05: upstream requests, streaming backpressure, cancellation and sanitized failures.
 import { HttpError } from './store.js';
 import { toChat, fromChat, bridgeStream, sseEvents, openSSE, writeSSE } from './protocol.js';
-import { sendDirect } from './nas-responses.js';
 import { sendAgent } from './nas-agent.js';
-import { nasModels, nasCompletion, sendNas } from './nas.js';
+import { claudeModels, sendClaude, ClaudeCodeBridge } from './claude-code.js';
+const defaultClaudeBridge = new ClaudeCodeBridge();
 
 export async function upstreamFetch(store, p, path, body, signal) {
   const timeout = AbortSignal.timeout((p.timeout || 180) * 1000);
@@ -27,30 +27,24 @@ export async function upstreamFetch(store, p, path, body, signal) {
   }
   return response;
 }
-export async function discover(store, p, signal) {
-  if (p.type === 'nas-codex') return nasModels(p, signal);
+export async function discover(store, p, signal, nasAgent) {
+  if (p.type === 'nas-codex') {
+    if (!nasAgent?.models) throw new HttpError(502, 'Codex 官方 app-server 桥接未初始化', 'codex_bridge_unavailable');
+    return nasAgent.models(p, signal);
+  }
+  if (p.type === 'claude-code') return claudeModels(p, signal);
   const response = await upstreamFetch(store, p, 'models', undefined, signal);
   const data = await response.json();
   if (!Array.isArray(data.data)) throw new HttpError(502, '上游模型接口未返回 data 数组，请手工填写模型');
   return data.data.map(m => m.id);
 }
-export async function route(store, p, model, body, endpoint, res, signal, nasAgent) {
+export async function route(store, p, model, body, endpoint, res, signal, nasAgent, claudeBridge = defaultClaudeBridge) {
   if (p.type === 'nas-codex') {
-    if (nasAgent?.directResponses) {
-      try { return await sendDirect(p, model, body, endpoint, res, signal); }
-      catch (e) {
-        // A protection-service failure can be content-specific to the native
-        // Responses path. The app-server relay uses a different request shape
-        // and preserves the same client-tool contract, so retry transparently
-        // only before anything has been written to the client.
-        if (e?.code === 'codex_response_protection' && nasAgent && !res.headersSent && !signal?.aborted)
-          return sendAgent(nasAgent, p, model, body, endpoint, res, signal);
-        throw e;
-      }
-    }
-    if (nasAgent) return sendAgent(nasAgent, p, model, body, endpoint, res, signal);
-    const chatBody = endpoint === 'responses' ? { ...toChat(body), model: body.model } : body;
-    return sendNas(await nasCompletion(p, model, chatBody, signal), res, endpoint, body.stream);
+    if (!nasAgent) throw new HttpError(502, 'Codex 官方 app-server 桥接未初始化', 'codex_bridge_unavailable');
+    return sendAgent(nasAgent, p, model, body, endpoint, res, signal);
+  }
+  if (p.type === 'claude-code') {
+    return sendClaude(claudeBridge, p, model, body, endpoint, res, signal);
   }
   if (endpoint === 'chat/completions' && p.protocol === 'responses') throw new HttpError(400, '此上游仅提供 Responses，请使用 /v1/responses 或更改供应商协议');
   const bridge = endpoint === 'responses' && p.protocol === 'chat';

@@ -15,13 +15,21 @@ const tools = [{ type: 'namespace', name: 'functions', tools: [
   { type: 'custom', name: 'apply_patch', format: { type: 'grammar', syntax: 'lark', definition: 'start: /.+/s' } },
   { type: 'function', name: 'read_file', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
 ] }];
-function fakeLaunch({ hang = false, malformed = false, webSearch = false, echoInput = false } = {}) {
+function fakeLaunch({ hang = false, malformed = false, webSearch = false, echoInput = false, streamText = false } = {}) {
   const children = [], exchanges = []; let counter = 0;
   const launch = () => {
     const child = new EventEmitter(), serial = ++counter; let specs, step = 0;
     child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.killed = false;
     const emit = value => queueMicrotask(() => child.stdout.write(JSON.stringify(value) + '\n'));
-    const completed = text => { emit({ method: 'item/completed', params: { item: { type: 'agentMessage', text } } }); emit({ method: 'turn/completed', params: { turn: { status: 'completed' } } }); };
+    const completed = text => {
+      const id = 'msg_' + serial;
+      if (streamText) {
+        emit({ method: 'item/started', params: { item: { type: 'agentMessage', id, text: '', phase: 'final_answer' } } });
+        for (const delta of String(text).match(/.{1,4}/g) || []) emit({ method: 'item/agentMessage/delta', params: { itemId: id, delta } });
+      }
+      emit({ method: 'item/completed', params: { item: { type: 'agentMessage', id, text, phase: 'final_answer' } } });
+      emit({ method: 'turn/completed', params: { turn: { status: 'completed' } } });
+    };
     const call = () => {
       const tool = specs[step];
       if (!tool) return completed('CLIENT_RESULT_OK');
@@ -34,6 +42,8 @@ function fakeLaunch({ hang = false, malformed = false, webSearch = false, echoIn
         if (malformed) { queueMicrotask(() => child.stdout.write('invalid-json\n')); continue; }
         if (request.method === 'initialize') emit({ id: request.id, result: {} });
         else if (request.method === 'thread/start') { specs = request.params.dynamicTools; emit({ id: request.id, result: { thread: { id: 'thread' } } }); }
+        else if (request.method === 'thread/inject_items') emit({ id: request.id, result: {} });
+        else if (request.method === 'model/list') emit({ id: request.id, result: { data: [{ id: 'model', hidden: false }, { id: 'hidden-model', hidden: true }], nextCursor: null } });
         else if (request.method === 'turn/start') { if (echoInput) emit({ method: 'item/started', params: { item: { type: 'userMessage', content: request.params.input } } }); emit({ id: request.id, result: { turn: { id: 'turn' } } }); if (webSearch) emit({method:'item/completed',params:{item:{type:'webSearch',id:'ws_test',query:'Python official',action:{type:'search',queries:['Python official'],query:'Python official'}}}}); call(); }
         else if (request.result) { assert.equal(request.result.contentItems[0].text, step ? 'READ_OK' : 'PATCH_OK'); step++; call(); }
       }
@@ -187,6 +197,22 @@ test('NAS sessions enforce capacity, release idle workers, timeout and cancellat
 });
 
 
+test('Responses SSE forwards app-server text deltas once and keeps a complete final response', async () => {
+  const fake = fakeLaunch({ streamText: true }), bridge = new NasAgentBridge({ launch: fake.launch });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harbor-live-stream-')), gateway = createGateway({ dataDir: dir, nasAgent: bridge });
+  gateway.store.upsert({ ...p, name: 'Remote', models: ['model'] });
+  await new Promise(resolve => gateway.server.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${gateway.server.address().port}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer ' + gateway.store.gatewayKey(), 'content-type': 'application/json' }, body: JSON.stringify({ model: 'nas/model', input: 'hello', stream: true }) });
+    const events = []; for await (const event of sseEvents(response.body)) events.push(JSON.parse(event.data));
+    assert.equal(events.filter(e => e.type === 'response.output_text.delta').map(e => e.delta).join(''), 'CLIENT_RESULT_OK');
+    assert.equal(events.filter(e => e.type === 'response.output_text.done').length, 1);
+    assert.equal(events.filter(e => e.type === 'response.output_item.done').length, 1);
+    assert.equal(events.at(-1).type, 'response.completed');
+    assert.equal(events.at(-1).response.output[0].content[0].text, 'CLIENT_RESULT_OK');
+  } finally { bridge.close(); gateway.server.closeAllConnections(); await new Promise(resolve => gateway.server.close(resolve)); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('desktop GUI discovery declarations, long MCP names and discovered tool schemas are compatible', () => {
   const longName='mcp__codex_apps__codex_document_control_get_document_tool_schemas';
   assert.ok(longName.length>64 && longName.length<=128);
@@ -231,10 +257,25 @@ test('GUI max_tokens aliases are validated, disclosed and sent as a generation b
 });
 
 
-test('model switch rejects oversized history before launching remote inference', async () => {
+test('long history is injected natively and only the current user turn is sent to turn/start', async () => {
   const fake = fakeLaunch(), bridge = new NasAgentBridge({ launch: fake.launch });
   try {
-    await assert.rejects(bridge.run(p, 'model', {model:'nas/model',input:'x'.repeat(1048576)}, 'responses'), e => e.code === 'remote_input_too_large');
-    assert.equal(fake.children.length, 0);
+    const longHistory = { role: 'user', content: 'H'.repeat(1100000) };
+    const response = await bridge.run(p, 'model', { model: 'nas/model', input: [longHistory, { role: 'assistant', content: 'ack' }, { role: 'user', content: 'continue' }] }, 'responses');
+    assert.equal(response.status, 'completed');
+    const injected = fake.exchanges.filter(e => e.method === 'thread/inject_items').flatMap(e => e.params.items);
+    assert.ok(injected.length, 'native history injection was called');
+    assert.equal(injected.length, 2);
+    const turn = fake.exchanges.find(e => e.method === 'turn/start');
+    assert.deepEqual(turn.params.input, [{ type: 'text', text: 'continue' }]);
+  } finally { bridge.close(); }
+});
+
+test('model discovery uses the official app-server model/list endpoint', async () => {
+  const fake = fakeLaunch(), bridge = new NasAgentBridge({ launch: fake.launch });
+  try {
+    assert.deepEqual(await bridge.models({ ...p, type: 'nas-codex' }), ['model']);
+    assert.ok(fake.exchanges.some(e => e.method === 'model/list'));
+    assert.ok(!fake.exchanges.some(e => e.method === 'collect'));
   } finally { bridge.close(); }
 });

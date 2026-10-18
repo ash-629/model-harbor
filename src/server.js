@@ -11,6 +11,8 @@ import { route, discover } from './upstream.js';
 import { writeSSE } from './protocol.js';
 import { NasAgentBridge } from './nas-agent.js';
 import { ImageProviders } from './image-providers.js';
+import { claudeUsage } from './claude-usage.js';
+import { ClaudeCodeBridge } from './claude-code.js';
 import { ImageJobs, runnerFile } from './images.js';
 const root = fileURLToPath(new URL('..', import.meta.url));
 const publicDir = path.join(root, 'public');
@@ -26,7 +28,7 @@ async function readBody(req, limit = 4 * 1024 * 1024) {
   if (!body || Array.isArray(body) || typeof body !== 'object') throw new HttpError(400, '请求体必须为 JSON 对象');
   return body;
 }
-export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, publicUrl, adminPassword, nasAgent = new NasAgentBridge(), apiBodyLimitMb = 64 } = {}) {
+export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, publicUrl, adminPassword, nasAgent = new NasAgentBridge(), claudeBridge = new ClaudeCodeBridge(), apiBodyLimitMb = 64 } = {}) {
   if (!Number.isInteger(apiBodyLimitMb) || apiBodyLimitMb < 1 || apiBodyLimitMb > 256) throw new Error('GATEWAY_API_BODY_LIMIT_MB 必须是 1–256 的整数');
   const external = publicUrl ? new URL(publicUrl) : null;
   if (external && (!['http:', 'https:'].includes(external.protocol) || external.username || external.password || external.pathname !== '/' || external.search || external.hash)) throw new Error('GATEWAY_PUBLIC_URL 必须是服务根地址');
@@ -114,7 +116,11 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
         if (pathname === '/api/key' && method === 'GET') return json(res, 200, { key: store.gatewayKey() });
         if (pathname === '/api/providers' && method === 'POST') return json(res, 201, store.upsert(await readBody(req)));
         const usageMatch = /^\/api\/providers\/([a-z0-9_-]+)\/usage$/.exec(pathname);
-        if (usageMatch && method === 'GET') return json(res, 200, await nasAgent.usage(store.get(usageMatch[1]), controller.signal));
+        if (usageMatch && method === 'GET') {
+          const provider = store.get(usageMatch[1]);
+          if (provider.type === 'claude-code') return json(res, 200, await claudeUsage(provider, controller.signal));
+          return json(res, 200, await nasAgent.usage(provider, controller.signal));
+        }
         const resetMatch = /^\/api\/providers\/([a-z0-9_-]+)\/reset$/.exec(pathname);
         if (resetMatch && method === 'POST') return json(res, 200, await nasAgent.resetUsage(store.get(resetMatch[1]), await readBody(req), controller.signal));
         const match = /^\/api\/providers\/([a-z0-9_-]+)(\/refresh)?$/.exec(pathname);
@@ -122,7 +128,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
           const [, id, action] = match;
           if (method === 'POST' && action) {
             const provider = store.get(id);
-            const models = await discover(store, provider, controller.signal);
+            const models = await discover(store, provider, controller.signal, nasAgent);
             return json(res, 200, store.setModels(id, models));
           }
           if (method === 'PUT' && !action) return json(res, 200, store.upsert(await readBody(req), id));
@@ -135,7 +141,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
           const endpoint = provider.protocol === 'responses' ? 'responses' : 'chat/completions';
           const body = endpoint === 'responses' ? { model: input.model, input: input.prompt, store: false } : { model: input.model, messages: [{ role: 'user', content: input.prompt }] };
           requestModel = body.model; requestEndpoint = 'test';
-          const output = await route(store, provider, model, body, endpoint, res, controller.signal, nasAgent);
+          const output = await route(store, provider, model, body, endpoint, res, controller.signal, nasAgent, claudeBridge);
           const text = output.choices?.[0]?.message?.content ?? output.output?.filter(i => i.type === 'message').flatMap(i => i.content || []).map(c => c.text || c.refusal || '').join('\n') ?? '';
           log({ model: body.model, endpoint: 'test', status: 200, duration: Date.now() - started });
           return json(res, 200, { text, usage: output.usage, duration: Date.now() - started });
@@ -151,7 +157,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
           requestModel = body.model; requestEndpoint = 'messages';
           if (req.headers['anthropic-version'] && req.headers['anthropic-version'] !== '2023-06-01') throw new HttpError(400, 'Unsupported anthropic-version; use 2023-06-01');
           const {provider, model} = store.resolve(body.model);
-          const result = await sendMessages(body, res, (request, target) => route(store, provider, model, request, 'responses', target, controller.signal, nasAgent));
+          const result = await sendMessages(body, res, (request, target) => route(store, provider, model, request, 'responses', target, controller.signal, nasAgent, claudeBridge));
           log({model:body.model,endpoint:'messages',status:200,duration:Date.now()-started});
           if (result) json(res,200,result);
           return;
@@ -161,7 +167,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
           if (body.stream !== undefined && typeof body.stream !== 'boolean') throw new HttpError(400, 'stream 必须为布尔值');
           const { provider, model } = store.resolve(body.model);
           const endpoint = pathname.slice(4); requestModel = body.model; requestEndpoint = endpoint;
-          const result = await route(store, provider, model, body, endpoint, res, controller.signal, nasAgent);
+          const result = await route(store, provider, model, body, endpoint, res, controller.signal, nasAgent, claudeBridge);
           log({ model: body.model, endpoint, status: 200, duration: Date.now() - started });
           if (result) json(res, 200, result);
           return;

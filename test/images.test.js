@@ -106,7 +106,7 @@ test('Codex provider validation and SSH command construction never interpolate a
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harbor-image-provider-'));
   try {
     const providers = new ImageProviders(new Store(dir));
-    const p = { id: 'nas', name: 'NAS', type: 'codex', execution: 'ssh-docker', sshHost: '192.0.2.10', sshUser: 'example-user', sshKeyPath: '/keys/key', runnerPath: '/workspace/model-harbor/codex-image-runner.py', container: 'codex-linux' };
+    const p = { id: 'nas', name: 'NAS', type: 'codex', execution: 'ssh-docker', sshHost: '192.0.2.10', sshUser: 'exampleuser', sshKeyPath: '/keys/key', runnerPath: '/workspace/model-harbor/codex-image-runner.py', container: 'codex-linux' };
     providers.upsert(p); const configured = providers.get('nas');
     const command = codexCommand(configured, 'generate', '12345678-1234-1234-1234-123456789012');
     assert.equal(command.command, 'ssh'); assert.match(command.args.at(-1), /'python3' '\/workspace\/model-harbor\/codex-image-runner.py' 'generate'/);

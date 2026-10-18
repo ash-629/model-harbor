@@ -49,30 +49,41 @@ $('reset-confirm').addEventListener('click', async () => {
   } catch (e) { errorBox('reset-error', e.message); }
   finally { resetBusy = false; busy = false; $('reset-confirm').disabled = false; $('reset-cancel').disabled = false; $('reset-confirm').textContent = resetLabel(); renderProviders(); }
 });
+function usageTone(value) {
+  if (value === null || value === undefined || value === '') return 'unknown';
+  const percent = Number(value);
+  if (!Number.isFinite(percent)) return 'unknown';
+  if (percent >= 100) return 'critical';
+  if (percent >= 80) return 'danger';
+  if (percent >= 60) return 'warning';
+  return 'safe';
+}
 function usageWindow(window) {
   const label = window.durationMins === 300 ? t('5 小时用量') : window.durationMins === 10080 ? t('每周用量') : window.durationMins ? t('{minutes} 分钟用量', {minutes:window.durationMins}) : t('用量窗口');
   const percent = value => Math.round(value * 10) / 10;
   const known = window.usedPercent !== null && window.usedPercent !== undefined;
+  const tone = known ? usageTone(window.usedPercent) : 'unknown';
   const reset = window.resetsAt ? new Date(window.resetsAt * 1000).toLocaleString(getLanguage()) : t('暂不可用');
-  return `<div class="quota-window"><div class="quota-row"><strong>${h(label)}</strong><span>${known ? h(t('已用 {percent}%', {percent:percent(window.usedPercent)})) : t('暂不可用')}</span></div>${known ? `<progress max="100" value="${window.usedPercent}" aria-label="${h(label)}"></progress><div class="quota-detail">${h(t('剩余 {percent}%', {percent:percent(window.remainingPercent)}))}</div>` : ''}<div class="quota-detail">${h(t('下次重置：{time}', {time:reset}))}</div></div>`;
+  return `<div class="quota-window quota-${tone}"><div class="quota-row"><strong>${h(label)}</strong><span class="quota-used">${known ? h(t('已用 {percent}%', {percent:percent(window.usedPercent)})) : t('暂不可用')}</span></div>${known ? `<progress max="100" value="${window.usedPercent}" aria-label="${h(label)}"></progress><div class="quota-detail">${h(t('剩余 {percent}%', {percent:percent(window.remainingPercent)}))}</div>` : ''}<div class="quota-detail">${h(t('下次重置：{time}', {time:reset}))}</div></div>`;
 }
 function usageMarkup(p) {
-  if (p.type !== 'nas-codex') return '';
-  const usage = usageById.get(p.id), data = usage?.data;
+  if (p.type !== 'nas-codex' && p.type !== 'claude-code') return '';
+  const usage = usageById.get(p.id), data = usage?.data, claude = p.type === 'claude-code';
   let body = '';
   if (data) {
-    const buckets = data.buckets.length ? data.buckets : [{id:'codex', windows:[]}];
+    const buckets = data.buckets?.length ? data.buckets : [{id: claude ? 'claude' : 'codex', windows:[]}];
     body = buckets.map(bucket => {
-      const windows = [...bucket.windows];
+      const windows = [...(bucket.windows || [])];
       for (const durationMins of [300, 10080]) if (!windows.some(w => w.durationMins === durationMins)) windows.push({durationMins, usedPercent:null});
       windows.sort((a,b) => (a.durationMins || Infinity) - (b.durationMins || Infinity));
       return `<div class="quota-bucket">${buckets.length > 1 || bucket.planType ? `<div class="quota-detail">${h(bucket.name || (bucket.id === 'codex' ? t('默认额度') : bucket.id))}${bucket.planType ? ' · ' + h(bucket.planType) : ''}</div>` : ''}${windows.map(usageWindow).join('')}</div>`;
     }).join('');
-    body += `<div class="quota-row quota-resets"><strong>${t('剩余重置次数')}</strong><span>${data.resetCredits === null ? t('暂不可用') : h(t('{count} 次', {count:data.resetCredits}))}</span></div><div class="quota-detail">${h(t('更新于 {time}', {time:new Date(data.checkedAt).toLocaleTimeString(getLanguage())}))}</div><div class="quota-detail">${t('同一账号额度共享；数据最多缓存 30 秒。')}</div>`;
+    if (claude) body += `<div class="quota-detail">${h(t('更新于 {time}', {time:new Date(data.checkedAt).toLocaleTimeString(getLanguage())}))}</div><div class="quota-detail">${t('Claude 用量按账号共享；数据最多缓存 30 秒。')}</div>`;
+    else body += `<div class="quota-row quota-resets"><strong>${t('剩余重置次数')}</strong><span>${data.resetCredits === null ? t('暂不可用') : h(t('{count} 次', {count:data.resetCredits}))}</span></div><div class="quota-detail">${h(t('更新于 {time}', {time:new Date(data.checkedAt).toLocaleTimeString(getLanguage())}))}</div><div class="quota-detail">${t('同一账号额度共享；数据最多缓存 30 秒。')}</div>`;
   }
-  body += `<button class="button secondary quota-reset-button" data-reset-usage="${h(p.id)}" ${busy || usage?.loading || (!(data?.resetCredits > 0) && !pendingResetKey(p.id)) ? 'disabled' : ''}>${pendingResetKey(p.id) ? t('重试同一次重置') : t('重置额度')}</button>`;
+  if (!claude) body += `<button class="button secondary quota-reset-button" data-reset-usage="${h(p.id)}" ${busy || usage?.loading || (!(data?.resetCredits > 0) && !pendingResetKey(p.id)) ? 'disabled' : ''}>${pendingResetKey(p.id) ? t('重试同一次重置') : t('重置额度')}</button>`;
   if (usage?.error) body = `<div class="notice error" role="alert">${h(translateError(usage.error))}</div>` + body;
-  return `<section class="provider-quota"><div class="quota-row"><strong>${t('Codex 账号用量')}</strong><button class="button ghost" data-usage="${h(p.id)}" ${usage?.loading ? 'disabled' : ''}>${usage?.loading ? t('查询中…') : data ? t('刷新用量') : t('查看用量')}</button></div>${body || `<div class="quota-detail">${usage?.loading ? t('正在读取账号额度…') : t('查看用量、重置时间与可用重置次数。')}</div>`}</section>`;
+  return `<section class="provider-quota"><div class="quota-row"><strong>${t(claude ? 'Claude 账号用量' : 'Codex 账号用量')}</strong><button class="button ghost" data-usage="${h(p.id)}" ${usage?.loading ? 'disabled' : ''}>${usage?.loading ? t('查询中…') : data ? t('刷新用量') : t('查看用量')}</button></div>${body || `<div class="quota-detail">${usage?.loading ? t('正在读取账号额度…') : t(claude ? '查看 Claude 的 5 小时与每周用量。' : '查看用量、重置时间与可用重置次数。')}</div>`}</section>`;
 }
 async function loadUsage(id, force = false) {
   const previous = usageById.get(id);
@@ -113,13 +124,13 @@ function renderModels() {
   $('models-empty').querySelector('h3').textContent = state.models.length ? t('没有匹配的模型') : t('把第一个模型接进来');
   $('models-empty').querySelector('p').textContent = state.models.length ? t('试试其他关键词或切换供应商筛选。') : t('添加供应商并刷新模型，或手动填写模型 ID。');
   $('empty-add').hidden = Boolean(state.models.length);
-  $('models-body').innerHTML = models.map(m => `<tr><td><span class="model-name" title="${h(m.name)}">${h(m.name)}</span><code class="model-id">${h(m.id)}</code></td><td><span class="source-badge">${h(m.provider_name)}</span></td><td><span class="source-badge ${m.source === 'nas-codex' ? 'bridge-badge' : ''}">${m.source === 'nas-codex' ? t('Codex 工具桥接') : 'API'}</span></td><td><button class="button ghost" data-test="${h(m.id)}">${t('测试 ↗')}</button></td></tr>`).join('');
+  $('models-body').innerHTML = models.map(m => `<tr><td><span class="model-name" title="${h(m.name)}">${h(m.name)}</span><code class="model-id">${h(m.id)}</code></td><td><span class="source-badge">${h(m.provider_name)}</span></td><td><span class="source-badge ${m.source === 'nas-codex' || m.source === 'claude-code' ? 'bridge-badge' : ''}">${m.source === 'nas-codex' ? t('Codex 工具桥接') : m.source === 'claude-code' ? t('Claude 工具桥接') : 'API'}</span></td><td><button class="button ghost" data-test="${h(m.id)}">${t('测试 ↗')}</button></td></tr>`).join('');
   $('model-footer').textContent = t('共 {count} 个模型 · 仅显示已启用供应商的配置模型', {count: models.length});
   $('refresh-all').disabled = busy || !state.providers.some(p => p.enabled);
 }
 function renderProviders() {
   $('providers-empty').hidden = Boolean(state.providers.length);
-  $('providers-grid').innerHTML = state.providers.map(p => `<article class="panel provider-card"><div class="provider-top"><div class="provider-mark">${p.type === 'nas-codex' ? '⌂' : h(p.name.slice(0, 1).toUpperCase())}</div><span class="status-pill ${p.enabled ? '' : 'off'}">${p.enabled ? t('已启用') : t('已停用')}</span></div><h3>${h(p.name)}</h3><code class="model-id">${h(p.id)} / ${p.type === 'nas-codex' ? (p.execution === 'ssh' ? 'Codex · SSH' : 'Codex · SSH + Docker') : h(p.protocol)}</code><p>${h(p.baseUrl || `${p.sshUser}@${p.sshHost}${p.execution === 'ssh' ? '' : ' · ' + p.container}`)}</p><div class="provider-meta"><span>${t('{count} 个模型', {count: p.models.length})}</span><span>·</span><span>${p.lastSync ? t('同步于 {time}', {time: new Date(p.lastSync).toLocaleTimeString(getLanguage(), {hour:'2-digit',minute:'2-digit'})}) : t('尚未同步')}</span></div>${usageMarkup(p)}<div class="provider-actions"><button class="button ghost" data-refresh="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('↻ 刷新模型')}</button><button class="button ghost" data-edit="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('编辑')}</button><button class="button ghost danger" data-delete="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('删除')}</button></div></article>`).join('');
+  $('providers-grid').innerHTML = state.providers.map(p => `<article class="panel provider-card"><div class="provider-top"><div class="provider-mark">${p.type === 'nas-codex' ? '⌂' : p.type === 'claude-code' ? '✦' : h(p.name.slice(0, 1).toUpperCase())}</div><span class="status-pill ${p.enabled ? '' : 'off'}">${p.enabled ? t('已启用') : t('已停用')}</span></div><h3>${h(p.name)}</h3><code class="model-id">${h(p.id)} / ${p.type === 'nas-codex' ? (p.execution === 'ssh' ? 'Codex · SSH' : 'Codex · SSH + Docker') : p.type === 'claude-code' ? (p.execution === 'ssh' ? 'Claude · SSH' : 'Claude · SSH + Docker') : h(p.protocol)}</code><p>${h(p.baseUrl || `${p.sshUser}@${p.sshHost}${p.execution === 'ssh' ? '' : ' · ' + p.container}`)}</p><div class="provider-meta"><span>${t('{count} 个模型', {count: p.models.length})}</span><span>·</span><span>${p.lastSync ? t('同步于 {time}', {time: new Date(p.lastSync).toLocaleTimeString(getLanguage(), {hour:'2-digit',minute:'2-digit'})}) : t('尚未同步')}</span></div>${usageMarkup(p)}<div class="provider-actions"><button class="button ghost" data-refresh="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('↻ 刷新模型')}</button><button class="button ghost" data-edit="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('编辑')}</button><button class="button ghost danger" data-delete="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('删除')}</button></div></article>`).join('');
 }
 function renderLogs() {
   $('logs-empty').hidden = Boolean(state.logs.length);
@@ -127,7 +138,7 @@ function renderLogs() {
 }
 function capability() {
   const model = state.models.find(m => m.id === $('test-model').value);
-  $('test-capability').textContent = model?.source === 'nas-codex' ? t('远程 Codex 支持客户端工具调用；由客户端执行工具，远端负责推理。') : '';
+  $('test-capability').textContent = model?.source === 'nas-codex' ? t('远程 Codex 支持客户端工具调用；由客户端执行工具，远端负责推理。') : model?.source === 'claude-code' ? t('Claude Code 支持客户端 function/custom 工具；由客户端执行操作，容器负责推理。') : '';
 }
 const views = new Set(['overview', 'providers', 'images', 'logs', 'settings']);
 function viewFromLocation() {
@@ -145,7 +156,7 @@ function view(name, { updateUrl = true } = {}) {
   const names = { settings: [t('设置'), t('管理你的模型港。'), t('配置管理页面的登录方式。')], images: [t('生成图像'), t('描述你的想象。'), t('从一句话开始，把想法变成可以保存的图像。')], overview: [t('模型总览'), t('所有模型，一个入口。'), t('连接不同来源，在同一份模型列表里自由选择。')], providers: [t('供应商'), t('连接你的模型来源。'), t('统一管理 API 服务与远程 Codex。')], logs: [t('请求记录'), t('每一次调用，都有迹可循。'), t('检查路由结果、响应状态与请求耗时。')] };
   [$('page-name').textContent, $('heading').textContent, $('subtitle').textContent] = names[name];
   if (name === 'settings') loadSettings();
-  if (name === 'providers') for (const p of state.providers) if (p.type === 'nas-codex' && p.enabled) loadUsage(p.id);
+  if (name === 'providers') for (const p of state.providers) if ((p.type === 'nas-codex' || p.type === 'claude-code') && p.enabled) loadUsage(p.id);
   if (updateUrl && location.hash !== '#' + name) history.pushState({ view: name }, '', '#' + name);
 }
 let settingsLoading = false;
@@ -180,26 +191,42 @@ $('settings-form').addEventListener('submit', async event => {
 });
 $('settings-relogin').addEventListener('click', () => location.reload());
 function typeFields() {
-  const remoteCodex = $('p-type').value === 'nas-codex';
-  $('remote-codex-fields').hidden = !remoteCodex; $('http-fields').hidden = remoteCodex;
-  $('p-url').required = !remoteCodex;
-  ['p-host', 'p-user', 'p-ssh-key'].forEach(id => $(id).required = remoteCodex);
+  const type = $('p-type').value;
+  const claude = type === 'claude-code';
+  const remote = type === 'nas-codex' || claude;
+  $('remote-codex-fields').hidden = !remote; $('http-fields').hidden = remote;
+  $('p-url').required = !remote;
+  ['p-host', 'p-user', 'p-ssh-key'].forEach(id => $(id).required = remote);
   const docker = $('p-execution').value === 'ssh-docker';
-  $('p-container-label').hidden = !docker; $('p-container').required = remoteCodex && docker;
-  $('p-codex-label').hidden = docker; $('p-codex').required = remoteCodex && !docker;
+  $('p-container-label').hidden = !docker; $('p-container').required = remote && docker;
+  $('p-docker-label').hidden = !docker; $('p-docker-path').required = remote && docker;
+  $('p-codex-label').hidden = !remote;
+  if (!remote) return;
+  $('p-remote-notice').textContent = t(claude
+    ? '通过 SSH 调用 Claude Code，支持客户端工具和图片。目标环境需安装并登录 Claude Code，并部署工具执行器；工具由客户端执行。'
+    : '通过 SSH 调用主机或容器里的官方 Codex CLI。支持文本、图片与客户端 function/custom 工具；由客户端执行命令和文件修改。目标环境需已安装并登录 Codex。');
+  $('p-cli-label-text').textContent = t(claude ? 'Claude Code 可执行文件路径' : 'Codex 可执行文件路径');
+  $('p-cli-help').textContent = t(claude
+    ? '填写目标主机或容器内的路径；仅当 PATH 包含 claude 时使用 claude。需要 Linux、timeout、python3 和工具执行器。'
+    : '填写 Codex 命令或目标主机/容器内的绝对路径，默认 codex。使用官方 Codex CLI；无需安装 Python 执行器。');
+  $('p-codex').placeholder = claude ? '/home/dev/.local/bin/claude' : '/home/ubuntu/.local/bin/codex';
 }
+
 function openEditor(id) {
   editing = id || null; $('provider-form').reset(); errorBox('editor-error');
   const p = id ? state.providers.find(p => p.id === id) : null;
   $('editor-title').textContent = p ? t('编辑供应商') : t('添加供应商');
   $('p-id').disabled = Boolean(p); $('preset-label').hidden = Boolean(p);
   $('p-type').value = p?.type || 'openai';
-  $('p-execution').value = p?.execution || 'ssh-docker'; $('p-codex').value = p?.codexPath || 'codex';
+  $('p-execution').value = p?.execution || 'ssh-docker';
+  $('p-codex').value = p ? (p.claudePath || p.codexPath || (p.type === 'claude-code' ? 'claude' : 'codex')) : 'codex';
   $('key-help').textContent = p?.hasApiKey ? t('已保存密钥，留空保持原值；输入新密钥可替换。') : t('密钥在服务端加密保存。');
   $('clear-key-label').hidden = !p?.hasApiKey;
   if (p) {
-    const fields = { 'p-name': 'name', 'p-id': 'id', 'p-url': 'baseUrl', 'p-protocol': 'protocol', 'p-host': 'sshHost', 'p-user': 'sshUser', 'p-ssh-key': 'sshKeyPath', 'p-container': 'container', 'p-timeout': 'timeout' };
+    const fields = { 'p-name': 'name', 'p-id': 'id', 'p-url': 'baseUrl', 'p-protocol': 'protocol', 'p-host': 'sshHost', 'p-user': 'sshUser', 'p-ssh-port': 'sshPort', 'p-ssh-key': 'sshKeyPath', 'p-container': 'container', 'p-docker-path': 'dockerPath', 'p-timeout': 'timeout' };
     for (const [id, key] of Object.entries(fields)) $(id).value = p[key] ?? '';
+    $('p-ssh-port').value = p.sshPort || 22;
+    $('p-docker-path').value = p.dockerPath || '/usr/local/bin/docker';
     $('p-models').value = p.models.join('\n'); $('p-enabled').checked = p.enabled;
   }
   typeFields(); $('provider-dialog').showModal();
@@ -207,15 +234,30 @@ function openEditor(id) {
 $('p-execution').addEventListener('change', typeFields);
 $('preset').addEventListener('change', () => {
   const preset = $('preset').value;
-  $('p-type').value = preset === 'remote-codex' ? 'nas-codex' : 'openai';
-  const config = { custom: ['', '', '', 'chat'], deepseek: ['DeepSeek', 'deepseek', 'https://api.deepseek.com/v1', 'chat'], openai: ['OpenAI', 'openai', 'https://api.openai.com/v1', 'both'], 'remote-codex': [t('远程 Codex'), 'codex', '', 'chat'] }[preset];
+  $('p-type').value = preset === 'remote-codex' ? 'nas-codex' : preset === 'claude-code' ? 'claude-code' : 'openai';
+  const config = { custom: ['', '', '', 'chat'], deepseek: ['DeepSeek', 'deepseek', 'https://api.deepseek.com/v1', 'chat'], openai: ['OpenAI', 'openai', 'https://api.openai.com/v1', 'both'], 'remote-codex': [t('远程 Codex'), 'codex', '', 'chat'], 'claude-code': [t('Claude Code'), 'claude', '', 'chat'] }[preset];
   [$('p-name').value, $('p-id').value, $('p-url').value, $('p-protocol').value] = config;
-  $('p-key').value = ''; $('p-models').value = ''; typeFields();
+  $('p-key').value = ''; $('p-models').value = '';
+  if (preset === 'claude-code') {
+    $('p-execution').value = 'ssh-docker';
+    $('p-container').value = 'claude-linux';
+    $('p-codex').value = 'claude';
+    $('p-ssh-key').value = '/home/node/.ssh/id_ed25519';
+    $('p-ssh-port').value = '22';
+    $('p-docker-path').value = '/usr/local/bin/docker';
+    $('p-models').value = 'sonnet\nopus\nhaiku';
+  } else if (preset === 'remote-codex') {
+    $('p-execution').value = 'ssh-docker';
+    $('p-container').value = 'codex-linux';
+    $('p-codex').value = 'codex';
+    $('p-timeout').value = '600';
+  }
+  typeFields();
 });
 $('provider-form').addEventListener('submit', async event => {
   event.preventDefault(); if (busy) return;
   const input = { id: $('p-id').value.trim(), name: $('p-name').value, type: $('p-type').value, baseUrl: $('p-url').value.trim(), protocol: $('p-protocol').value, apiKey: $('p-key').value, clearApiKey: $('p-clear-key').checked, enabled: $('p-enabled').checked,
-    models: $('p-models').value.split(/[\n,，]/).map(m => m.trim()).filter(Boolean), timeout: Number($('p-timeout').value), sshHost: $('p-host').value.trim(), sshUser: $('p-user').value.trim(), sshKeyPath: $('p-ssh-key').value.trim(), container: $('p-container').value.trim(), execution: $('p-execution').value, codexPath: $('p-codex').value.trim() };
+    models: $('p-models').value.split(/[\n,，]/).map(m => m.trim()).filter(Boolean), timeout: Number($('p-timeout').value), sshHost: $('p-host').value.trim(), sshUser: $('p-user').value.trim(), sshPort: Number($('p-ssh-port').value || 22), sshKeyPath: $('p-ssh-key').value.trim(), container: $('p-container').value.trim(), dockerPath: $('p-docker-path').value.trim(), execution: $('p-execution').value, codexPath: $('p-type').value === 'nas-codex' ? $('p-codex').value.trim() : undefined, claudePath: $('p-type').value === 'claude-code' ? $('p-codex').value.trim() : undefined };
   busy = true; saving = true; $('save-provider').disabled = true; $('save-provider').textContent = t('正在保存…'); errorBox('editor-error');
   try {
     await api('/providers' + (editing ? '/' + editing : ''), { method: editing ? 'PUT' : 'POST', body: JSON.stringify(input) });
@@ -329,6 +371,7 @@ function applyLanguage() {
   for (const [id, message] of errorsById) $(id).textContent = translateError(message) || '';
   renderTestOutput();
   renderSelectors(); renderModels(); renderProviders(); renderLogs(); capability();
+  if ($('provider-dialog').open) typeFields();
   $('editor-title').textContent = t(editing ? '编辑供应商' : '添加供应商');
   $('key-help').textContent = t(editing && state.providers.find(p => p.id === editing)?.hasApiKey ? '已保存密钥，留空保持原值；输入新密钥可替换。' : '密钥在服务端加密保存。');
   $('save-provider').textContent = t(saving ? '正在保存…' : '保存供应商');

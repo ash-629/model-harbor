@@ -65,7 +65,7 @@ test('usage management endpoint requires admin session and does not expose raw a
   } finally { bridge.close(); gateway.server.closeAllConnections(); await new Promise(resolve=>gateway.server.close(resolve)); fs.rmSync(dir,{recursive:true,force:true}); }
 });
 
-const resetInput={confirmed:true,idempotencyKey:'00000000-0000-4000-8000-000000000001'};
+const resetInput={confirmed:true,idempotencyKey:'8ae96ff3-3425-4f4c-8772-b6fd61502868'};
 test('reset simulation preserves idempotency, refreshes authoritative usage and never decrements locally', async () => {
   const fake=fakeUsage(), bridge=new NasAgentBridge({launch:fake.launch});
   try {

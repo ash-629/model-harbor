@@ -1,13 +1,14 @@
 # Model Harbor · 模型港
 
-个人使用的多供应商模型网关，提供统一 OpenAI 兼容地址和中英文像素风管理页面。需要 Node.js 22+，无第三方 npm 运行依赖。
+个人和可信局域网使用的多供应商模型网关：统一 OpenAI / Anthropic 兼容地址、官方 Codex 与 Claude Code 远程编排、中英文像素风管理页面和网页生图。需要 Node.js 22+，无第三方 npm 运行依赖。
 
 ## 功能
 
 - 管理 OpenAI 兼容供应商，自动发现或手动填写模型，使用供应商前缀区分同名模型。
 - `/v1/models`、`/v1/chat/completions`、`/v1/responses`，原协议转发及 Chat → Responses 转换。
 - `/v1/messages` 接收 Anthropic Messages 请求，并转换到现有 Responses 路由。
-- 通过 SSH 或 SSH + Docker 接入已登录的 Codex app-server；支持客户端 function/custom 工具往返、用量查询及确认后手动重置额度。
+- 通过 SSH 或 SSH + Docker 接入官方 Codex app-server；支持客户端 function/custom/namespace 工具、完整结构化历史、实时文本 SSE、用量查询及确认后手动重置额度。
+- 通过 SSH 或 SSH + Docker 接入官方 Claude Code；支持客户端工具、图片输入、工具图片结果和多轮往返。
 - 网页生图：OpenAI 兼容 Images API、MiniMax API、本机或远程 Codex；参考图、后台队列、历史和原图下载。
 - “设置”菜单可启用或关闭管理页面的用户名密码登录，立即生效并持久化。
 
@@ -54,19 +55,42 @@ docker compose up -d --build
 
 关闭管理登录后，任何能访问该地址的人都可以管理模型港。此开关不会关闭 `/v1` 的 Bearer API Key 验证。
 
-## Codex 与图像执行器
+## Codex 官方 CLI 接入
 
-SSH 目标需安装并登录 Codex，并提供 `python3` 和 `timeout`。Docker 模式需要容器名及免交互 Docker 权限；聊天模型发现兼容容器用户目录 `/home/dev/.codex/models_cache.json`，不同布局需调整对应路径。纯 SSH 模式从目标账号的 Codex 目录发现模型。
+Codex 聊天链路使用目标环境中的官方 `codex app-server`，通过 SSH 或 SSH + Docker 运行。模型港只负责编排和协议转换，不读取或导出 `auth.json`，也不直接请求 Codex 私有 Responses 接口。
 
-原生 Responses 直连使用 `src/codex-responses-runner.py`，需放到目标环境的 `/workspace/model-harbor/codex-responses-runner.py`；如果修改了固定路径，应同步调整 `src/nas-responses.js` 与受限 SSH 命令。
+前置条件：目标主机或容器已安装并登录官方 Codex；模型港容器可读取 SSH 私钥；SSH + Docker 模式还需要目标用户的免交互 Docker 权限。
 
-生图时，从管理页下载执行器，或使用 `src/codex-image-runner.py`，放到目标环境的专用目录。配置执行器绝对路径、SSH 主机、用户和私钥路径。预先核对并信任 SSH 主机密钥；Docker 中的私钥应由部署者自行只读挂载。不要提交私钥或 Codex 登录文件。
+配置字段包括执行方式、SSH 主机/用户/端口/私钥、Docker 容器名、Docker 命令路径、CLI 可执行文件路径和请求超时。大历史建议设置 600 秒超时。
 
-`examples/ssh-command-guard.py` 是可选的受限 SSH 强制命令示例，默认容器名 `codex-linux`、容器用户目录 `/home/dev`，并限制为图像执行器和 Responses 转发程序的固定路径。使用前必须与自己的部署配置对齐，它不是通用 SSH 权限配置工具。
+实现要点：
+
+- 模型发现使用官方 `model/list`，不读取 `models_cache.json`。
+- 新建会话先启动 ephemeral `thread/start` 并注册动态客户端工具，再通过分块的 `thread/inject_items` 注入结构化历史；`turn/start` 只发送当前用户消息。
+- function、custom、namespace、tool_search 等客户端工具会映射为原生动态工具调用，工具在客户端执行，结果回到同一推理回合。
+- `item/agentMessage/delta` 会实时转换为 Responses SSE 文本增量；工具调用项仍在回合完成后汇总。
+- `thread/inject_items` 是实验接口。旧 CLI 不支持时，只有不超过 1,048,576 字符的历史可使用短历史兼容路径；长历史会明确报错，不会静默截断或改走 token 直连。
+- 长历史仍受模型上下文窗口限制；字符数不是 token 上限。
+- 不支持 `previous_response_id`、服务端响应存储、`store=true`、WebSocket 和 compact，客户端应发送完整历史和 `store=false`。
+- 远程 app-server 的 shell、patch、apps、plugins、MCP、图片生成和多代理工具默认关闭，远程进程只负责推理。
+
+`examples/ssh-command-guard.py` 是可选的受限 SSH 强制命令示例。它默认使用 `codex-linux`、`/usr/local/bin/docker` 和固定 Codex 路径；使用前必须按自己的容器、用户目录、CLI 路径和时间限制修改。
+
+## Claude Code 官方 CLI 接入
+
+Claude 聊天链路使用官方 Claude Code 的 `--json-schema` / `stream-json` 能力。模型港通过 SSH 或 SSH + Docker 启动 `claude-tool-runner.py`，官方 CLI 负责认证和推理，客户端工具在调用方执行。
+
+目标环境需安装并登录 Claude Code，并提供 `python3`、`timeout` 和可执行的 Claude CLI。执行器源码为 `src/claude-tool-runner.py`，默认目标路径为 `/workspace/model-harbor/claude-tool-runner.py`。
+
+支持 function/custom/namespace、长工具名、客户端 tool search、图片输入、工具图片结果和多轮工具往返；Claude 模型别名默认为 `sonnet`、`opus`、`haiku`。该链路直接使用官方 CLI 登录，不通过模型港读取或转发订阅 token。
+
+## 网页生图
+
+生图入口位于管理页「生图」，支持 OpenAI 兼容或 MiniMax Images API、本机或远程 Codex。Codex 生图执行器是 `src/codex-image-runner.py`，与 Codex 聊天接入相互独立；远程生图仍需安装、登录 Codex 并部署该执行器。参考图最多 3 张，具体限制以页面和服务商能力为准。
 
 ## 协议边界
 
-Codex 桥接要求完整历史和 `store=false`；不支持持久 Responses 查询、`previous_response_id`、WebSocket 或 compact。工具由客户端执行，远程 Codex 负责推理。custom grammar 作为指令传递，不提供原生语法强制校验。输出 token 预算转为模型提示，响应 metadata 披露该限制，不保证严格截断。工具定义或预算变化可能重建上下文。
+Codex 桥接要求完整历史和 `store=false`；不支持持久 Responses 查询、`previous_response_id`、服务端响应存储、WebSocket 或 compact。工具由客户端执行，远程 Codex 负责推理。custom grammar 作为指令传递，不提供原生语法强制校验。输出 token 字段转为生成提示，不保证严格截断。工具定义、预算或模型变化可能重建上下文。
 
 原生 API 供应商按所选协议转发。Chat → Responses 转换支持的能力取决于上游，不等同所有原生 Responses 特性。原生文字搜索可在 Codex 支持时启用，图片搜索声明不会被冒充为实际图片检索能力。
 
@@ -85,6 +109,6 @@ npm test
 npm run check
 ```
 
-测试使用模拟上游和临时数据，不调用真实模型、不消耗真实账号重置次数。Python 执行器与 Responses 转发测试需 Python 3。支持 Windows 和 Linux 开发，远程 SSH 执行环境需 POSIX 工具。
+当前 Node 回归测试为 70 项，覆盖管理鉴权、供应商 CRUD、协议转换、流式 SSE、客户端工具往返、长历史注入、模型发现、Codex/Claude 工具桥接、图片队列和 i18n。测试使用模拟上游和临时数据，不调用真实模型、不消耗真实账号重置次数。
 
 字体及其许可证见 [public/FONT-LICENSE.txt](public/FONT-LICENSE.txt)。

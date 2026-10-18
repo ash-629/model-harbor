@@ -45,7 +45,7 @@ export class Store {
     const old = oldId ? this.get(oldId) : null;
     if (!old && this.data.providers.some(p => p.id === id)) throw new HttpError(409, '供应商前缀已存在');
     const type = input.type || 'openai';
-    if (!['openai', 'nas-codex'].includes(type)) throw new HttpError(400, '未知供应商类型');
+    if (!['openai', 'nas-codex', 'claude-code'].includes(type)) throw new HttpError(400, '未知供应商类型');
     if (old && old.type !== type) throw new HttpError(400, '已有供应商的类型不可修改');
     const models = input.models ?? old?.models ?? [];
     if (!Array.isArray(models) || models.length > 2000 || models.some(m => typeof m !== 'string' || !m.trim() || m.length > 200 || /[\r\n\x00]/.test(m))) throw new HttpError(400, '模型列表应为有效模型 ID 数组（最多 2000 项）');
@@ -53,29 +53,41 @@ export class Store {
       id, name: String(input.name || id).trim().slice(0, 80), type,
       enabled: input.enabled !== false, models: [...new Set(models.map(m => m.trim()))],
       apiKey: input.clearApiKey ? '' : input.apiKey ? this.seal(String(input.apiKey)) : old?.apiKey || '',
-      protocol: input.protocol || 'chat', timeout: Number(input.timeout ?? 180),
+      protocol: input.protocol || 'chat', timeout: Number(input.timeout ?? old?.timeout ?? (type === 'nas-codex' ? 600 : 180)),
       updatedAt: new Date().toISOString(), lastSync: old?.lastSync || null
     };
     if (!Number.isFinite(p.timeout) || p.timeout < 10 || p.timeout > 600) throw new HttpError(400, '超时应为 10–600 秒');
     if (!['chat', 'responses', 'both'].includes(p.protocol)) throw new HttpError(400, '无效的接口协议');
+    const validateRemote = () => {
+      p.execution = input.execution ?? old?.execution ?? 'ssh-docker';
+      if (!['ssh', 'ssh-docker'].includes(p.execution)) throw new HttpError(400, '请选择 SSH 或 SSH + Docker 执行方式');
+      for (const k of ['sshHost', 'sshUser', ...(p.execution === 'ssh-docker' ? ['container'] : [])]) {
+        p[k] = String(input[k] ?? old?.[k] ?? '');
+        if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(p[k])) throw new HttpError(400, `${k} 格式不正确`);
+      }
+      p.sshPort = Number(input.sshPort ?? old?.sshPort ?? 22);
+      if (!Number.isInteger(p.sshPort) || p.sshPort < 1 || p.sshPort > 65535) throw new HttpError(400, 'SSH 端口应为 1–65535');
+      p.sshKeyPath = String(input.sshKeyPath ?? old?.sshKeyPath ?? '');
+      if (!p.sshKeyPath || /[\r\n\x00]/.test(p.sshKeyPath)) throw new HttpError(400, '请输入 SSH 私钥绝对路径');
+    };
     if (type === 'openai') {
       let url; try { url = new URL(input.baseUrl); } catch { throw new HttpError(400, '请输入有效的 API Base URL'); }
       if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new HttpError(400, 'API 地址只支持 HTTP/HTTPS，不应含认证、查询或片段');
       p.baseUrl = url.toString().replace(/\/+$/, '');
       if (/\/(models|responses|chat\/completions)$/.test(p.baseUrl)) throw new HttpError(400, '请输入 Base URL，例如 https://api.example.com/v1，不包含具体接口路径');
+    } else if (type === 'nas-codex') {
+      validateRemote();
+      p.codexPath = String(input.codexPath ?? old?.codexPath ?? 'codex').trim();
+      if (p.codexPath !== 'codex' && !/^\/[A-Za-z0-9_./ -]+$/.test(p.codexPath)) throw new HttpError(400, 'Codex 路径须为 codex 或目标主机/容器内的绝对路径');
+      if (p.execution === 'ssh-docker') p.dockerPath = String(input.dockerPath ?? old?.dockerPath ?? '/usr/local/bin/docker').trim();
+      if (p.dockerPath && !/^\/[A-Za-z0-9_./-]+$/.test(p.dockerPath)) throw new HttpError(400, 'Docker 命令须为目标主机上的绝对路径');
+      p.protocol = 'chat';
     } else {
-      p.execution = input.execution ?? old?.execution ?? 'ssh-docker';
-      if (!['ssh', 'ssh-docker'].includes(p.execution)) throw new HttpError(400, '请选择 SSH 或 SSH + Docker 执行方式');
-      for (const k of ['sshHost', 'sshUser', ...(p.execution === 'ssh-docker' ? ['container'] : [])]) {
-        p[k] = String(input[k] || '');
-        if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(p[k])) throw new HttpError(400, `${k} 格式不正确`);
-      }
-      if (p.execution === 'ssh') {
-        p.codexPath = String(input.codexPath ?? old?.codexPath ?? 'codex').trim();
-        if (p.codexPath !== 'codex' && !/^\/[A-Za-z0-9_./ -]+$/.test(p.codexPath)) throw new HttpError(400, 'Codex 路径须为 codex 或目标主机上的绝对路径');
-      }
-      p.sshKeyPath = String(input.sshKeyPath || '');
-      if (!p.sshKeyPath || /[\r\n\x00]/.test(p.sshKeyPath)) throw new HttpError(400, '请输入 SSH 私钥绝对路径');
+      validateRemote();
+      p.claudePath = String(input.claudePath ?? old?.claudePath ?? 'claude').trim();
+      if (p.claudePath !== 'claude' && !/^\/[A-Za-z0-9_./-]+$/.test(p.claudePath)) throw new HttpError(400, 'Claude Code 路径须为 claude 或目标主机/容器内的绝对路径');
+      p.dockerPath = String(input.dockerPath ?? old?.dockerPath ?? '/usr/local/bin/docker').trim();
+      if (!/^\/[A-Za-z0-9_./-]+$/.test(p.dockerPath)) throw new HttpError(400, 'Docker 命令须为目标主机上的绝对路径');
       p.protocol = 'chat';
     }
     if (old) this.data.providers[this.data.providers.indexOf(old)] = p; else this.data.providers.push(p);
@@ -92,7 +104,7 @@ export class Store {
     return this.data.providers.filter(p => p.enabled).flatMap(p => p.models.map(model => ({
       id: `${p.id}/${model}`, object: 'model', created: 0, owned_by: p.id,
       name: model, provider_name: p.name, source: p.type,
-      capabilities: { tools: true, custom_tools: p.type === 'nas-codex' || p.protocol !== 'chat', text: true, cli_bridge: p.type === 'nas-codex' }
+      capabilities: { tools: true, custom_tools: p.type === 'nas-codex' || p.type === 'claude-code' || p.protocol !== 'chat', text: true, cli_bridge: p.type === 'nas-codex' || p.type === 'claude-code' }
     })));
   }
   resolve(model) {

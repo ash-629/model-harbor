@@ -3,12 +3,13 @@ import { spawn } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { HttpError } from './store.js';
 import { uid, openSSE, writeSSE, fromChat } from './protocol.js';
-import { runtimePrefix, codexExecutable, modelCommand } from './remote-codex.js';
+import { runtimePrefix, codexExecutable, sshCommand } from './remote-codex.js';
 const quote = s => "'" + String(s).replace(/'/g, "'\\''") + "'";
 
 export function remote(p, command, stdin = '', signal) {
   return new Promise((resolve, reject) => {
-    const child = spawn('ssh', ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=8', '-o', 'ServerAliveInterval=15', '-i', p.sshKeyPath, `${p.sshUser}@${p.sshHost}`, command.map(quote).join(' ')], { windowsHide: true, signal });
+    const ssh = sshCommand(p, command);
+    const child = spawn(ssh.command, ssh.args, { windowsHide: true, signal });
     let out = '', err = '', size = 0; const decoder = new StringDecoder('utf8');
     const timer = setTimeout(() => { child.kill(); reject(new HttpError(504, '远程调用超时')); }, (p.timeout || 180) * 1000 + 10000);
     child.stdout.on('data', data => { size += data.length; if (size > 8 * 1024 * 1024) { child.kill(); reject(new HttpError(502, '远程输出超出限制')); } else out += decoder.write(data); });
@@ -26,11 +27,6 @@ export function remote(p, command, stdin = '', signal) {
     });
     child.stdin.end(stdin);
   });
-}
-export async function nasModels(p, signal) {
-  const result = JSON.parse(await remote(p, modelCommand(p), '', signal));
-  if (!Array.isArray(result) || !result.length) throw new HttpError(502, '远程模型缓存为空，请在目标环境启动 Codex 更新缓存，或手工填写模型');
-  return result;
 }
 function textContent(content) {
   if (typeof content === 'string') return content;
