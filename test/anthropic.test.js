@@ -16,12 +16,12 @@ test('Anthropic returns real tools, max_tokens stop and separates cached input u
  const a=fromResponses(response,'remote/m');assert.equal(a.stop_reason,'tool_use');assert.deepEqual(a.content[0],{type:'tool_use',id:'t1',name:'read',input:{a:1}});assert.equal(a.usage.input_tokens,40);assert.equal(a.usage.cache_read_input_tokens,60);
  assert.equal(fromResponses({...response,output:[],status:'incomplete',incomplete_details:{reason:'max_output_tokens'}},'m').stop_reason,'max_tokens');
 });
-test('Anthropic thinking accepts enabled/adaptive/disabled, preserves historical thinking, and removes sampling for Codex',()=>{
+test('Anthropic thinking accepts enabled/adaptive/disabled, omits historical thinking from answer text, and removes sampling for Codex',()=>{
  const b={model:'m',max_tokens:10,messages:[{role:'user',content:'hi'}]};
  for(const patch of [{max_tokens:0},{stream:'yes'},{thinking:{type:'bogus'}},{stop_sequences:['stop']},{top_k:5},{messages:[{role:'user',content:[{type:'document'}]}]}])assert.throws(()=>toResponses({...b,...patch}),e=>e.status===400);
  for(const thinking of [{type:'disabled'},{type:'enabled',budget_tokens:1024},{type:'adaptive'}])assert.doesNotThrow(()=>toResponses({...b,thinking,temperature:1,top_p:.9}));
  const mapped=toResponses({...b,thinking:{type:'enabled',budget_tokens:32000},context_management:{edits:[{type:'clear_tool_uses_20250919'}]},container:'c'});assert.equal(mapped.reasoning.effort,'high');
- const history=toResponses({...b,messages:[{role:'assistant',content:[{type:'thinking',thinking:'prior thought',signature:'sig'},{type:'redacted_thinking',data:'opaque'},{type:'text',text:'answer'}]}]});assert.deepEqual(history.input[0].content.map(x=>x.text),['prior thought','answer']);
+ const history=toResponses({...b,messages:[{role:'assistant',content:[{type:'thinking',thinking:'prior thought',signature:'sig'},{type:'redacted_thinking',data:'opaque'},{type:'text',text:'answer'}]}]});assert.deepEqual(history.input[0].content.map(x=>x.text),['answer']);
  assert.equal(toResponses({...b,messages:[{role:'user',content:'one'},{role:'system',content:[{type:'text',text:'mid-conversation rule'}]}]}).input[1].role,'developer');
 });
 test('Messages HTTP authenticates SDK headers and Bearer, emits Anthropic SSE, resumes tools, and reports errors',async()=>{

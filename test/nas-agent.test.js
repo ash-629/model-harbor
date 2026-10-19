@@ -5,7 +5,7 @@ import { PassThrough, Writable } from 'node:stream';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { NasAgentBridge, toolSpecs, agentInput, validateAgent, agentCommand, outputBudget } from '../src/nas-agent.js';
+import { NasAgentBridge, historyItems, toolSpecs, fitToolSpecs, deferToolSpecs, agentInput, validateAgent, agentCommand, outputBudget } from '../src/nas-agent.js';
 import { sseEvents } from '../src/protocol.js';
 import { createGateway } from '../src/server.js';
 
@@ -15,7 +15,7 @@ const tools = [{ type: 'namespace', name: 'functions', tools: [
   { type: 'custom', name: 'apply_patch', format: { type: 'grammar', syntax: 'lark', definition: 'start: /.+/s' } },
   { type: 'function', name: 'read_file', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
 ] }];
-function fakeLaunch({ hang = false, malformed = false, webSearch = false, echoInput = false, streamText = false } = {}) {
+function fakeLaunch({ hang = false, malformed = false, webSearch = false, echoInput = false, streamText = false, errorEvent = null, unknownTool = false } = {}) {
   const children = [], exchanges = []; let counter = 0;
   const launch = () => {
     const child = new EventEmitter(), serial = ++counter; let specs, step = 0;
@@ -30,10 +30,11 @@ function fakeLaunch({ hang = false, malformed = false, webSearch = false, echoIn
       emit({ method: 'item/completed', params: { item: { type: 'agentMessage', id, text, phase: 'final_answer' } } });
       emit({ method: 'turn/completed', params: { turn: { status: 'completed' } } });
     };
+    const flatten = value => (value || []).flatMap(spec => spec.type === 'namespace' ? spec.tools.map(tool => ({ ...tool, namespace: spec.name })) : [{ ...spec, namespace: null }]);
     const call = () => {
-      const tool = specs[step];
+      const tool = flatten(specs)[step];
       if (!tool) return completed('CLIENT_RESULT_OK');
-      emit({ id: 'rpc-' + serial + '-' + step, method: 'item/tool/call', params: { threadId: 'thread', turnId: 'turn', callId: 'call-' + serial + '-' + step, tool: tool.name, arguments: step ? { path: 'result.txt' } : { input: patch } } });
+      emit({ id: 'rpc-' + serial + '-' + step, method: 'item/tool/call', params: { threadId: 'thread', turnId: 'turn', callId: 'call-' + serial + '-' + step, tool: tool.name, ...(tool.namespace ? { namespace: tool.namespace } : {}), arguments: step ? { path: 'result.txt' } : { input: patch } } });
     };
     child.stdin = new Writable({ write(chunk, encoding, done) {
       for (const line of chunk.toString().trim().split('\n')) {
@@ -44,7 +45,7 @@ function fakeLaunch({ hang = false, malformed = false, webSearch = false, echoIn
         else if (request.method === 'thread/start') { specs = request.params.dynamicTools; emit({ id: request.id, result: { thread: { id: 'thread' } } }); }
         else if (request.method === 'thread/inject_items') emit({ id: request.id, result: {} });
         else if (request.method === 'model/list') emit({ id: request.id, result: { data: [{ id: 'model', hidden: false }, { id: 'hidden-model', hidden: true }], nextCursor: null } });
-        else if (request.method === 'turn/start') { if (echoInput) emit({ method: 'item/started', params: { item: { type: 'userMessage', content: request.params.input } } }); emit({ id: request.id, result: { turn: { id: 'turn' } } }); if (webSearch) emit({method:'item/completed',params:{item:{type:'webSearch',id:'ws_test',query:'Python official',action:{type:'search',queries:['Python official'],query:'Python official'}}}}); call(); }
+        else if (request.method === 'turn/start') { if (echoInput) emit({ method: 'item/started', params: { item: { type: 'userMessage', content: request.params.input } } }); emit({ id: request.id, result: { turn: { id: 'turn' } } }); if (errorEvent) { emit({ method: 'error', params: { message: errorEvent, willRetry: false } }); continue; } if (unknownTool) { emit({ id: 'rpc-bad', method: 'item/tool/call', params: { threadId: 'thread', turnId: 'turn', callId: 'bad', tool: 'client_missing_0', arguments: {} } }); continue; } if (webSearch) emit({method:'item/completed',params:{item:{type:'webSearch',id:'ws_test',query:'Python official',action:{type:'search',queries:['Python official'],query:'Python official'}}}}); call(); }
         else if (request.result) { assert.equal(request.result.contentItems[0].text, step ? 'READ_OK' : 'PATCH_OK'); step++; call(); }
       }
       done();
@@ -88,6 +89,42 @@ for (const execution of ['ssh-docker', 'ssh']) test(`Remote ${execution} Respons
     assert.equal((await api({ model: 'nas/model', input: 'hello', tools: [{ type: 'not_supported' }] })).status, 400);
     assert.equal((await api({ model: 'nas/model', input: 'hello', previous_response_id: first.id })).status, 400);
   } finally { bridge.close(); gateway.server.closeAllConnections(); await new Promise(resolve => gateway.server.close(resolve)); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('tool result after app-server loss reconstructs history instead of rejecting the continuation', async () => {
+  const fake = fakeLaunch(), bridge = new NasAgentBridge({ launch: fake.launch });
+  try {
+    const body = { model: 'nas/model', input: [{ role: 'user', content: 'Create and read result.txt' }], tools };
+    const first = await bridge.run(p, 'model', body, 'responses');
+    const call = first.output.find(i => i.type === 'custom_tool_call');
+    assert.ok(call);
+    fake.children[0].kill();
+    await new Promise(resolve => setImmediate(resolve));
+    const continuation = { model: 'nas/model', tools, input: [...body.input, ...first.output, { type: 'custom_tool_call_output', call_id: call.call_id, output: 'PATCH_OK' }] };
+    const second = await bridge.run(p, 'model', continuation, 'responses');
+    assert.equal(second.metadata.model_harbor_session, 'reconstructed_after_tool_result');
+    assert.equal(fake.children.length, 2);
+    const injected = fake.exchanges.filter(e => e.method === 'thread/inject_items').flatMap(e => e.params.items);
+    assert.ok(injected.some(i => i.type === 'custom_tool_call' && i.call_id === call.call_id));
+    assert.ok(injected.some(i => i.type === 'custom_tool_call_output' && i.call_id === call.call_id));
+    const turn = fake.exchanges.filter(e => e.method === 'turn/start').at(-1);
+    assert.match(turn.params.input[0].text, /tool result above/i);
+  } finally { bridge.close(); }
+});
+
+test('changed client tool catalog reconstructs a pending tool continuation', async () => {
+  const fake = fakeLaunch(), bridge = new NasAgentBridge({ launch: fake.launch });
+  try {
+    const body = { model: 'nas/model', input: [{ role: 'user', content: 'Create and read result.txt' }], tools };
+    const first = await bridge.run(p, 'model', body, 'responses');
+    const call = first.output.find(i => i.type === 'custom_tool_call');
+    const extra = { type: 'function', name: 'extra_tool', parameters: { type: 'object', properties: { x: { type: 'string' } } } };
+    const continuation = { model: 'nas/model', tools: [...tools, extra], input: [...body.input, ...first.output, { type: 'custom_tool_call_output', call_id: call.call_id, output: 'PATCH_OK' }] };
+    const second = await bridge.run(p, 'model', continuation, 'responses');
+    assert.equal(second.metadata.model_harbor_session, 'reconstructed_after_tool_result');
+    assert.equal(fake.children.length, 2);
+    assert.equal(fake.children[0].killed, true);
+  } finally { bridge.close(); }
 });
 
 test('native web search plus local custom tools: SSE records and replay preserve the client tool round trip', async () => {
@@ -159,7 +196,66 @@ test('NAS tool spec validation, Chat shape, restricted command and disabled tool
   const body = agentInput({ messages: [{ role: 'tool', tool_call_id: 'id', content: 'ok' }], tools: [{ type: 'function', function: { name: 'read_file' } }] }, 'chat/completions');
   assert.equal(body.input[0].call_id, 'id'); assert.equal(body.tools[0].name, 'read_file');
   const command = agentCommand(p); assert.equal(command.command, 'ssh'); assert.match(command.args.at(-1), /'app-server'/); assert.match(command.args.at(-1), /'features.shell_tool=false'/);
+  assert.match(command.args.at(-1), /model_provider="openai-mh"/);
+  assert.match(command.args.at(-1), /stream_idle_timeout_ms=180000/);
+  assert.match(command.args.at(-1), /7200s/);
   assert.equal(command.args.at(-1).includes('input'), false, 'no user content is interpolated into the shell');
+});
+
+test('tool spec compaction fits the app-server budget and preserves property names', () => {
+ const specs = toolSpecs([{ type: 'namespace', name: 'functions', tools: [{
+   type: 'function', name: 'probe', parameters: { type: 'object', properties: { title: { type: 'string' }, description: { type: 'string' } }, required: ['title'] }
+ }] }]).specs;
+ specs[0].description = 'x'.repeat(2000000);
+ const fitted = fitToolSpecs(specs, 900 * 1024);
+ assert.ok(Buffer.byteLength(JSON.stringify(fitted)) <= 900 * 1024);
+ assert.equal(fitted[0].inputSchema.properties.title.type, 'string');
+ assert.equal(fitted[0].inputSchema.properties.description.type, 'string');
+});
+
+test('deferToolSpecs keeps core tools eager and namespaces the long tail', () => {
+ const raw = [{ type: 'custom', name: 'apply_patch', format: { type: 'grammar', syntax: 'lark', definition: 'start: /.+/s' } }];
+ for (let i = 0; i < 40; i++) raw.push({ type: 'function', name: 'tool_' + i, parameters: { type: 'object', properties: { x: { type: 'string' } } } });
+ const mapped = toolSpecs(raw);
+ const result = deferToolSpecs(mapped.specs, mapped.mappings, { mode: 'auto', minTools: 24, minBytes: 1, groupSize: 12, maxEager: 10, minEager: 4 });
+ assert.ok(result.stats.deferred > 0);
+ assert.ok(result.stats.namespaces >= 1);
+ assert.equal(result.stats.eager + result.stats.deferred, mapped.specs.length);
+ const eager = result.specs.filter(s => s.type === 'function');
+ assert.ok(eager.some(s => mapped.mappings.get(s.name)?.name === 'apply_patch'));
+ const namespaces = result.specs.filter(s => s.type === 'namespace');
+ assert.ok(namespaces.every(n => n.tools.every(t => t.type === 'function' && t.deferLoading === true)));
+});
+
+test('deferToolSpecs leaves small tool sets unchanged and can be forced', () => {
+ const mapped = toolSpecs([{ type: 'function', name: 'read_file', parameters: { type: 'object' } }, { type: 'function', name: 'other', parameters: { type: 'object' } }]);
+ const auto = deferToolSpecs(mapped.specs, mapped.mappings, { mode: 'auto', minTools: 24, minBytes: 48 * 1024 });
+ assert.equal(auto.stats.deferred, 0);
+ assert.deepEqual(auto.specs, mapped.specs);
+ const forced = deferToolSpecs(mapped.specs, mapped.mappings, { mode: 'always', minEager: 1, groupSize: 10 });
+ assert.ok(forced.stats.deferred >= 1);
+ assert.ok(forced.specs.some(s => s.type === 'namespace'));
+});
+
+test('deferToolSpecs caps eager schema bytes and moves large non-core tools to namespaces', () => {
+ const raw = Array.from({ length: 7 }, (_, i) => ({ type: 'function', name: 'tool_' + i, description: 'd'.repeat(20000), parameters: { type: 'object', properties: { x: { type: 'string' } } } }));
+ const mapped = toolSpecs(raw);
+ const result = deferToolSpecs(mapped.specs, mapped.mappings, { mode: 'always', groupSize: 12, minEager: 4, maxEagerBytes: 32 * 1024 });
+ const eagerBytes = result.specs.filter(s => s.type === 'function').reduce((n, s) => n + Buffer.byteLength(JSON.stringify(s)), 0);
+ assert.ok(eagerBytes <= 32 * 1024);
+ assert.ok(result.stats.deferred > 0);
+ assert.ok(result.specs.some(s => s.type === 'namespace'));
+});
+
+test('fitToolSpecs preserves deferred namespaces and deferLoading flags', () => {
+ const raw = Array.from({ length: 30 }, (_, i) => ({ type: 'function', name: 'tool_' + i, description: 'd'.repeat(2000), parameters: { type: 'object', properties: { ['p' + i]: { type: 'string', description: 'x'.repeat(2000) } } } }));
+ const mapped = toolSpecs(raw);
+ const result = deferToolSpecs(mapped.specs, mapped.mappings, { mode: 'always', groupSize: 10, minEager: 2 });
+ const fitted = fitToolSpecs(result.specs, 900 * 1024);
+ const namespaces = fitted.filter(s => s.type === 'namespace');
+ assert.ok(namespaces.length >= 1);
+ assert.ok(namespaces.every(n => n.tools.every(t => t.deferLoading === true && t.inputSchema)));
+ assert.ok(fitted.filter(s => s.type === 'function').every(s => s.deferLoading === undefined));
 });
 
 test('NAS Chat HTTP returns function calls, accepts client tool results and streams the final answer', async () => {
@@ -180,7 +276,7 @@ test('NAS Chat HTTP returns function calls, accepts client tool results and stre
 });
 
 test('NAS sessions enforce capacity, release idle workers, timeout and cancellation', async () => {
-  const fake = fakeLaunch(), bridge = new NasAgentBridge({ launch: fake.launch, idleMs: 25, maxSessions: 1 });
+  const fake = fakeLaunch(), bridge = new NasAgentBridge({ launch: fake.launch, idleMs: 25, toolWaitMs: 25, maxSessions: 1 });
   const body = { model: 'nas/model', input: 'tool', tools };
   await bridge.run(p, 'model', body, 'responses');
   await assert.rejects(bridge.run(p, 'model', body, 'responses'), e => e.status === 429);
@@ -278,4 +374,61 @@ test('model discovery uses the official app-server model/list endpoint', async (
     assert.ok(fake.exchanges.some(e => e.method === 'model/list'));
     assert.ok(!fake.exchanges.some(e => e.method === 'collect'));
   } finally { bridge.close(); }
+});
+
+test('tool specs always drop schema metadata and cap long descriptions, even under the size limit', () => {
+ const specs = [{ type: 'function', name: 'probe', description: 'd'.repeat(5000), inputSchema: { type: 'object', title: 'T', examples: [1], properties: { a: { type: 'string', default: 'x', description: 'p'.repeat(5000) } } } }];
+ const fitted = fitToolSpecs(specs, 900 * 1024);
+ assert.equal(fitted[0].description.length, 800);
+ assert.equal(fitted[0].inputSchema.title, undefined);
+ assert.equal(fitted[0].inputSchema.properties.a.default, undefined);
+ assert.equal(fitted[0].inputSchema.properties.a.description.length, 800);
+ assert.equal(fitted[0].inputSchema.properties.a.type, 'string');
+});
+
+test('history injection drops earlier reasoning items but keeps messages', () => {
+ const items = historyItems([{ type: 'reasoning', summary: [{ type: 'summary_text', text: 's' }], encrypted_content: 'x' }, { type: 'message', role: 'user', content: 'hi' }]);
+ assert.equal(items.length, 1);
+ assert.equal(items[0].type, 'message');
+});
+
+test('history trimming replaces old images and clips old huge tool outputs but keeps recent turns intact', () => {
+ const big = 'a'.repeat(40000), img = { type: 'input_image', image_url: 'data:image/png;base64,AAAA' };
+ const input = [
+  { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'old' }, img] },
+  { type: 'function_call', call_id: 'c1', name: 'x', arguments: '{}' },
+  { type: 'function_call_output', call_id: 'c1', output: big },
+  { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'mid' }, img] },
+  { type: 'function_call_output', call_id: 'c2', output: big },
+  { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'new' }, img] }
+ ];
+ const items = historyItems(input);
+ assert.equal(items[0].content[1].text, '[image omitted]');
+ assert.ok(items[2].output.length < 20000 && items[2].output.includes('chars omitted'));
+ assert.equal(items[3].content[1].type, 'input_image');
+ assert.equal(items[4].output.length, 40000);
+ assert.equal(items[5].content[1].type, 'input_image');
+});
+
+test('custom tool format hint survives description truncation', () => {
+ const specs = toolSpecs([{ type: 'custom', name: 'apply_patch', description: 'D'.repeat(2000), format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' } }]).specs;
+ const fitted = fitToolSpecs(specs, 900 * 1024);
+ assert.ok(fitted[0].description.includes('MUST follow this format'));
+ assert.ok(fitted[0].description.includes('start: begin_patch'));
+ assert.equal(fitted[0].formatHint, undefined);
+ assert.ok(fitted[0].description.startsWith('Client tool'));
+});
+
+test('app-server error events keep their upstream detail', async () => {
+  const fake = fakeLaunch({ errorEvent: 'usage limit reached for this account' });
+  const b = new NasAgentBridge({ launch: fake.launch });
+  await assert.rejects(b.run(p, 'model', { model: 'm', input: [{ role: 'user', content: 'hi' }] }, 'responses'), e => e.status === 502 && /usage limit reached/.test(e.message));
+  b.close();
+});
+
+test('unknown app-server tool calls report the requested name', async () => {
+  const fake = fakeLaunch({ unknownTool: true });
+  const b = new NasAgentBridge({ launch: fake.launch });
+  await assert.rejects(b.run(p, 'model', { model: 'm', input: [{ role: 'user', content: 'hi' }] }, 'responses'), e => e.status === 502 && /unregistered tool: client_missing_0/.test(e.message));
+  b.close();
 });

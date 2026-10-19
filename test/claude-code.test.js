@@ -107,7 +107,7 @@ test('custom SSE preserves raw patch and namespace, invalid CLI output has no co
  const gw=createGateway({dataDir:dir,claudeBridge:bridge});gw.store.upsert(provider);await new Promise(resolve=>gw.server.listen(0,'127.0.0.1',resolve));
  try{const api=()=>fetch(`http://127.0.0.1:${gw.server.address().port}/v1/responses`,{method:'POST',headers:{authorization:'Bearer '+gw.store.gatewayKey(),'content-type':'application/json'},body:JSON.stringify({...body,stream:true})});
  let events=[];for await(const e of sseEvents((await api()).body))events.push(JSON.parse(e.data));assert.equal(events.find(e=>e.type==='response.custom_tool_call_input.delta').delta,patch);assert.equal(events.at(-1).response.output[0].namespace,'functions');
- broken=true;events=[];for await(const e of sseEvents((await api()).body))events.push(JSON.parse(e.data));assert.equal(events.some(e=>e.type==='response.completed'),false);assert.ok(events.some(e=>e.type==='error'));
+ broken=true;events=[];for await(const e of sseEvents((await api()).body))events.push(JSON.parse(e.data));assert.equal(events.some(e=>e.type==='response.completed'),false);assert.ok(events.some(e=>e.type==='response.failed'&&e.response?.status==='failed'));
  }finally{gw.server.closeAllConnections();await new Promise(resolve=>gw.server.close(resolve));fs.rmSync(dir,{recursive:true,force:true});}
 });
 

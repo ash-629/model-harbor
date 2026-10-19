@@ -5,7 +5,7 @@ import {sseEvents,openSSE,writeSSE,uid} from './protocol.js';
 const bad=m=>{throw new HttpError(400,m,'invalid_request_error');};
 function content(b,assistant=false){
  if(b.type==='text'&&typeof b.text==='string')return {type:assistant?'output_text':'input_text',text:b.text};
- if(assistant&&b.type==='thinking'){if(typeof b.thinking!=='string')bad('Invalid thinking block');return {type:'output_text',text:b.thinking};}
+ if(assistant&&b.type==='thinking'){if(typeof b.thinking!=='string')bad('Invalid thinking block');return null;}
  if(assistant&&b.type==='redacted_thinking')return null;
  if(!assistant&&b.type==='image'){
   const s=b.source;
@@ -69,6 +69,8 @@ export function fromResponses(r,model){
 export async function sendMessages(body,res,invoke){
  const request=toResponses(body);if(!body.stream)return fromResponses(await invoke(request,res),body.model);
  const sink=new PassThrough();sink.writeHead=()=>{};sink.flushHeaders=()=>{};
+ sink.apiOptimizationDisabled=res.apiOptimizationDisabled;
+ Object.defineProperty(sink,'apiMetrics',{get:()=>res.apiMetrics,set:value=>{res.apiMetrics=value;}});
  const producer=Promise.resolve().then(()=>invoke(request,sink)).then(()=>{if(!sink.writableEnded)sink.end();},e=>sink.destroy(e));
  let opened=false,messageStarted=false,terminal=false,index=0;const blocks=new Map();
  const emit=async(type,fields)=>{if(!opened){openSSE(res);opened=true;}await writeSSE(res,{type,...fields},type);};

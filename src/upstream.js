@@ -1,5 +1,6 @@
 // F-03/F-05: upstream requests, streaming backpressure, cancellation and sanitized failures.
 import { HttpError } from './store.js';
+import { optimizeApiPayload, tokenPolicy, usageMetrics, requestStats } from './api-token-policy.js';
 import { toChat, fromChat, bridgeStream, sseEvents, openSSE, writeSSE } from './protocol.js';
 import { sendAgent } from './nas-agent.js';
 import { claudeModels, sendClaude, ClaudeCodeBridge } from './claude-code.js';
@@ -48,27 +49,41 @@ export async function route(store, p, model, body, endpoint, res, signal, nasAge
   }
   if (endpoint === 'chat/completions' && p.protocol === 'responses') throw new HttpError(400, '此上游仅提供 Responses，请使用 /v1/responses 或更改供应商协议');
   const bridge = endpoint === 'responses' && p.protocol === 'chat';
-  const payload = { ...(bridge ? toChat(body) : body), model };
+  let payload = { ...(bridge ? toChat(body) : body), model };
+  const policy = tokenPolicy(p.tokenOptimization);
+  const optimized = optimizeApiPayload(payload, policy, res.apiOptimizationDisabled);
+  payload = optimized.payload;
+  if (payload.stream && (bridge || endpoint === 'chat/completions') && policy.captureStreamUsage) {
+    payload = { ...payload, stream_options: { ...payload.stream_options, include_usage: true } };
+  }
+  optimized.stats.after = requestStats(payload);
+  const metrics = res.apiMetrics = { provider: p.id, protocol: bridge ? 'chat' : endpoint, ...optimized.stats, usage: null, completion: 'pending' };
   const upstream = await upstreamFetch(store, p, bridge ? 'chat/completions' : endpoint, payload, signal);
   if (!body.stream) {
     const data = await upstream.json();
     if (data.error) throw new HttpError(502, '上游返回了错误响应', 'upstream_error');
+    metrics.usage = usageMetrics(data.usage);
+    metrics.completion = data.status || data.choices?.[0]?.finish_reason || 'completed';
     if (bridge) return fromChat(data, body.model);
     return { ...data, model: body.model };
   }
   if (!upstream.headers.get('content-type')?.includes('text/event-stream')) { await upstream.body.cancel(); throw new HttpError(502, '上游没有返回 SSE 流，请检查协议配置'); }
-  if (bridge) { await bridgeStream(upstream.body, res, body.model); return null; }
+  if (bridge) { await bridgeStream(upstream.body, res, body.model, (response, rawUsage) => { metrics.usage = usageMetrics(rawUsage); metrics.completion = response.status; }); return null; }
   openSSE(res);
   let terminal = false;
   for await (const event of sseEvents(upstream.body)) {
     if (event.data === '[DONE]') { terminal = true; await writeSSE(res, '[DONE]', event.event); continue; }
     let data; try { data = JSON.parse(event.data); } catch { throw new HttpError(502, '上游 SSE 包含无效 JSON'); }
     if (data.error || data.type === 'error' || data.type === 'response.failed') throw new HttpError(502, '上游流返回错误', 'upstream_error');
+    if (data.usage || data.response?.usage) metrics.usage = usageMetrics(data.usage || data.response.usage);
+    if (data.choices?.some(c => c.finish_reason)) metrics.completion = data.choices.find(c => c.finish_reason).finish_reason;
+    if (['response.completed', 'response.incomplete'].includes(data.type)) metrics.completion = data.type.slice(9);
     if (data.model) data.model = body.model;
     if (data.response?.model) data.response.model = body.model;
     if (data.choices?.some(c => c.finish_reason) || ['response.completed', 'response.incomplete'].includes(data.type)) terminal = true;
     await writeSSE(res, data, event.event);
   }
   if (!terminal) throw new HttpError(502, '上游流意外结束，未收到完成标记');
+  if (metrics.completion === 'pending') metrics.completion = 'completed';
   res.end(); return null;
 }

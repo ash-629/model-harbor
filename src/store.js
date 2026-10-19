@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { tokenPolicy } from './api-token-policy.js';
 
 export class HttpError extends Error {
   constructor(status, message, code = 'invalid_request_error') { super(message); this.status = status; this.code = code; }
@@ -71,6 +72,7 @@ export class Store {
       if (!p.sshKeyPath || /[\r\n\x00]/.test(p.sshKeyPath)) throw new HttpError(400, '请输入 SSH 私钥绝对路径');
     };
     if (type === 'openai') {
+      p.tokenOptimization = tokenPolicy(input.tokenOptimization ?? old?.tokenOptimization);
       let url; try { url = new URL(input.baseUrl); } catch { throw new HttpError(400, '请输入有效的 API Base URL'); }
       if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new HttpError(400, 'API 地址只支持 HTTP/HTTPS，不应含认证、查询或片段');
       p.baseUrl = url.toString().replace(/\/+$/, '');

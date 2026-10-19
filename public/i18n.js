@@ -1,5 +1,13 @@
 // UI-only language preference. Model IDs, provider names and user input are never translated.
 export const messages = {
+"输入 / 输出 / 缓存": "Input / output / cached",
+"请求体积": "Request size",
+"Token 优化（API Key）": "Token optimization (API Key)",
+"压缩冗长工具描述与旧工具结果": "Shorten long tool descriptions and old tool results",
+"默认关闭。保留参数结构、图片和最近三轮用户消息及后续工具结果；省略内容可重新读取。": "Off by default. Keeps parameter schemas, images and the last three user turns with subsequent tool results. Omitted content can be read again.",
+"请求流式用量统计": "Request streaming usage",
+"仅在上游支持 stream_options.include_usage 时开启。": "Enable only if the upstream supports stream_options.include_usage.",
+
   "填写 Codex 或 Claude Code 的命令/绝对路径。Codex 使用官方 CLI，无需 Python 执行器。": "Enter the Codex or Claude Code command or absolute path. Codex uses the official CLI and needs no Python runner.",
   "codex 或 /home/user/.local/bin/codex": "codex or /home/user/.local/bin/codex",
   "通过 SSH 调用主机或容器里的官方 Codex CLI。支持文本、图片与客户端 function/custom 工具；由客户端执行命令和文件修改。目标环境需已安装并登录 Codex。": "Calls the official Codex CLI on a host or in a container over SSH. Supports text, images and client function/custom tools. Commands and file changes run in the client. Codex must be installed and signed in in the target environment.",
@@ -12,7 +20,7 @@ export const messages = {
   "通过 SSH 调用 Claude Code，支持客户端工具和图片。目标环境需安装并登录 Claude Code，并部署工具执行器；工具由客户端执行。": "Calls Claude Code over SSH with client tools and images. Install and sign in to Claude Code and deploy the tool runner on the target. Tools execute on the client.",
   "填写目标主机或容器内的路径；仅当 PATH 包含 claude 时使用 claude。需要 Linux、timeout、python3 和工具执行器。": "Enter the path on the target host/container. Use claude only when it is in PATH. Requires Linux, timeout, python3 and the tool runner.",
 
-"支持文本、图片、工具调用、流式 Messages 和 thinking 参数；思考内容以普通文本历史保留，服务端工具、提示缓存控制和 token 计数接口暂不支持。": "Supports text, images, tool calls, streaming Messages and thinking parameters. Thinking text is retained as ordinary history; hosted tools, prompt-cache controls and token counting are not supported yet.",
+"支持文本、图片、工具调用、流式 Messages 和 thinking 参数；历史思考块不转换为回答正文，服务端工具、提示缓存控制和 token 计数接口暂不支持。": "Supports text, images, tool calls, streaming Messages and thinking parameters. Historical thinking blocks are not converted into answer text; hosted tools, prompt-cache controls and token counting are not supported yet.",
 
 "接入指南 ↗": "Connection guide \u2197",
 "接入指南": "Connection guide",
@@ -114,7 +122,7 @@ export const messages = {
   '＋ 添加供应商': '+ Add provider', '添加供应商': 'Add provider', '编辑供应商': 'Edit provider',
   '已启用供应商': 'Enabled providers', '连接你的模型来源': 'Connect your model providers', '可用模型': 'Available models',
   '按来源区分，统一调用': 'Multiple providers. One API.', '统一 API 地址': 'Unified API endpoint',
-  '复制 API 地址': 'Copy API endpoint', 'OpenAI 兼容 · 统一调用': 'OpenAI compatible · Unified access',
+  '复制 API 地址': 'Copy API endpoint', 'OpenAI / Anthropic 兼容 · 统一调用': 'OpenAI / Anthropic compatible · Unified access', '复制 OpenAI API 地址': 'Copy OpenAI API endpoint', '复制 Anthropic API 地址': 'Copy Anthropic API endpoint',
   '模型目录': 'Model directory', '选择模型即可切换到对应供应商': 'Select a model to route to its provider',
   '↻ 刷新模型': '↻ Refresh models', '搜索模型或供应商…': 'Search models or providers…', '搜索模型': 'Search models',
   '筛选供应商': 'Filter providers', '所有供应商': 'All providers', '模型 / 调用 ID': 'Model / API ID', '来源': 'Provider', '接入方式': 'Connection',
@@ -176,7 +184,7 @@ export const messages = {
   '请输入 Base URL，例如 https://api.example.com/v1，不包含具体接口路径': 'Enter a base URL such as https://api.example.com/v1 without an endpoint path.',
   '请输入 SSH 私钥绝对路径': 'Enter the absolute SSH private key path.', '上游返回的模型列表格式不正确': 'The upstream returned an invalid model list.',
   '必须指定 model': 'A model is required.', '模型不存在或供应商已停用，请从 /v1/models 选择模型': 'Model not found or provider disabled. Choose a model from /v1/models.',
-  '管理会话已过期，请刷新页面': 'Your management session expired. Refresh the page.', '无效的管理请求': 'Invalid management request',
+  '管理会话已过期，请刷新页面': 'Your management session expired. Refresh the page.', '无效的管理请求': 'Invalid management request', '账户余额': 'Account balance', '充值': 'Topped up', '赠送': 'Granted', '充值 {a} · 赠送 {b}': 'Topped up {a} · Granted {b}', '余额不足，API 暂不可用': 'Insufficient balance; API unavailable', '刷新余额': 'Refresh balance', '查看余额': 'View balance', '查看账户余额。': 'View account balance.', '该供应商暂不支持余额查询': 'Balance lookup is not supported for this provider', '无法连接上游余额接口': 'Cannot reach the upstream balance API',
   '请输入测试内容（最多 16000 字符）': 'Enter a test message (up to 16,000 characters).', '无效的网关 API Key': 'Invalid gateway API key',
   '请求处理失败，请检查上游响应格式与协议配置': 'Request failed. Check the upstream response format and protocol settings.',
   '请求已取消': 'Request cancelled', '上游响应超时': 'The upstream request timed out.',

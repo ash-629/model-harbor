@@ -12,9 +12,20 @@ const bad = message => { throw new HttpError(400, message, 'unsupported_paramete
 // overhead above the default 64 MiB HTTP request limit.
 const RPC_MESSAGE_LIMIT = 128 * 1024 * 1024;
 const rpcTooLarge = () => new HttpError(502, 'Remote Codex RPC message exceeds 128 MiB; compact history or reduce attachments', 'remote_message_too_large');
-const failed = () => new HttpError(502, '远程 Codex 工具桥接失败，请检查登录、模型权限和 app-server 版本');
+const rpcDetail = value => String(value || '').replace(/Bearer\s+\S+/gi, 'Bearer [redacted]').replace(/\b(sk-[A-Za-z0-9_-]{6,})\b/g, '[redacted]').replace(/\s+/g, ' ').trim().slice(-500);
+const failed = detail => new HttpError(502, detail ? `远程 Codex 工具桥接失败：${rpcDetail(detail)}` : '远程 Codex 工具桥接失败，请检查登录、模型权限和 app-server 版本');
 const quote = s => "'" + String(s).replace(/'/g, "'\\''") + "'";
-export const agentTail = ['timeout', '--signal=TERM', '--kill-after=5s', '1200s', 'codex', 'app-server', '--listen', 'stdio://',
+// A coding turn can legitimately span many client tool rounds. Keep a hard
+// outer bound for abandoned processes, but do not cap normal work at 20 min.
+const agentMaxSeconds = Math.max(600, Math.floor(Number(process.env.MH_AGENT_MAX_SECONDS || 7200)) || 7200);
+export const agentTail = ['timeout', '--signal=TERM', '--kill-after=5s', `${agentMaxSeconds}s`, 'codex', 'app-server', '--listen', 'stdio://',
+  // Derive the built-in provider so the stream idle timeout can be raised above 30s.
+  '-c', 'model_provider="openai-mh"',
+  '-c', 'model_providers.openai-mh.name="OpenAI via Model Harbor"',
+  '-c', 'model_providers.openai-mh.base_url="https://chatgpt.com/backend-api/codex"',
+  '-c', 'model_providers.openai-mh.wire_api="responses"',
+  '-c', 'model_providers.openai-mh.requires_openai_auth=true',
+  '-c', 'model_providers.openai-mh.stream_idle_timeout_ms=180000',
   '-c', 'features.shell_tool=false', '-c', 'features.apply_patch_freeform=false', '-c', 'features.multi_agent=false',
   '-c', 'features.image_generation=false', '-c', 'features.apps=false', '-c', 'features.plugins=false', '-c', 'web_search="disabled"'];
 export function agentCommand(p) {
@@ -23,6 +34,146 @@ export function agentCommand(p) {
   return sshCommand(p, command);
 }
 
+const SCHEMA_METADATA_KEYS = new Set(['$schema','$id','$comment','examples','default','title','deprecated','readOnly','writeOnly']);
+const SCHEMA_MAPS = new Set(['properties','patternProperties','$defs','definitions','dependentSchemas','dependencies']);
+function compactSchema(value, descriptionLimit) {
+  if (Array.isArray(value)) return value.map(v => compactSchema(v, descriptionLimit));
+  if (!value || typeof value !== 'object') return value;
+  const out = {};
+  for (const [key, inner] of Object.entries(value)) {
+    if (SCHEMA_MAPS.has(key) && inner && typeof inner === 'object' && !Array.isArray(inner)) {
+      out[key] = Object.fromEntries(Object.entries(inner).map(([name, schema]) => [name, compactSchema(schema, descriptionLimit)]));
+      continue;
+    }
+    if (SCHEMA_METADATA_KEYS.has(key)) continue;
+    if (key === 'description' && typeof inner === 'string') {
+      if (descriptionLimit > 0) out[key] = inner.slice(0, descriptionLimit);
+      continue;
+    }
+    out[key] = compactSchema(inner, descriptionLimit);
+  }
+  return out;
+}
+function compactFunctionSpec(tool, descriptionLimit) {
+  const hint = tool.formatHint || '', base = tool.descriptionBase ?? tool.description ?? '';
+  const out = {
+    type: 'function',
+    name: tool.name,
+    // description is required by DynamicToolSpec; keep an empty string at the smallest budget.
+    description: descriptionLimit > 0 ? String(base).slice(0, descriptionLimit) + hint : hint.trim(),
+    inputSchema: compactSchema(tool.inputSchema || { type: 'object', properties: {} }, descriptionLimit)
+  };
+  if (tool.deferLoading) out.deferLoading = true;
+  return out;
+}
+function compactToolSpec(tool, descriptionLimit) {
+  if (tool?.type !== 'namespace') return compactFunctionSpec(tool, descriptionLimit);
+  return {
+    type: 'namespace',
+    name: tool.name,
+    description: descriptionLimit > 0 ? String(tool.description || '').slice(0, descriptionLimit) : '',
+    tools: (tool.tools || []).map(t => compactFunctionSpec(t, descriptionLimit))
+  };
+}
+// app-server rejects a single thread/start JSON-RPC message above ~1 MiB.
+// Keep callable tool names, but compact verbose schemas and descriptions to fit.
+export function fitToolSpecs(specs, maxBytes = 900 * 1024) {
+  const limit = Number.isFinite(maxBytes) ? Math.max(32 * 1024, maxBytes) : 900 * 1024;
+  const originalBytes = Buffer.byteLength(JSON.stringify(specs));
+  for (const descriptionLimit of [800, 400, 200, 100, 50, 0]) {
+    const copy = specs.map(tool => compactToolSpec(tool, descriptionLimit));
+    const bytes = Buffer.byteLength(JSON.stringify(copy));
+    if (bytes <= limit) {
+      if (originalBytes > limit) console.warn(`[model-harbor] compacted tool specs from ${originalBytes} to ${bytes} bytes`);
+      return copy;
+    }
+  }
+  return specs.map(tool => {
+    if (tool?.type === 'namespace') {
+      return {
+        type: 'namespace',
+        name: tool.name,
+        description: String(tool.description || '').slice(0, 120),
+        tools: (tool.tools || []).map(t => ({
+          type: 'function', name: t.name, description: String(t.description || '').slice(0, 120),
+          inputSchema: { type: 'object', properties: {}, additionalProperties: true },
+          ...(t.deferLoading ? { deferLoading: true } : {})
+        }))
+      };
+    }
+    return {
+      type: 'function', name: tool.name, description: String(tool.description || '').slice(0, 120),
+      inputSchema: { type: 'object', properties: {}, additionalProperties: true },
+      ...(tool.deferLoading ? { deferLoading: true } : {})
+    };
+  });
+}
+
+const CORE_TOOL_NAME = /(apply_patch|read_file|write_file|list_dir|list_files|glob|grep|search|run_command|shell|exec|terminal|bash|powershell|edit|view|create_file|delete_file|move_file|todo|plan)/i;
+function toolMappingFor(mappings, spec) {
+  return mappings?.get(spec.name) || { name: spec.name, type: 'function' };
+}
+function coreTool(mapping) {
+  return mapping.type === 'custom' || mapping.type === 'tool_search' || CORE_TOOL_NAME.test(mapping.name || '');
+}
+// Deferred tools must live inside a namespace. Keep a small core surface eager,
+// then group the long tail into namespaces with deferLoading so their schemas
+// do not enter every request.
+export function deferToolSpecs(specs, mappings, { mode = 'auto', minTools = 24, minBytes = 48 * 1024, groupSize = 12, maxEager = 10, maxEagerBytes = 64 * 1024, minEager = 4 } = {}) {
+  const rawMode = String(mode ?? 'auto').trim().toLowerCase();
+  const normalizedMode = ({ '0': 'off', '1': 'always' })[rawMode] || rawMode;
+  const options = {
+    mode: ['off', 'auto', 'always'].includes(normalizedMode) ? normalizedMode : 'auto',
+    minTools: Number.isFinite(minTools) ? Math.max(2, Math.floor(minTools)) : 24,
+    minBytes: Number.isFinite(minBytes) ? Math.max(0, Math.floor(minBytes)) : 48 * 1024,
+    groupSize: Number.isFinite(groupSize) ? Math.max(1, Math.floor(groupSize)) : 12,
+    maxEager: Number.isFinite(maxEager) ? Math.max(1, Math.floor(maxEager)) : 10,
+    maxEagerBytes: Number.isFinite(maxEagerBytes) ? Math.max(0, Math.floor(maxEagerBytes)) : 64 * 1024,
+    minEager: Number.isFinite(minEager) ? Math.max(0, Math.floor(minEager)) : 4
+  };
+  const bytes = Buffer.byteLength(JSON.stringify(specs));
+  const stats = { mode: options.mode, eager: specs.length, deferred: 0, namespaces: 0, bytes };
+  if (options.mode === 'off' || specs.length < 2 || specs.some(s => s.type === 'namespace')) return { specs, stats };
+  if (options.mode === 'auto' && specs.length < options.minTools && bytes < options.minBytes) return { specs, stats };
+  const entries = specs.map(spec => ({ spec, mapping: toolMappingFor(mappings, spec), bytes: Buffer.byteLength(JSON.stringify(spec)) }));
+  const eager = new Set();
+  for (const entry of entries) if (coreTool(entry.mapping) && eager.size < options.maxEager) eager.add(entry.spec.name);
+  const minimum = Math.min(options.minEager, entries.length);
+  // Prefer the smallest non-core tools for the eager floor so large MCP schemas move to the deferred namespace.
+  for (const entry of entries.filter(entry => !eager.has(entry.spec.name)).sort((a, b) => a.bytes - b.bytes)) {
+    if (eager.size >= minimum) break;
+    eager.add(entry.spec.name);
+  }
+  let eagerBytes = entries.filter(entry => eager.has(entry.spec.name)).reduce((sum, entry) => sum + entry.bytes, 0);
+  while (eagerBytes > options.maxEagerBytes) {
+    const candidates = entries.filter(entry => eager.has(entry.spec.name) && !coreTool(entry.mapping)).sort((a, b) => b.bytes - a.bytes);
+    if (!candidates.length || eager.size <= 1) break;
+    eager.delete(candidates[0].spec.name);
+    eagerBytes -= candidates[0].bytes;
+  }
+  const deferred = entries.filter(entry => !eager.has(entry.spec.name));
+  if (!deferred.length) return { specs, stats };
+  const active = entries.filter(entry => eager.has(entry.spec.name)).map(entry => entry.spec);
+  const used = new Set(active.map(spec => spec.name)), namespaces = [];
+  for (let offset = 0, part = 0; offset < deferred.length; offset += options.groupSize) {
+    let name;
+    do { name = `mh_group_${++part}`; } while (used.has(name));
+    used.add(name);
+    const chunk = deferred.slice(offset, offset + options.groupSize);
+    namespaces.push({
+      type: 'namespace',
+      name,
+      description: `Deferred client tools (${chunk.length}). Their schemas load on demand; call them directly by name.`,
+      tools: chunk.map(({ spec }) => ({
+        type: 'function', name: spec.name, description: spec.description, inputSchema: spec.inputSchema, deferLoading: true,
+        ...(spec.descriptionBase ? { descriptionBase: spec.descriptionBase } : {}),
+        ...(spec.formatHint ? { formatHint: spec.formatHint } : {})
+      }))
+    });
+  }
+  stats.eager = active.length; stats.deferred = deferred.length; stats.namespaces = namespaces.length;
+  return { specs: [...active, ...namespaces], stats };
+}
 export function toolSpecs(tools = [], choice = 'auto') {
   if (!Array.isArray(tools) || tools.length > 256) bad('远程工具列表无效（最多 256 项）');
   const webSearch = nativeSearch(tools, choice);
@@ -35,9 +186,10 @@ export function toolSpecs(tools = [], choice = 'auto') {
     const name = 'client_' + tool.name.slice(0, 45) + '_' + specs.length;
     const custom = tool.type === 'custom';
     const inputSchema = custom ? { type: 'object', properties: { input: { type: 'string', description: 'Exact raw tool input, without JSON wrapping or markdown fences.' } }, required: ['input'], additionalProperties: false } : tool.parameters || { type: 'object', properties: {} };
-    let description = `Client tool ${key}. ${tool.description || ''}`;
-    if (custom && tool.format) description += '\nThe input string MUST follow this format: ' + JSON.stringify(tool.format);
-    specs.push({ type: 'function', name, description, inputSchema });
+    const description = `Client tool ${key}. ${tool.description || ''}`;
+    // The format hint is the call contract, so it is excluded from truncation.
+    const formatHint = custom && tool.format ? '\nThe input string MUST follow this format: ' + JSON.stringify(tool.format) : '';
+    specs.push({ type: 'function', name, description: description + formatHint, inputSchema, ...(formatHint ? { descriptionBase: description, formatHint } : {}) });
     mappings.set(name, { ...tool, namespace });
   };
   for (const tool of tools) {
@@ -145,7 +297,31 @@ export function historyItem(item) {
   if (item.type === 'image_generation_call') return { type: 'image_generation_call', result: item.result || '', status: item.status || 'completed' };
   bad('远程历史不支持此输入项: ' + String(item.type || item.role).slice(0, 80));
 }
-export function historyItems(input) { return input.map(historyItem).filter(Boolean); }
+// Reasoning items from earlier turns only cost tokens; the current tool loop keeps its own native state.
+const OLD_OUTPUT_LIMIT = 16 * 1024, RECENT_USER_TURNS = 2;
+const clipMiddle = (s, limit = OLD_OUTPUT_LIMIT) => s.length > limit ? s.slice(0, limit / 2) + '\n[... ' + (s.length - limit) + ' chars omitted ...]\n' + s.slice(-limit / 2) : s;
+const dropImages = parts => parts.map(p => p.type === 'input_image' ? { type: 'input_text', text: '[image omitted]' } : p);
+// Older turns keep their text, but images are replaced and huge tool outputs are clipped.
+function trimOld(item) {
+  if (item.type === 'message') return { ...item, content: dropImages(item.content) };
+  if (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') {
+    const output = typeof item.output === 'string' ? clipMiddle(item.output) : dropImages(item.output).map(p => p.type === 'input_text' ? { ...p, text: clipMiddle(p.text) } : p);
+    return { ...item, output };
+  }
+  return item;
+}
+export function historyItems(input) {
+  const users = []; input.forEach((i, n) => { if (i?.role === 'user' && (!i.type || i.type === 'message')) users.push(n); });
+  const cutoff = users.length >= RECENT_USER_TURNS ? users.at(-RECENT_USER_TURNS) : 0;
+  return input.flatMap((i, n) => {
+    if (i?.type === 'reasoning') return [];
+    const h = historyItem(i);
+    return h ? [n < cutoff ? trimOld(h) : h] : [];
+  });
+}
+export const isToolOutput = item => item?.type === 'function_call_output' || item?.type === 'custom_tool_call_output';
+const CONTINUE_AFTER_TOOL = 'The client has returned the tool result above. Continue the current task from that result. Do not repeat tool calls that already completed unless the result shows they failed.';
+const continuationInput = () => [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: CONTINUE_AFTER_TOOL }] }];
 export function currentTurnInput(input) {
   const item = input.at(-1);
   if (!item || (item.type && item.type !== 'message') || item.role !== 'user') throw bad('远程请求最后一项必须是当前用户消息；工具结果续接需要保留同一会话');
@@ -241,16 +417,16 @@ export function validateAgent(body) {
 // One bounded JSON-RPC process per active conversation; no token or login export.
 class RPC {
   constructor(child) {
-    this.child = child; this.id = 0; this.pending = new Map(); this.events = []; this.waiter = null; this.closed = false;
+    this.child = child; this.id = 0; this.pending = new Map(); this.events = []; this.waiter = null; this.closed = false; this.stderr = ''; this.lastError = null;
     const decoder = new StringDecoder('utf8'); let buffer = '';
-    child.stdin.on('error', () => {}); child.stderr.on('data', () => {});
+    child.stdin.on('error', () => {}); child.stderr.on('data', bytes => { this.stderr = (this.stderr + bytes.toString()).slice(-4096); });
     child.stdout.on('data', bytes => {
       buffer += decoder.write(bytes);
       let index;
       while ((index = buffer.indexOf('\n')) >= 0) {
         if (index > RPC_MESSAGE_LIMIT) return this.fail(rpcTooLarge());
         const line = buffer.slice(0, index); buffer = buffer.slice(index + 1); if (!line.trim()) continue;
-        let event; try { event = JSON.parse(line); } catch { this.fail(failed()); return; }
+        let event; try { event = JSON.parse(line); } catch { this.fail(failed('app-server returned non-JSON output: ' + line)); return; }
         if (!event.method && this.pending.has(event.id)) {
           const p = this.pending.get(event.id); this.pending.delete(event.id);
           if (event.error) {
@@ -264,23 +440,39 @@ class RPC {
       }
       if (buffer.length > RPC_MESSAGE_LIMIT) return this.fail(rpcTooLarge());
     });
-    child.on('error', () => this.fail(failed())); child.on('close', () => this.fail(failed()));
+    child.on('error', e => this.fail(failed('app-server process error: ' + e.message))); child.on('close', (code, signal) => this.fail(failed(`app-server exited (${code ?? signal ?? 'unknown'})${this.stderr ? ': ' + this.stderr : ''}`)));
   }
-  send(value) { if (this.closed) throw failed(); this.child.stdin.write(JSON.stringify(value) + '\n'); }
+  send(value) { if (this.closed) throw this.lastError || failed(); this.child.stdin.write(JSON.stringify(value) + '\n'); }
   call(method, params) { const id = ++this.id; return new Promise((resolve, reject) => { this.pending.set(id, { resolve, reject }); try { this.send({ id, method, params }); } catch (e) { this.pending.delete(id); reject(e); } }); }
-  next() { if (this.closed) return Promise.reject(failed()); if (this.events.length) return Promise.resolve(this.events.shift()); return new Promise((resolve, reject) => { this.waiter = { resolve, reject }; }); }
+  next() { if (this.closed) return Promise.reject(this.lastError || failed()); if (this.events.length) return Promise.resolve(this.events.shift()); return new Promise((resolve, reject) => { this.waiter = { resolve, reject }; }); }
   fail(error) {
-    if (this.closed) return; this.closed = true;
+    if (this.closed) return; this.closed = true; this.lastError = error;
     for (const p of this.pending.values()) p.reject(error); this.pending.clear();
     this.waiter?.reject(error); this.waiter = null; this.events = [];
-    this.child.stdin.end(); this.child.kill();
+    try { this.child.stdin.end(); } catch {}
+    try { this.child.kill(); } catch {}
   }
   close() { this.fail(failed()); }
 }
 
 export class NasAgentBridge {
-  constructor({ launch = (p) => { const c = agentCommand(p); return spawn(c.command, c.args, { windowsHide: true }); }, idleMs = 10 * 60 * 1000, maxSessions = 8 } = {}) {
+  constructor({
+    launch = (p) => { const c = agentCommand(p); return spawn(c.command, c.args, { windowsHide: true }); },
+    idleMs = 10 * 60 * 1000,
+    toolWaitMs = Number(process.env.MH_TOOL_WAIT_SECONDS || 1800) * 1000,
+    maxSessions = 8,
+    deferTools = process.env.MH_DEFER_TOOLS || 'auto',
+    deferMinTools = Number(process.env.MH_DEFER_MIN_TOOLS || 24),
+    deferMinBytes = Number(process.env.MH_DEFER_MIN_BYTES || 48 * 1024),
+    deferGroupSize = Number(process.env.MH_DEFER_GROUP_SIZE || 12),
+    deferMaxEager = Number(process.env.MH_DEFER_MAX_EAGER || 10),
+    deferMaxEagerBytes = Number(process.env.MH_DEFER_MAX_EAGER_BYTES || 64 * 1024),
+    deferMinEager = Number(process.env.MH_DEFER_MIN_EAGER || 4)
+  } = {}) {
     this.launch = launch; this.idleMs = idleMs; this.maxSessions = maxSessions; this.sessions = new Set(); this.calls = new Map(); this.completedCalls = new Map();
+    this.toolWaitMs = Number.isFinite(toolWaitMs) && toolWaitMs > 0 ? Math.max(idleMs, toolWaitMs) : Math.max(idleMs, 30 * 60 * 1000);
+    this.deferTools = deferTools; this.deferMinTools = deferMinTools; this.deferMinBytes = deferMinBytes;
+    this.deferGroupSize = deferGroupSize; this.deferMaxEager = deferMaxEager; this.deferMaxEagerBytes = deferMaxEagerBytes; this.deferMinEager = deferMinEager;
     this.usageReaders = new Set(); this.usageCache = new Map(); this.usageGeneration = 0;
   }
   dispose(s) { clearTimeout(s.idle); s.rpc.close(); this.sessions.delete(s); for (const [id, value] of this.calls) if (value === s) this.calls.delete(id); }
@@ -370,13 +562,21 @@ export class NasAgentBridge {
       const previous = this.completedCalls.get(output.call_id);
       if (input.filter(i => i.type !== 'reasoning').at(-1) === output && previous && previous.signature === signature && previous.output === JSON.stringify(output) && Date.now() - previous.at < this.idleMs) return structuredClone(previous.response);
     }
+    const lastItem = input.filter(i => i.type !== 'reasoning').at(-1);
     const matches = outputs.filter(o => this.calls.has(o.call_id));
     let s = matches.length ? this.calls.get(matches.at(-1).call_id) : null;
-    if (s && s.signature !== signature) { this.dispose(s); s = null; }
+    if (s && (s.signature !== signature || s.rpc.closed)) {
+      // The native process can disappear between a client tool call and its
+      // result (idle cleanup, outer timeout, crash, or a changed tool catalog).
+      // Rebuild the transcript below instead of rejecting the continuation.
+      if (s.rpc.closed) console.warn('[model-harbor] app-server session ended before its tool result returned; reconstructing history');
+      this.dispose(s); s = null;
+    }
     if (s?.busy) throw new HttpError(409, '同一工具结果正在处理中，请勿重复提交');
     if (!s) {
       if (this.sessions.size >= this.maxSessions) throw new HttpError(429, '远程工具会话已满，请稍后重试');
-      s = { rpc: new RPC(this.launch(p)), signature, mappings, busy: false }; this.sessions.add(s);
+      s = { rpc: new RPC(this.launch(p)), signature, mappings, busy: false, reconstructed: isToolOutput(lastItem) };
+      this.sessions.add(s);
     }
     clearTimeout(s.idle); s.busy = true; let resumed;
     const finish = response => {
@@ -389,9 +589,11 @@ export class NasAgentBridge {
     const abort = () => this.dispose(s);
     signal?.addEventListener('abort', abort, { once: true });
     const timer = setTimeout(abort, (p.timeout || 600) * 1000);
+    let context = '';
     try {
       if (signal?.aborted) throw new HttpError(408, '请求已取消');
       const response = budgetResponse(responseBase(rawBody.model), budget); response.tools = body.tools || []; response.tool_choice = body.tool_choice || 'auto'; response.parallel_tool_calls = false;
+      if (s.reconstructed) response.metadata = { ...(response.metadata || {}), model_harbor_session: 'reconstructed_after_tool_result' };
       if (webSearch.unsupportedContentTypes) response.metadata = {...response.metadata, model_harbor_unsupported_search_content_types: webSearch.unsupportedContentTypes.join(',')};
       if (s.waiting) {
         const output = outputs.find(o => o.call_id === s.waiting.callId);
@@ -407,13 +609,31 @@ export class NasAgentBridge {
         await s.rpc.call('initialize', { clientInfo: { name: 'model_harbor', version: '0.1.0' }, capabilities: { experimentalApi: true } });
         s.rpc.send({ method: 'initialized', params: {} });
         const searchInstructions = webSearch.mode === 'disabled' ? '' : ' The client explicitly enabled the upstream native web_search tool. You may use that native search tool for internet research; this is the sole exception to client-only tools. A required web_search choice MUST perform an actual native search before answering. Never simulate search with a client function or claim to search without doing so.';
-        const instructions = 'You are the reasoning engine for an external coding client. Only use the supplied dynamic client tools. All filesystem, shell and patch operations MUST be requested using those tools and executed by the client. Never use server-side tools, skills, MCP, shell or filesystem access. IMPORTANT: the proxy server read-only sandbox applies only to this remote process. It does NOT forbid REQUESTING an operation through a client_* tool; the external client enforces its own permissions. When the user names a tool such as apply_patch, ALWAYS call its client_* counterpart, never the remote built-in tool. Do not claim a client operation failed before requesting its client_* tool and receiving its result. Paths in client tools belong to the CLIENT workspace in the conversation history, never this remote proxy cwd /tmp. Preserve client-relative paths; never resolve them against /tmp. The native thread history contains the conversation and client tool results; follow its role hierarchy. Continue the last user task. Custom tools receive their exact raw text through the input field. Tool names are mapped in their descriptions.\n' + (body.instructions || '') + '\nTool choice: ' + JSON.stringify(body.tool_choice || 'auto');
-        const budgetHint = budget === undefined ? '' : `\nThe client requests an output budget of ${budget} tokens for each model response, including reasoning and tool arguments. Aim to stay within this budget; be concise. This is a generation hint, not a server-enforced hard token cap. Do not truncate tool inputs or output malformed arguments to fit it.`;
-        const thread = await s.rpc.call('thread/start', { model, cwd: '/tmp', ephemeral: true, approvalPolicy: 'never', sandbox: 'read-only', baseInstructions: instructions + searchInstructions + (webSearch.unsupportedContentTypes ? '\nNative image search is unavailable on this upstream. The client may advertise image alongside text search by default; that does not require an image search for ordinary chat. For actual image search, use an appropriate supplied client tool if available; otherwise explain the limitation. Never claim to have searched images using the native text search tool.' : '') + budgetHint, dynamicTools: specs,
-          config: { 'features.shell_tool': false, 'features.apply_patch_freeform': false, 'features.multi_agent': false, 'features.image_generation': false, 'features.apps': false, 'features.plugins': false, web_search: webSearch.mode, 'tools.web_search': webSearch.mode === 'disabled' ? false : webSearch.options || {}, mcp_servers: {} } });
+        const instructions = 'You are the reasoning engine for an external coding client. Use only the supplied dynamic client_* tools; all filesystem, shell and patch operations must be requested through them and are executed by the client. Never use server-side tools, skills, MCP, shell or filesystem. The remote read-only sandbox does not forbid REQUESTING a client_* tool; the client enforces its own permissions. If the user names a tool such as apply_patch, call its client_* counterpart. Do not claim a client operation failed before receiving its result. Paths belong to the CLIENT workspace, never the remote cwd /tmp; keep them as given. Follow the history role hierarchy and continue the last user task. Custom tools take their exact raw text in the input field. Tool names are mapped in their descriptions.\n' + (body.instructions || '') + '\nTool choice: ' + JSON.stringify(body.tool_choice || 'auto');
+        const budgetHint = budget === undefined ? '' : `\nThe client requests an output budget of ${Math.ceil(budget / 4096) * 4096} tokens for each model response, including reasoning and tool arguments. Aim to stay within this budget; be concise. This is a generation hint, not a server-enforced hard token cap. Do not truncate tool inputs or output malformed arguments to fit it.`;
+        const baseInstructions = instructions + searchInstructions + (webSearch.unsupportedContentTypes ? '\nNative image search is unavailable on this upstream. The client may advertise image alongside text search by default; that does not require an image search for ordinary chat. For actual image search, use an appropriate supplied client tool if available; otherwise explain the limitation. Never claim to have searched images using the native text search tool.' : '') + budgetHint;
+        const maxToolBytes = 1000 * 1024 - Buffer.byteLength(baseInstructions) - 32 * 1024;
+        const deferred = deferToolSpecs(specs, mappings, {
+          mode: this.deferTools, minTools: this.deferMinTools, minBytes: this.deferMinBytes,
+          groupSize: this.deferGroupSize, maxEager: this.deferMaxEager, maxEagerBytes: this.deferMaxEagerBytes, minEager: this.deferMinEager
+        });
+        const dynamicTools = fitToolSpecs(deferred.specs, maxToolBytes);
+        const threadParams = { model, cwd: '/tmp', ephemeral: true, approvalPolicy: 'never', sandbox: 'read-only', baseInstructions, dynamicTools,
+          config: { 'features.shell_tool': false, 'features.apply_patch_freeform': false, 'features.multi_agent': false, 'features.image_generation': false, 'features.apps': false, 'features.plugins': false, web_search: webSearch.mode, 'tools.web_search': webSearch.mode === 'disabled' ? false : webSearch.options || {}, mcp_servers: {} } };
+        let thread;
+        try {
+          thread = await s.rpc.call('thread/start', threadParams);
+        } catch (e) {
+          if (!deferred.stats.deferred || !/defer|namespace|unknown (field|variant)/i.test(`${e.rpcDetail || ''} ${e.message || ''}`)) throw e;
+          console.warn('[model-harbor] app-server rejected deferred tools; retrying with eager tool specs');
+          thread = await s.rpc.call('thread/start', { ...threadParams, dynamicTools: fitToolSpecs(specs, maxToolBytes) });
+        }
         s.threadId = thread.thread.id;
-        const history = historyItems(input.slice(0, -1));
-        const current = currentTurnInput(input);
+        const history = historyItems(s.reconstructed ? input : input.slice(0, -1));
+        const current = currentTurnInput(s.reconstructed ? continuationInput() : input);
+        context = `tools=${specs.length}, toolBytes=${Buffer.byteLength(JSON.stringify(specs))}, eager=${deferred.stats.eager}, deferred=${deferred.stats.deferred}, namespaces=${deferred.stats.namespaces}, history=${history.length}${s.reconstructed ? ', reconstructed=true' : ''}`;
+        if (s.reconstructed) console.warn('[model-harbor] reconstructing native history: tool result arrived without a live app-server session');
+        if (deferred.stats.deferred) console.log(`[model-harbor] deferLoading: ${deferred.stats.eager} eager, ${deferred.stats.deferred} deferred in ${deferred.stats.namespaces} namespaces`);
         if (history.length) {
           try {
             for (const chunk of historyChunks(history)) await s.rpc.call('thread/inject_items', { threadId: s.threadId, items: chunk });
@@ -424,7 +644,7 @@ export class NasAgentBridge {
             if (e?.code !== 'codex_app_server_unsupported') throw e;
             const transcript = input.map(i => Array.isArray(i.content) ? { ...i, content: i.content.map(c => c.type === 'input_image' ? { type: 'text', text: '[attached image]' } : c) } : i);
             if (JSON.stringify(transcript).length > 1048576) throw new HttpError(413, '目标 Codex CLI 不支持长历史原生注入；请升级 CLI，或压缩会话后再试', 'remote_input_too_large');
-            s.legacyTranscript = transcript;
+            s.legacyTranscript = s.reconstructed ? [...transcript, ...continuationInput()] : transcript;
           }
         }
         const turnInput = s.legacyTranscript ? [{ type: 'text', text: JSON.stringify(s.legacyTranscript) }, ...current.filter(item => item.type === 'image')] : current;
@@ -445,14 +665,19 @@ export class NasAgentBridge {
           if (webSearch.mode === 'disabled') throw failed();
           response.output.push(searchItem(params.item));
         } else if (event.method === 'item/tool/call' && event.id !== undefined) {
-          const tool = s.mappings.get(params.tool); if (!tool) throw failed();
+          const callName = String(params.tool || ''), shortName = callName.includes('.') ? callName.slice(callName.lastIndexOf('.') + 1) : callName;
+          const tool = s.mappings.get(callName) || s.mappings.get(shortName);
+          if (!tool) {
+            console.error('[model-harbor] unknown tool call:', callName.slice(0, 120), 'namespace:', String(params.namespace || '').slice(0, 120), 'registered:', [...s.mappings.keys()].slice(0, 20).join(','));
+            throw failed('app-server requested an unregistered tool: ' + String(params.tool || '').slice(0, 120));
+          }
           const item = { id: uid(tool.type === 'custom' ? 'ctc_' : 'fc_'), type: tool.type === 'tool_search' ? 'tool_search_call' : tool.type === 'custom' ? 'custom_tool_call' : 'function_call', status: 'completed', call_id: params.callId, name: tool.name, ...(tool.namespace ? { namespace: tool.namespace } : {}) };
           if (tool.type === 'tool_search') { delete item.name; item.execution = 'client'; item.arguments = params.arguments; }
           else if (tool.type === 'custom') { if (typeof params.arguments?.input !== 'string') throw failed(); item.input = params.arguments.input; }
           else item.arguments = JSON.stringify(params.arguments);
           response.output.push(item); response.status = 'completed';
           s.waiting = { id: event.id, callId: params.callId }; this.calls.set(params.callId, s);
-          s.idle = setTimeout(() => this.dispose(s), this.idleMs); s.idle.unref(); return finish(response);
+          s.idle = setTimeout(() => this.dispose(s), this.toolWaitMs); s.idle.unref(); return finish(response);
         } else if (event.method === 'turn/completed' || event.method === 'turn/failed') {
           const status = params.turn?.status || (event.method === 'turn/failed' ? 'failed' : '');
           if (status !== 'completed') {
@@ -465,13 +690,22 @@ export class NasAgentBridge {
         } else if (event.method === 'thread/tokenUsage/updated') {
           const u = params.tokenUsage?.last;
           if (u) response.usage = { input_tokens: u.inputTokens || 0, output_tokens: u.outputTokens || 0, total_tokens: u.totalTokens || 0, input_tokens_details: { cached_tokens: u.cachedInputTokens || 0 }, output_tokens_details: { reasoning_tokens: u.reasoningOutputTokens || 0 } };
-        } else if (event.method === 'error' && !params.willRetry) throw failed();
-        else if (event.id !== undefined && event.method) {
+        } else if (event.method === 'error' && !params.willRetry) {
+          const detail = String(params.message || params.error?.message || JSON.stringify(params || {})).slice(0, 500);
+          console.error('[model-harbor] app-server error event:', rpcDetail(detail));
+          throw failed(detail);
+        } else if (event.id !== undefined && event.method) {
           // Unexpected approval/local tool requests are refused, never auto-approved.
-          s.rpc.send({ id: event.id, error: { code: -32601, message: 'Only client dynamic tools are supported' } }); throw failed();
+          console.error('[model-harbor] unexpected app-server request:', String(event.method).slice(0, 120));
+          s.rpc.send({ id: event.id, error: { code: -32601, message: 'Only client dynamic tools are supported' } });
+          throw failed('unexpected app-server request: ' + String(event.method).slice(0, 120));
         }
       }
-    } catch (e) { this.dispose(s); throw e; }
+    } catch (e) {
+      this.dispose(s);
+      if (e instanceof HttpError && e.message === '远程 Codex 工具桥接失败，请检查登录、模型权限和 app-server 版本' && context) e.message += `（${context}）`;
+      throw e;
+    }
     finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); s.busy = false; if (resumed && this.calls.get(resumed.call_id) === s) this.calls.delete(resumed.call_id); }
   }
 }

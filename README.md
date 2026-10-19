@@ -109,6 +109,46 @@ npm test
 npm run check
 ```
 
-当前 Node 回归测试为 70 项，覆盖管理鉴权、供应商 CRUD、协议转换、流式 SSE、客户端工具往返、长历史注入、模型发现、Codex/Claude 工具桥接、图片队列和 i18n。测试使用模拟上游和临时数据，不调用真实模型、不消耗真实账号重置次数。
+当前 Node 回归测试为 89 项，覆盖管理鉴权、供应商 CRUD、协议转换、流式 SSE、客户端工具往返、长历史注入、模型发现、Codex/Claude 工具桥接、图片队列和 i18n。测试使用模拟上游和临时数据，不调用真实模型、不消耗真实账号重置次数。
 
 字体及其许可证见 [public/FONT-LICENSE.txt](public/FONT-LICENSE.txt)。
+
+## Codex 工具延迟加载（DeferLoading）
+
+`nas-codex`（官方 Codex app-server）路径会在工具较多或 schema 较大时，把非核心工具放入 `mh_group_N` namespace，并标记 `deferLoading: true`；核心工具保持 eager。默认 `auto`，工具少于 24 个且总 schema 小于 48KB 时不启用。
+
+| 环境变量 | 默认 | 用途 |
+| --- | --- | --- |
+| `MH_DEFER_TOOLS` | `auto` | `off` / `auto` / `always` |
+| `MH_DEFER_MIN_TOOLS` | `24` | auto 模式触发的最小工具数 |
+| `MH_DEFER_MIN_BYTES` | `49152` | auto 模式触发的最小 schema 字节 |
+| `MH_DEFER_GROUP_SIZE` | `12` | 每个 namespace 的工具数 |
+| `MH_DEFER_MAX_EAGER` | `10` | 最多保留的 eager 工具数 |
+| `MH_DEFER_MAX_EAGER_BYTES` | `65536` | eager schema 字节预算 |
+| `MH_DEFER_MIN_EAGER` | `4` | 至少保留的 eager 工具数 |
+
+需要临时关闭时，在 `deployment.env` 或容器环境设置 `MH_DEFER_TOOLS=off` 并重启容器。该功能只影响 `nas-codex` app-server 路径，不影响 API Key / OpenAI 兼容上游。
+
+## 上下文优化与会话恢复
+
+Codex 桥接会精简工具 Schema 元数据与描述，并保留 custom 工具的格式约束提示。历史注入会省略 reasoning 项，将较早图片替换为省略标记，对旧的超长工具输出保留头尾；近期用户轮次保留原始内容。上述裁剪有信息损失，需要旧内容时应重新读取源文件。
+
+app-server 流空闲超时设为 180 秒；进程总时限默认 7200 秒，可通过 `MH_AGENT_MAX_SECONDS` 调整（受限 SSH 示例允许 600–14400 秒）。工具结果等待默认 1800 秒，可通过 `MH_TOOL_WAIT_SECONDS` 调整。工具结果返回时若原会话已失效，或工具目录发生变化，会重建 ephemeral thread 并注入结构化历史，响应 metadata 标记 `model_harbor_session=reconstructed_after_tool_result`。重建可能增加首包延迟，不等同原生持久会话续接。
+
+## API Key 上游 Token 优化与用量观测
+
+OpenAI 兼容 API Key 供应商支持独立的 `tokenOptimization` 配置，默认不做有损裁剪，与 Codex 工具延迟加载分开生效。管理页面可启用优化；也可通过供应商管理 API 设置以下字段：
+
+| 字段 | 默认 | 用途 |
+| --- | --- | --- |
+| `enabled` | `false` | 启用函数工具描述及旧工具结果裁剪 |
+| `toolDescriptionChars` | `2000` | 函数工具描述字符上限 |
+| `oldToolResultChars` | `32768` | 旧的配对字符串工具结果字符上限 |
+| `keepRecentUserTurns` | `3` | 保留最近用户轮次的完整工具结果 |
+| `captureStreamUsage` | `false` | 请求兼容 Chat 上游返回流式 usage |
+
+单次请求可发送 `X-Model-Harbor-Optimize: off` 跳过有损裁剪。JSON Schema、custom/native 工具、图片和近期历史保持不变。请求日志与管理端测试结果记录请求体积、工具体积、裁剪数量及上游实际 usage；缺失 usage 保持未知，不将字节数直接当作 Token。费用与缓存收益需按供应商计费及真实任务验证。
+
+`test/helpers/api-token-benchmark.mjs` 是需要显式启用的真实模型基准，默认测试不会运行它。执行时必须设置 `MH_LIVE_BENCH=1` 和 `MH_BENCH_DATA`，会消耗上游额度；报告中的合成任务结果不代表生产平均节省率。
+
+DeepSeek 供应商支持账户余额查询；管理会话过期后页面会尝试重新建立会话并重试一次。

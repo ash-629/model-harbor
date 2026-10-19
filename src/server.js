@@ -12,6 +12,7 @@ import { writeSSE } from './protocol.js';
 import { NasAgentBridge } from './nas-agent.js';
 import { ImageProviders } from './image-providers.js';
 import { claudeUsage } from './claude-usage.js';
+import { providerBalance } from './balance.js';
 import { ClaudeCodeBridge } from './claude-code.js';
 import { ImageJobs, runnerFile } from './images.js';
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -42,6 +43,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
     const started = Date.now(), controller = new AbortController();
     res.on('close', () => { if (!res.writableEnded) controller.abort(); });
     req.on('aborted', () => controller.abort());
+    res.apiOptimizationDisabled = req.headers['x-model-harbor-optimize'] === 'off';
     res.setHeader('cache-control', 'no-store');
     res.setHeader('x-content-type-options', 'nosniff');
     res.setHeader('referrer-policy', 'no-referrer');
@@ -119,6 +121,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
         if (usageMatch && method === 'GET') {
           const provider = store.get(usageMatch[1]);
           if (provider.type === 'claude-code') return json(res, 200, await claudeUsage(provider, controller.signal));
+          if (provider.type === 'openai') return json(res, 200, await providerBalance(store, provider, controller.signal));
           return json(res, 200, await nasAgent.usage(provider, controller.signal));
         }
         const resetMatch = /^\/api\/providers\/([a-z0-9_-]+)\/reset$/.exec(pathname);
@@ -143,8 +146,8 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
           requestModel = body.model; requestEndpoint = 'test';
           const output = await route(store, provider, model, body, endpoint, res, controller.signal, nasAgent, claudeBridge);
           const text = output.choices?.[0]?.message?.content ?? output.output?.filter(i => i.type === 'message').flatMap(i => i.content || []).map(c => c.text || c.refusal || '').join('\n') ?? '';
-          log({ model: body.model, endpoint: 'test', status: 200, duration: Date.now() - started });
-          return json(res, 200, { text, usage: output.usage, duration: Date.now() - started });
+          log({ model: body.model, endpoint: 'test', status: 200, duration: Date.now() - started, ...(res.apiMetrics ? { tokenMetrics: res.apiMetrics } : {}) });
+          return json(res, 200, { text, usage: output.usage, duration: Date.now() - started, ...(res.apiMetrics ? { tokenMetrics: res.apiMetrics } : {}) });
         }
         throw new HttpError(404, '管理接口不存在');
       }
@@ -158,7 +161,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
           if (req.headers['anthropic-version'] && req.headers['anthropic-version'] !== '2023-06-01') throw new HttpError(400, 'Unsupported anthropic-version; use 2023-06-01');
           const {provider, model} = store.resolve(body.model);
           const result = await sendMessages(body, res, (request, target) => route(store, provider, model, request, 'responses', target, controller.signal, nasAgent, claudeBridge));
-          log({model:body.model,endpoint:'messages',status:200,duration:Date.now()-started});
+          log({model:body.model,endpoint:'messages',status:200,duration:Date.now()-started,...(res.apiMetrics?{tokenMetrics:res.apiMetrics}:{})});
           if (result) json(res,200,result);
           return;
         }
@@ -168,7 +171,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
           const { provider, model } = store.resolve(body.model);
           const endpoint = pathname.slice(4); requestModel = body.model; requestEndpoint = endpoint;
           const result = await route(store, provider, model, body, endpoint, res, controller.signal, nasAgent, claudeBridge);
-          log({ model: body.model, endpoint, status: 200, duration: Date.now() - started });
+          log({ model: body.model, endpoint, status: 200, duration: Date.now() - started, ...(res.apiMetrics ? { tokenMetrics: res.apiMetrics } : {}) });
           if (result) json(res, 200, result);
           return;
         }
@@ -184,10 +187,16 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
       const status = e.status || (e.name === 'TimeoutError' ? 504 : 502);
       const error = { message: e instanceof HttpError ? e.message : '请求处理失败，请检查上游响应格式与协议配置', type: e.code || 'gateway_error', code: e.code || 'gateway_error' };
       if (anthropicRequest) { error.type = anthropicErrorType(status); delete error.code; }
-      if (requestModel) log({ model: requestModel, endpoint: requestEndpoint, status, duration: Date.now() - started, error: error.message });
+      if (requestModel) log({ model: requestModel, endpoint: requestEndpoint, status, duration: Date.now() - started, error: error.message, ...(res.apiMetrics ? { tokenMetrics: { ...res.apiMetrics, completion: 'failed' } } : {}) });
       if (res.destroyed || res.writableEnded) return;
       if (res.headersSent) {
-        try { await writeSSE(res, { type: 'error', error }, requestEndpoint === 'responses' || anthropicRequest ? 'error' : undefined); res.end(); } catch { res.destroy(); }
+        try {
+          if (requestEndpoint === 'responses' && !anthropicRequest) {
+            const response = { id: 'resp_error_' + Date.now(), object: 'response', created_at: Math.floor(Date.now() / 1000), status: 'failed', model: requestModel || '', output: [], error };
+            await writeSSE(res, { type: 'response.failed', response }, 'response.failed');
+          } else await writeSSE(res, { type: 'error', error }, requestEndpoint === 'responses' || anthropicRequest ? 'error' : undefined);
+          res.end();
+        } catch { res.destroy(); }
       } else {
         if (e.retryAfter && /^[\w ,:-]{1,80}$/.test(e.retryAfter)) res.setHeader('retry-after', e.retryAfter);
         json(res, status === 499 ? 408 : status, anthropicRequest ? { type:'error', error } : { error });

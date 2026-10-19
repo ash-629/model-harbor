@@ -66,7 +66,29 @@ function usageWindow(window) {
   const reset = window.resetsAt ? new Date(window.resetsAt * 1000).toLocaleString(getLanguage()) : t('暂不可用');
   return `<div class="quota-window quota-${tone}"><div class="quota-row"><strong>${h(label)}</strong><span class="quota-used">${known ? h(t('已用 {percent}%', {percent:percent(window.usedPercent)})) : t('暂不可用')}</span></div>${known ? `<progress max="100" value="${window.usedPercent}" aria-label="${h(label)}"></progress><div class="quota-detail">${h(t('剩余 {percent}%', {percent:percent(window.remainingPercent)}))}</div>` : ''}<div class="quota-detail">${h(t('下次重置：{time}', {time:reset}))}</div></div>`;
 }
+function balanceProvider(p) { return p.type === 'openai' && /(^|\.)deepseek\.com(\/|$)/.test((p.baseUrl || '').replace(/^https?:\/\//, '')); }
+function balanceMoney(b) {
+  if (!b || b.total === null || b.total === undefined) return '—';
+  const symbol = b.currency === 'CNY' ? '¥' : b.currency === 'USD' ? '$' : b.currency ? b.currency + ' ' : '';
+  return symbol + Number(b.total).toFixed(2);
+}
+function balanceMarkup(p) {
+  const usage = usageById.get(p.id), data = usage?.data;
+  const balances = data?.balances || [], primary = balances[0];
+  const low = data && (data.available === false || (primary && primary.total !== null && primary.total <= 0));
+  let body = '';
+  if (primary) {
+    body = `<div class="balance-split"><span><span class="balance-caption">${t('充值')}</span> ${h(balanceMoney({ ...primary, total: primary.toppedUp ?? 0 }))}</span><span class="balance-dot">·</span><span><span class="balance-caption">${t('赠送')}</span> ${h(balanceMoney({ ...primary, total: primary.granted ?? 0 }))}</span></div>`;
+    if (balances.length > 1) body += `<div class="balance-list">${balances.slice(1).map(b => `<div class="balance-alt"><span>${h(b.currency || t('账户余额'))}</span><strong>${h(balanceMoney(b))}</strong></div>`).join('')}</div>`;
+    if (data.available === false) body += `<div class="balance-foot balance-warning">${t('余额不足，API 暂不可用')}</div>`;
+  }
+  const foot = data ? `<div class="balance-foot">${h(t('更新于 {time}', {time:new Date(data.checkedAt).toLocaleTimeString(getLanguage())}))}</div>` : `<div class="balance-foot">${usage?.loading ? t('正在读取账号额度…') : t('查看账户余额。')}</div>`;
+  const error = usage?.error ? `<div class="notice error" role="alert">${h(translateError(usage.error))}</div>` : '';
+  return `<section class="provider-quota balance-card"><div class="balance-head"><div class="balance-title"><span>${t('账户余额')}</span><strong class="${low ? 'low' : ''}">${primary ? h(balanceMoney(primary)) : '—'}</strong></div><button class="button ghost balance-refresh" data-usage="${h(p.id)}" ${usage?.loading ? 'disabled' : ''}>${usage?.loading ? t('查询中…') : data ? t('刷新余额') : t('查看余额')}</button></div>${error}${body}${foot}</section>`;
+}
+
 function usageMarkup(p) {
+  if (balanceProvider(p)) return balanceMarkup(p);
   if (p.type !== 'nas-codex' && p.type !== 'claude-code') return '';
   const usage = usageById.get(p.id), data = usage?.data, claude = p.type === 'claude-code';
   let body = '';
@@ -95,15 +117,16 @@ async function loadUsage(id, force = false) {
 }
 function toast(message) { $('toast').textContent = translateError(t(message)); $('toast').hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').hidden = true, 3500); }
 function errorBox(id, message) { errorsById.set(id, message); $(id).textContent = translateError(message) || ''; $(id).hidden = !message; }
-async function api(path, options = {}) {
+async function api(path, options = {}, retried = false) {
   const response = await fetch('/api' + path, { ...options, headers: { 'content-type': 'application/json', 'x-csrf-token': csrf || '', ...options.headers } });
+  if (response.status === 401 && !retried && path !== '/session') { csrf = (await api('/session', {}, true)).csrf; return api(path, options, true); }
   const data = await response.json(); if (!response.ok) throw new Error(data.error?.message || t('请求失败')); return data;
 }
 async function load() {
   state = await api('/config');
   $('stat-providers').textContent = state.providers.filter(p => p.enabled).length;
   $('stat-models').textContent = state.models.length;
-  $('base-url').textContent = state.baseUrl; renderConnection();
+  $('base-url-openai').textContent = state.baseUrl || ''; $('base-url-anthropic').textContent = (state.baseUrl || '').replace(/\/v1\/?$/, ''); renderConnection();
   renderSelectors();
   renderModels(); renderProviders(); renderLogs(); capability();
 }
@@ -132,9 +155,14 @@ function renderProviders() {
   $('providers-empty').hidden = Boolean(state.providers.length);
   $('providers-grid').innerHTML = state.providers.map(p => `<article class="panel provider-card"><div class="provider-top"><div class="provider-mark">${p.type === 'nas-codex' ? '⌂' : p.type === 'claude-code' ? '✦' : h(p.name.slice(0, 1).toUpperCase())}</div><span class="status-pill ${p.enabled ? '' : 'off'}">${p.enabled ? t('已启用') : t('已停用')}</span></div><h3>${h(p.name)}</h3><code class="model-id">${h(p.id)} / ${p.type === 'nas-codex' ? (p.execution === 'ssh' ? 'Codex · SSH' : 'Codex · SSH + Docker') : p.type === 'claude-code' ? (p.execution === 'ssh' ? 'Claude · SSH' : 'Claude · SSH + Docker') : h(p.protocol)}</code><p>${h(p.baseUrl || `${p.sshUser}@${p.sshHost}${p.execution === 'ssh' ? '' : ' · ' + p.container}`)}</p><div class="provider-meta"><span>${t('{count} 个模型', {count: p.models.length})}</span><span>·</span><span>${p.lastSync ? t('同步于 {time}', {time: new Date(p.lastSync).toLocaleTimeString(getLanguage(), {hour:'2-digit',minute:'2-digit'})}) : t('尚未同步')}</span></div>${usageMarkup(p)}<div class="provider-actions"><button class="button ghost" data-refresh="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('↻ 刷新模型')}</button><button class="button ghost" data-edit="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('编辑')}</button><button class="button ghost danger" data-delete="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('删除')}</button></div></article>`).join('');
 }
+function tokenMetricsMarkup(m) {
+  if (!m) return '';
+  const u = m.usage, val = n => Number.isFinite(n) ? n.toLocaleString(getLanguage()) : '—';
+  return `<div class="muted small">${h(t('输入 / 输出 / 缓存'))}: ${val(u?.inputTokens)} / ${val(u?.outputTokens)} / ${val(u?.cachedInputTokens)}<br>${h(t('请求体积'))}: ${val(m.before?.requestBytes)} → ${val(m.after?.requestBytes)} B</div>`;
+}
 function renderLogs() {
   $('logs-empty').hidden = Boolean(state.logs.length);
-  $('logs-body').innerHTML = state.logs.map(l => `<tr><td>${h(new Date(l.time).toLocaleTimeString(getLanguage()))}</td><td><code>${h(l.model)}</code>${l.error ? `<div class="log-error">${h(translateError(l.error))}</div>` : ''}</td><td>${h(l.endpoint)}</td><td><span class="source-badge ${l.status === 200 ? '' : 'bridge-badge'}">${l.status}</span></td><td>${(l.duration / 1000).toFixed(2)} s</td></tr>`).join('');
+  $('logs-body').innerHTML = state.logs.map(l => `<tr><td>${h(new Date(l.time).toLocaleTimeString(getLanguage()))}</td><td><code>${h(l.model)}</code>${l.error ? `<div class="log-error">${h(translateError(l.error))}</div>` : ''}</td><td>${h(l.endpoint)}${tokenMetricsMarkup(l.tokenMetrics)}</td><td><span class="source-badge ${l.status === 200 ? '' : 'bridge-badge'}">${l.status}</span></td><td>${(l.duration / 1000).toFixed(2)} s</td></tr>`).join('');
 }
 function capability() {
   const model = state.models.find(m => m.id === $('test-model').value);
@@ -156,7 +184,7 @@ function view(name, { updateUrl = true } = {}) {
   const names = { settings: [t('设置'), t('管理你的模型港。'), t('配置管理页面的登录方式。')], images: [t('生成图像'), t('描述你的想象。'), t('从一句话开始，把想法变成可以保存的图像。')], overview: [t('模型总览'), t('所有模型，一个入口。'), t('连接不同来源，在同一份模型列表里自由选择。')], providers: [t('供应商'), t('连接你的模型来源。'), t('统一管理 API 服务与远程 Codex。')], logs: [t('请求记录'), t('每一次调用，都有迹可循。'), t('检查路由结果、响应状态与请求耗时。')] };
   [$('page-name').textContent, $('heading').textContent, $('subtitle').textContent] = names[name];
   if (name === 'settings') loadSettings();
-  if (name === 'providers') for (const p of state.providers) if ((p.type === 'nas-codex' || p.type === 'claude-code') && p.enabled) loadUsage(p.id);
+  if (name === 'providers') for (const p of state.providers) if ((p.type === 'nas-codex' || p.type === 'claude-code' || balanceProvider(p)) && p.enabled) loadUsage(p.id);
   if (updateUrl && location.hash !== '#' + name) history.pushState({ view: name }, '', '#' + name);
 }
 let settingsLoading = false;
@@ -222,6 +250,8 @@ function openEditor(id) {
   $('p-codex').value = p ? (p.claudePath || p.codexPath || (p.type === 'claude-code' ? 'claude' : 'codex')) : 'codex';
   $('key-help').textContent = p?.hasApiKey ? t('已保存密钥，留空保持原值；输入新密钥可替换。') : t('密钥在服务端加密保存。');
   $('clear-key-label').hidden = !p?.hasApiKey;
+  $('p-token-enabled').checked = p?.tokenOptimization?.enabled === true;
+  $('p-token-usage').checked = p?.tokenOptimization?.captureStreamUsage === true;
   if (p) {
     const fields = { 'p-name': 'name', 'p-id': 'id', 'p-url': 'baseUrl', 'p-protocol': 'protocol', 'p-host': 'sshHost', 'p-user': 'sshUser', 'p-ssh-port': 'sshPort', 'p-ssh-key': 'sshKeyPath', 'p-container': 'container', 'p-docker-path': 'dockerPath', 'p-timeout': 'timeout' };
     for (const [id, key] of Object.entries(fields)) $(id).value = p[key] ?? '';
@@ -258,6 +288,7 @@ $('provider-form').addEventListener('submit', async event => {
   event.preventDefault(); if (busy) return;
   const input = { id: $('p-id').value.trim(), name: $('p-name').value, type: $('p-type').value, baseUrl: $('p-url').value.trim(), protocol: $('p-protocol').value, apiKey: $('p-key').value, clearApiKey: $('p-clear-key').checked, enabled: $('p-enabled').checked,
     models: $('p-models').value.split(/[\n,，]/).map(m => m.trim()).filter(Boolean), timeout: Number($('p-timeout').value), sshHost: $('p-host').value.trim(), sshUser: $('p-user').value.trim(), sshPort: Number($('p-ssh-port').value || 22), sshKeyPath: $('p-ssh-key').value.trim(), container: $('p-container').value.trim(), dockerPath: $('p-docker-path').value.trim(), execution: $('p-execution').value, codexPath: $('p-type').value === 'nas-codex' ? $('p-codex').value.trim() : undefined, claudePath: $('p-type').value === 'claude-code' ? $('p-codex').value.trim() : undefined };
+  if (input.type === 'openai') input.tokenOptimization = { ...(state.providers.find(p => p.id === editing)?.tokenOptimization || {}), enabled: $('p-token-enabled').checked, captureStreamUsage: $('p-token-usage').checked };
   busy = true; saving = true; $('save-provider').disabled = true; $('save-provider').textContent = t('正在保存…'); errorBox('editor-error');
   try {
     await api('/providers' + (editing ? '/' + editing : ''), { method: editing ? 'PUT' : 'POST', body: JSON.stringify(input) });
@@ -321,7 +352,8 @@ async function copy(text) {
   if (!copied) copied = fallbackCopy(value);
   toast(copied ? '已复制到剪贴板' : '无法访问剪贴板，请手动选择并复制');
 }
-function connectionURL() {return connectionProtocol === 'anthropic' ? (state.baseUrl || '').replace(/\/v1\/?$/, '') : state.baseUrl || '';}
+function apiBase(protocol) { return protocol === 'anthropic' ? (state.baseUrl || '').replace(/\/v1\/?$/, '') : state.baseUrl || ''; }
+function connectionURL() { return apiBase(connectionProtocol); }
 function renderConnection() {
   $('connect-url').textContent = connectionURL();
   const base=(state.baseUrl || '').replace(/\/v1\/?$/, ''),model=state.models[0]?.id || 'provider/model';
@@ -346,7 +378,8 @@ $('copy-key').addEventListener('click', async () => { try { const key = connecti
 $('connection-dialog').addEventListener('close', () => { $('connect-key').textContent = '••••••••••••••••••••••••'; keyVisible = false; connectionKey = ''; });
 $('provider-dialog').addEventListener('close', () => { $('p-key').value = ''; });
 ['connection-btn', 'tip-connect'].forEach(id => $(id).addEventListener('click', openConnection));
-$('copy-url').addEventListener('click', () => copy(state.baseUrl));
+$('copy-url-openai').addEventListener('click', () => copy(apiBase('openai')));
+$('copy-url-anthropic').addEventListener('click', () => copy(apiBase('anthropic')));
 $('connect-copy-url').addEventListener('click', () => copy(connectionURL()));
 ['add-btn', 'empty-add'].forEach(id => $(id).addEventListener('click', () => openEditor()));
 $('search').addEventListener('input', renderModels); $('provider-filter').addEventListener('change', renderModels);

@@ -59,7 +59,7 @@ export function responseUsage(usage) {
   if (!usage) return null;
   return { input_tokens: usage.prompt_tokens || 0, output_tokens: usage.completion_tokens || 0,
     total_tokens: usage.total_tokens || 0,
-    input_tokens_details: { cached_tokens: usage.prompt_tokens_details?.cached_tokens || 0 },
+    input_tokens_details: { cached_tokens: usage.prompt_tokens_details?.cached_tokens ?? usage.prompt_cache_hit_tokens ?? 0 },
     output_tokens_details: { reasoning_tokens: usage.completion_tokens_details?.reasoning_tokens || 0 } };
 }
 export function responseBase(model, id = uid('resp_')) {
@@ -108,8 +108,8 @@ export async function writeSSE(res, data, event) {
     res.once('drain', done); res.once('close', close);
   });
 }
-export async function bridgeStream(upstream, res, model) {
-  const response = responseBase(model); let sequence = 0, message, messageIndex, refusal = false, finish;
+export async function bridgeStream(upstream, res, model, onCompleted) {
+  const response = responseBase(model); let sequence = 0, message, messageIndex, refusal = false, finish, upstreamUsage;
   const tools = new Map();
   const emit = (type, fields = {}) => writeSSE(res, { type, sequence_number: sequence++, ...fields }, type);
   openSSE(res);
@@ -120,7 +120,7 @@ export async function bridgeStream(upstream, res, model) {
     if (event.data === '[DONE]') { terminal = true; break; }
     const part = JSON.parse(event.data);
     if (part.error) throw new HttpError(502, '上游流返回错误', 'upstream_error');
-    if (part.usage) response.usage = responseUsage(part.usage);
+    if (part.usage) { upstreamUsage = part.usage; response.usage = responseUsage(part.usage); }
     const choice = part.choices?.[0]; if (!choice) continue;
     if (choice.finish_reason) { finish = choice.finish_reason; terminal = true; }
     const delta = choice.delta || {};
@@ -165,6 +165,7 @@ export async function bridgeStream(upstream, res, model) {
   }
   response.status = ['length', 'content_filter'].includes(finish) ? 'incomplete' : 'completed';
   if (response.status === 'incomplete') response.incomplete_details = { reason: finish === 'length' ? 'max_output_tokens' : 'content_filter' };
+  onCompleted?.(response, upstreamUsage);
   await emit(response.status === 'completed' ? 'response.completed' : 'response.incomplete', { response });
   res.end();
 }
