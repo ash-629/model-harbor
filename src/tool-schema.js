@@ -75,3 +75,39 @@ export function matchesSchema(value,schema,root=schema,depth=0){
 export function validateToolArguments(args,schema){
   if(!matchesSchema(args,schema))throw new HttpError(502,'Claude 工具参数不符合客户端 schema，未发送工具调用','invalid_tool_arguments');
 }
+
+
+// OpenCode's Grok Responses frontend requires function tool parameters to have
+// an object root. Client schemas sometimes describe a union at the root; pick
+// or wrap the object branches so the callable shape remains useful.
+const schemaObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const objectBranch = schema => {
+  if (!schemaObject(schema)) return false;
+  if (schema.type === 'object') return true;
+  if (Array.isArray(schema.type) && schema.type.includes('object')) return true;
+  if (schema.type && !(Array.isArray(schema.type) && schema.type.includes('object'))) return false;
+  return Boolean(schema.properties || schema.patternProperties || schema.additionalProperties !== undefined);
+};
+export function normalizeObjectParameters(parameters) {
+  if (!schemaObject(parameters)) return { type: 'object', properties: {}, additionalProperties: true };
+  if (parameters.type === 'object' && !parameters.oneOf && !parameters.anyOf) return parameters;
+  const meta = {};
+  for (const key of ['$schema', '$id', 'title', 'description', 'default', 'examples', '$defs', 'definitions']) {
+    if (parameters[key] !== undefined) meta[key] = parameters[key];
+  }
+  if (objectBranch(parameters)) {
+    // The root already supports objects; removing a contradictory union keeps
+    // its explicit properties and required fields intact.
+    return { ...parameters, type: 'object', oneOf: undefined, anyOf: undefined };
+  }
+  const key = Array.isArray(parameters.anyOf) ? 'anyOf' : Array.isArray(parameters.oneOf) ? 'oneOf' : '';
+  if (key) {
+    const branches = parameters[key].filter(objectBranch);
+    if (branches.length === 1) return { ...meta, ...branches[0] };
+    if (branches.length > 1) return { ...meta, type: 'object', anyOf: branches, additionalProperties: true };
+  }
+  if (Array.isArray(parameters.type) && parameters.type.includes('object')) {
+    return { ...parameters, type: 'object' };
+  }
+  return { ...meta, type: 'object', properties: {}, additionalProperties: true };
+}

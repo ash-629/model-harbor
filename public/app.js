@@ -12,6 +12,7 @@ const imageUI = createImageUI({api, toast});
 const usageById = new Map();
 const resetKeys = new Map();
 let resetProvider = null, resetBusy = false;
+let toolState = { tools: [] }, toolBusy = false, toolPollTimer = null;
 function pendingResetKey(id) {
   try { const key = localStorage.getItem('mh_reset_' + id); if (key) resetKeys.set(id, key); else resetKeys.delete(id); } catch {}
   return resetKeys.get(id);
@@ -87,7 +88,21 @@ function balanceMarkup(p) {
   return `<section class="provider-quota balance-card"><div class="balance-head"><div class="balance-title"><span>${t('账户余额')}</span><strong class="${low ? 'low' : ''}">${primary ? h(balanceMoney(primary)) : '—'}</strong></div><button class="button ghost balance-refresh" data-usage="${h(p.id)}" ${usage?.loading ? 'disabled' : ''}>${usage?.loading ? t('查询中…') : data ? t('刷新余额') : t('查看余额')}</button></div>${error}${body}${foot}</section>`;
 }
 
+function openCodeGoProvider(p) { return p.type === 'openai' && p.baseUrl === 'https://opencode.ai/inference/go/openai/v1'; }
+function openCodeGoUsageMarkup(p) {
+  const usage = usageById.get(p.id), data = usage?.data;
+  const labels = { rolling: '5 小时', weekly: '每周', monthly: '每月' };
+  const percent = value => Math.round(value * 10) / 10;
+  const body = (data?.windows || []).map(w => {
+    const known = Number.isFinite(w.remainingPercent);
+    const reset = w.resetsAt ? new Date(w.resetsAt * 1000).toLocaleString(getLanguage()) : t('暂不可用');
+    return `<div class="quota-window"><div class="quota-row"><strong>${h(t(labels[w.id] || w.id))}</strong><span>${known ? h(t('剩余 {percent}%', { percent: percent(w.remainingPercent) })) : t('暂不可用')}</span></div>${known ? `<progress max="100" value="${w.usedPercent}"></progress>` : ''}<div class="quota-detail">${h(t('重置于 {time}', { time: reset }))}</div></div>`;
+  }).join('');
+  const error = usage?.error ? `<div class="notice error" role="alert">${h(translateError(usage.error))}</div>` : '';
+  return `<section class="provider-quota"><div class="quota-row"><strong>${t('OpenCode Go 剩余额度')}</strong><button class="button ghost quota-refresh" data-usage="${h(p.id)}" ${usage?.loading ? 'disabled' : ''}>${usage?.loading ? t('查询中…') : data ? t('刷新用量') : t('查看用量')}</button></div>${error}${body}<div class="quota-detail">${t('Chat 与 Responses 共享同一 Go 工作区额度；数据最多缓存 30 秒。')}</div>${data ? `<div class="quota-detail">${h(t('更新于 {time}', {time:new Date(data.checkedAt).toLocaleTimeString(getLanguage())}))}</div>` : ''}</section>`;
+}
 function usageMarkup(p) {
+  if (openCodeGoProvider(p)) return openCodeGoUsageMarkup(p);
   if (balanceProvider(p)) return balanceMarkup(p);
   if (p.type !== 'nas-codex' && p.type !== 'claude-code') return '';
   const usage = usageById.get(p.id), data = usage?.data, claude = p.type === 'claude-code';
@@ -105,7 +120,7 @@ function usageMarkup(p) {
   }
   if (!claude) body += `<button class="button secondary quota-reset-button" data-reset-usage="${h(p.id)}" ${busy || usage?.loading || (!(data?.resetCredits > 0) && !pendingResetKey(p.id)) ? 'disabled' : ''}>${pendingResetKey(p.id) ? t('重试同一次重置') : t('重置额度')}</button>`;
   if (usage?.error) body = `<div class="notice error" role="alert">${h(translateError(usage.error))}</div>` + body;
-  return `<section class="provider-quota"><div class="quota-row"><strong>${t(claude ? 'Claude 账号用量' : 'Codex 账号用量')}</strong><button class="button ghost" data-usage="${h(p.id)}" ${usage?.loading ? 'disabled' : ''}>${usage?.loading ? t('查询中…') : data ? t('刷新用量') : t('查看用量')}</button></div>${body || `<div class="quota-detail">${usage?.loading ? t('正在读取账号额度…') : t(claude ? '查看 Claude 的 5 小时与每周用量。' : '查看用量、重置时间与可用重置次数。')}</div>`}</section>`;
+  return `<section class="provider-quota"><div class="quota-row"><strong>${t(claude ? 'Claude 账号用量' : 'Codex 账号用量')}</strong><button class="button ghost quota-refresh" data-usage="${h(p.id)}" ${usage?.loading ? 'disabled' : ''}>${usage?.loading ? t('查询中…') : data ? t('刷新用量') : t('查看用量')}</button></div>${body || `<div class="quota-detail">${usage?.loading ? t('正在读取账号额度…') : t(claude ? '查看 Claude 的 5 小时与每周用量。' : '查看用量、重置时间与可用重置次数。')}</div>`}</section>`;
 }
 async function loadUsage(id, force = false) {
   const previous = usageById.get(id);
@@ -114,6 +129,73 @@ async function loadUsage(id, force = false) {
   try { usageById.set(id, {data:await api('/providers/' + id + '/usage'), loading:false}); }
   catch (e) { usageById.set(id, {...previous, error:e.message, loading:false}); }
   renderProviders();
+}
+function toolBytes(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return t('未知');
+  if (n >= 1024 ** 3) return (n / 1024 ** 3).toFixed(2) + ' GB';
+  if (n >= 1024 ** 2) return (n / 1024 ** 2).toFixed(1) + ' MB';
+  return Math.round(n / 1024) + ' KB';
+}
+function toolStatusLabel(tool) {
+  const map = {
+    idle: '尚未检测',
+    checking: '正在检查最新版本…',
+    downloading: '正在通过 OpenWrt 代理下载…',
+    up_to_date: '已是最新版本',
+    error: '检测或下载失败'
+  };
+  return t(map[tool.status] || '尚未检测');
+}
+function stopToolPoll() { clearTimeout(toolPollTimer); toolPollTimer = null; }
+function scheduleToolPoll() {
+  stopToolPoll();
+  if (currentView !== 'tools') return;
+  if (!toolState.tools.some(tool => ['checking', 'downloading'].includes(tool.status))) return;
+  toolPollTimer = setTimeout(() => loadTools(true), 1800);
+}
+function renderTools() {
+  const grid = $('tools-grid'); if (!grid) return;
+  if (!toolState.tools.length) {
+    grid.innerHTML = `<section class="panel tool-empty"><div class="empty-symbol">⇩</div><h3>${t('工具列表正在加载')}</h3><p>${t('稍候会显示可下载的桌面工具。')}</p></section>`;
+    return;
+  }
+  grid.innerHTML = toolState.tools.map(tool => {
+    const working = ['checking', 'downloading'].includes(tool.status);
+    const progress = tool.progress;
+    const progressMarkup = tool.status === 'downloading'
+      ? `<div class="tool-progress"><div class="tool-progress-row"><span>${t('下载进度')}</span><strong>${progress?.percent ?? 0}%</strong></div><progress max="100" value="${progress?.percent ?? 0}"></progress><small>${h(toolBytes(progress?.received || 0))} / ${h(toolBytes(progress?.total || tool.bytes || 0))}</small></div>`
+      : tool.status === 'checking' ? `<div class="tool-progress tool-progress-checking"><progress></progress><small>${t('正在向 Microsoft Store 查询版本…')}</small></div>` : '';
+    const checked = tool.checkedAt ? new Date(tool.checkedAt).toLocaleString(getLanguage()) : t('尚未检测');
+    return `<article class="panel tool-card"><div class="tool-card-top"><div class="tool-mark">GPT</div><div><div class="eyebrow">MICROSOFT STORE · OPENAI</div><h3>${h(tool.name)}</h3><p>${h(tool.platform)}</p></div><span class="status-pill ${tool.status === 'error' ? 'off' : ''}">${h(toolStatusLabel(tool))}</span></div><div class="tool-versions"><div><span>${t('已安装版本')}</span><strong>${h(tool.installedVersion || t('尚未下载'))}</strong></div><div><span>${t('最新版本')}</span><strong>${h(tool.latestVersion || t('待检测'))}</strong></div><div><span>${t('安装包大小')}</span><strong>${h(tool.bytes ? toolBytes(tool.bytes) : t('未知'))}</strong></div></div>${progressMarkup}${tool.error ? `<div class="notice error" role="alert">${h(translateError(tool.error))}</div>` : ''}<div class="tool-card-meta"><span>${t('来源：Microsoft Store 官方安装包')}</span><span>·</span><span>${h(t('上次检测：{time}', { time: checked }))}</span><span>·</span><span class="${tool.proxyConfigured ? 'tool-proxy-ok' : 'tool-proxy-missing'}">${tool.proxyConfigured ? t('OpenWrt 代理已启用') : t('未配置下载代理')}</span></div><div class="tool-actions"><button class="button primary tool-update-button" data-tool-check ${working ? 'disabled' : ''}>${tool.status === 'checking' ? t('正在检测…') : tool.status === 'downloading' ? t('正在下载…') : t('检测更新')}</button>${tool.downloadUrl ? `<a class="button secondary" href="${h(tool.downloadUrl)}" download="${h(tool.fileName || '')}">${t('下载安装包')}</a>` : ''}</div></article>`;
+  }).join('');
+}
+async function loadTools(force = false) {
+  if (toolBusy && !force) return;
+  try {
+    const result = await api('/tools');
+    toolState = result;
+    renderTools();
+    scheduleToolPoll();
+  } catch (error) {
+    if (currentView === 'tools') errorBox('global-error', error.message);
+    stopToolPoll();
+  }
+}
+async function checkToolUpdate() {
+  if (toolBusy) return;
+  toolBusy = true; errorBox('global-error'); renderTools();
+  try {
+    const result = await api('/tools/chatgpt/check', { method: 'POST' });
+    toolState = { tools: [result.tool] };
+    renderTools(); scheduleToolPoll();
+    toast(result.tool.status === 'downloading' ? '检测到新版本，正在下载安装包' : '工具已是最新版本');
+  } catch (error) {
+    errorBox('global-error', error.message);
+    await loadTools(true);
+  } finally {
+    toolBusy = false; renderTools();
+  }
 }
 function toast(message) { $('toast').textContent = translateError(t(message)); $('toast').hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').hidden = true, 3500); }
 function errorBox(id, message) { errorsById.set(id, message); $(id).textContent = translateError(message) || ''; $(id).hidden = !message; }
@@ -153,7 +235,7 @@ function renderModels() {
 }
 function renderProviders() {
   $('providers-empty').hidden = Boolean(state.providers.length);
-  $('providers-grid').innerHTML = state.providers.map(p => `<article class="panel provider-card"><div class="provider-top"><div class="provider-mark">${p.type === 'nas-codex' ? '⌂' : p.type === 'claude-code' ? '✦' : h(p.name.slice(0, 1).toUpperCase())}</div><span class="status-pill ${p.enabled ? '' : 'off'}">${p.enabled ? t('已启用') : t('已停用')}</span></div><h3>${h(p.name)}</h3><code class="model-id">${h(p.id)} / ${p.type === 'nas-codex' ? (p.execution === 'ssh' ? 'Codex · SSH' : 'Codex · SSH + Docker') : p.type === 'claude-code' ? (p.execution === 'ssh' ? 'Claude · SSH' : 'Claude · SSH + Docker') : h(p.protocol)}</code><p>${h(p.baseUrl || `${p.sshUser}@${p.sshHost}${p.execution === 'ssh' ? '' : ' · ' + p.container}`)}</p><div class="provider-meta"><span>${t('{count} 个模型', {count: p.models.length})}</span><span>·</span><span>${p.lastSync ? t('同步于 {time}', {time: new Date(p.lastSync).toLocaleTimeString(getLanguage(), {hour:'2-digit',minute:'2-digit'})}) : t('尚未同步')}</span></div>${usageMarkup(p)}<div class="provider-actions"><button class="button ghost" data-refresh="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('↻ 刷新模型')}</button><button class="button ghost" data-edit="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('编辑')}</button><button class="button ghost danger" data-delete="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('删除')}</button></div></article>`).join('');
+  $('providers-grid').innerHTML = state.providers.map(p => `<article class="panel provider-card"><div class="provider-top"><div class="provider-mark">${p.type === 'nas-codex' ? '⌂' : p.type === 'claude-code' ? '✦' : h(p.name.slice(0, 1).toUpperCase())}</div><span class="status-pill ${p.enabled ? '' : 'off'}">${p.enabled ? t('已启用') : t('已停用')}</span></div><h3>${h(p.name)}</h3><code class="model-id">${h(p.id)} / ${p.type === 'nas-codex' ? (p.execution === 'ssh' ? 'Codex · SSH' : 'Codex · SSH + Docker') : p.type === 'claude-code' ? (p.execution === 'ssh' ? 'Claude · SSH' : 'Claude · SSH + Docker') : openCodeGoProvider(p) ? t('Chat + Responses · 自动路由') : h(p.protocol)}</code><p>${h(p.baseUrl || `${p.sshUser}@${p.sshHost}${p.execution === 'ssh' ? '' : ' · ' + p.container}`)}</p><div class="provider-meta"><span>${t('{count} 个模型', {count: p.models.length})}</span><span>·</span><span>${p.lastSync ? t('同步于 {time}', {time: new Date(p.lastSync).toLocaleTimeString(getLanguage(), {hour:'2-digit',minute:'2-digit'})}) : t('尚未同步')}</span></div>${usageMarkup(p)}<div class="provider-actions"><button class="button ghost" data-refresh="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('↻ 刷新模型')}</button><button class="button ghost" data-edit="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('编辑')}</button><button class="button ghost danger" data-delete="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('删除')}</button></div></article>`).join('');
 }
 function tokenMetricsMarkup(m) {
   if (!m) return '';
@@ -168,7 +250,7 @@ function capability() {
   const model = state.models.find(m => m.id === $('test-model').value);
   $('test-capability').textContent = model?.source === 'nas-codex' ? t('远程 Codex 支持客户端工具调用；由客户端执行工具，远端负责推理。') : model?.source === 'claude-code' ? t('Claude Code 支持客户端 function/custom 工具；由客户端执行操作，容器负责推理。') : '';
 }
-const views = new Set(['overview', 'providers', 'images', 'logs', 'settings']);
+const views = new Set(['overview', 'providers', 'images', 'logs', 'tools', 'settings']);
 function viewFromLocation() {
   const name = location.hash.replace(/^#\/?/, '');
   return views.has(name) ? name : 'overview';
@@ -176,15 +258,16 @@ function viewFromLocation() {
 function view(name, { updateUrl = true } = {}) {
   if (!views.has(name)) name = 'overview';
   currentView = name;
-  document.querySelector('.stats').hidden = ['images', 'settings'].includes(name);
-  $('add-btn').hidden = ['images', 'settings'].includes(name);
+  document.querySelector('.stats').hidden = ['images', 'tools', 'settings'].includes(name);
+  $('add-btn').hidden = ['images', 'tools', 'settings'].includes(name);
   imageUI.setVisible(name === 'images');
   document.querySelectorAll('.view').forEach(el => el.hidden = el.id !== name + '-view');
   document.querySelectorAll('.nav').forEach(el => el.classList.toggle('active', el.dataset.view === name));
-  const names = { settings: [t('设置'), t('管理你的模型港。'), t('配置管理页面的登录方式。')], images: [t('生成图像'), t('描述你的想象。'), t('从一句话开始，把想法变成可以保存的图像。')], overview: [t('模型总览'), t('所有模型，一个入口。'), t('连接不同来源，在同一份模型列表里自由选择。')], providers: [t('供应商'), t('连接你的模型来源。'), t('统一管理 API 服务与远程 Codex。')], logs: [t('请求记录'), t('每一次调用，都有迹可循。'), t('检查路由结果、响应状态与请求耗时。')] };
+  const names = { tools: [t('工具下载'), t('常用工具，一处获取。'), t('检查更新并通过 OpenWrt 代理缓存安装包。')], settings: [t('设置'), t('管理你的模型港。'), t('配置管理页面的登录方式。')], images: [t('生成图像'), t('描述你的想象。'), t('从一句话开始，把想法变成可以保存的图像。')], overview: [t('模型总览'), t('所有模型，一个入口。'), t('连接不同来源，在同一份模型列表里自由选择。')], providers: [t('供应商'), t('连接你的模型来源。'), t('统一管理 API 服务与远程 Codex。')], logs: [t('请求记录'), t('每一次调用，都有迹可循。'), t('检查路由结果、响应状态与请求耗时。')] };
   [$('page-name').textContent, $('heading').textContent, $('subtitle').textContent] = names[name];
   if (name === 'settings') loadSettings();
-  if (name === 'providers') for (const p of state.providers) if ((p.type === 'nas-codex' || p.type === 'claude-code' || balanceProvider(p)) && p.enabled) loadUsage(p.id);
+  if (name === 'tools') loadTools(); else stopToolPoll();
+  if (name === 'providers') for (const p of state.providers) if ((p.type === 'nas-codex' || p.type === 'claude-code' || balanceProvider(p) || openCodeGoProvider(p)) && p.enabled) loadUsage(p.id);
   if (updateUrl && location.hash !== '#' + name) history.pushState({ view: name }, '', '#' + name);
 }
 let settingsLoading = false;
@@ -259,12 +342,22 @@ function openEditor(id) {
     $('p-docker-path').value = p.dockerPath || '/usr/local/bin/docker';
     $('p-models').value = p.models.join('\n'); $('p-enabled').checked = p.enabled;
   }
-  typeFields(); $('provider-dialog').showModal();
+  syncOpenCodeGoPreset(); typeFields(); $('provider-dialog').showModal();
 }
 $('p-execution').addEventListener('change', typeFields);
+function syncOpenCodeGoPreset() {
+  const selected = $('preset').value === 'opencode-go';
+  $('opencode-go-preset').hidden = !selected; $('provider-standard-fields').hidden = selected;
+  $('save-provider').hidden = selected;
+  for (const id of ['p-name', 'p-id', 'p-key', 'p-url', 'p-models', 'p-timeout']) $(id).required = !selected && (id === 'p-name' || id === 'p-id' || id === 'p-timeout');
+  if (selected) for (const id of ['p-name', 'p-id', 'p-key', 'p-url', 'p-models']) $(id).disabled = true;
+  else for (const id of ['p-name', 'p-id', 'p-key', 'p-url', 'p-models']) $(id).disabled = false;
+}
 $('preset').addEventListener('change', () => {
   const preset = $('preset').value;
   $('p-type').value = preset === 'remote-codex' ? 'nas-codex' : preset === 'claude-code' ? 'claude-code' : 'openai';
+  if (preset === 'opencode-go') { syncOpenCodeGoPreset(); typeFields(); return; }
+  syncOpenCodeGoPreset();
   const config = { custom: ['', '', '', 'chat'], deepseek: ['DeepSeek', 'deepseek', 'https://api.deepseek.com/v1', 'chat'], openai: ['OpenAI', 'openai', 'https://api.openai.com/v1', 'both'], 'remote-codex': [t('远程 Codex'), 'codex', '', 'chat'], 'claude-code': [t('Claude Code'), 'claude', '', 'chat'] }[preset];
   [$('p-name').value, $('p-id').value, $('p-url').value, $('p-protocol').value] = config;
   $('p-key').value = ''; $('p-models').value = '';
@@ -284,8 +377,11 @@ $('preset').addEventListener('change', () => {
   }
   typeFields();
 });
+$('og-preset-open').addEventListener('click', event => {
+  event.preventDefault(); openOpenCodeGo();
+});
 $('provider-form').addEventListener('submit', async event => {
-  event.preventDefault(); if (busy) return;
+  event.preventDefault(); if (busy || $('preset').value === 'opencode-go') return;
   const input = { id: $('p-id').value.trim(), name: $('p-name').value, type: $('p-type').value, baseUrl: $('p-url').value.trim(), protocol: $('p-protocol').value, apiKey: $('p-key').value, clearApiKey: $('p-clear-key').checked, enabled: $('p-enabled').checked,
     models: $('p-models').value.split(/[\n,，]/).map(m => m.trim()).filter(Boolean), timeout: Number($('p-timeout').value), sshHost: $('p-host').value.trim(), sshUser: $('p-user').value.trim(), sshPort: Number($('p-ssh-port').value || 22), sshKeyPath: $('p-ssh-key').value.trim(), container: $('p-container').value.trim(), dockerPath: $('p-docker-path').value.trim(), execution: $('p-execution').value, codexPath: $('p-type').value === 'nas-codex' ? $('p-codex').value.trim() : undefined, claudePath: $('p-type').value === 'claude-code' ? $('p-codex').value.trim() : undefined };
   if (input.type === 'openai') input.tokenOptimization = { ...(state.providers.find(p => p.id === editing)?.tokenOptimization || {}), enabled: $('p-token-enabled').checked, captureStreamUsage: $('p-token-usage').checked };
@@ -296,6 +392,74 @@ $('provider-form').addEventListener('submit', async event => {
     $('provider-dialog').close(); await load(); toast('供应商已保存，可点击「刷新模型」获取模型列表');
   } catch (e) { errorBox('editor-error', e.message); }
   finally { busy = false; saving = false; $('save-provider').disabled = false; $('save-provider').textContent = t('保存供应商'); renderProviders(); renderModels(); }
+});
+let ogAttempt = null, ogGeneration = 0, ogTimer = null;
+function stopOpenCodeGo() {
+  ogGeneration++; clearTimeout(ogTimer);
+  const id = ogAttempt; ogAttempt = null;
+  if (id) api('/opencode-go/auth/' + id + '/cancel', { method: 'POST' }).catch(() => {});
+}
+function openOpenCodeGo() {
+  stopOpenCodeGo();
+  $('opencode-go-form').reset(); $('og-prefix').value = 'ocgo'; $('og-prefix').disabled = false;
+  $('og-auth').hidden = true; $('og-result').hidden = true; $('og-result').textContent = '';
+  errorBox('og-error');
+  $('og-submit').disabled = false; $('og-submit').textContent = t('浏览器授权并接入');
+  $('opencode-go-dialog').showModal();
+}
+$('opencode-go-dialog').addEventListener('close', stopOpenCodeGo);
+function showOpenCodeGoResult(result) {
+  const skipped = Object.values(result.groups?.skipped || {}).flat();
+  const lines = [t('已接入 {count} 个供应商。', {count: result.providers.length})];
+  const chatCount = result.groups?.chat?.length || 0, responsesCount = result.groups?.responses?.length || 0;
+  for (const provider of result.providers) lines.push('• ' + provider.name + ': ' + t('{count} 个模型', {count: provider.models.length}) + ' (' + t('Chat {chat} · Responses {responses}', {chat: chatCount, responses: responsesCount}) + ')');
+  if (skipped.length) lines.push(t('已跳过 {count} 个仅 Anthropic/Google 或未识别的模型。', {count: skipped.length}) + '\n' + skipped.join(', '));
+  $('og-result').textContent = lines.join('\n'); $('og-result').hidden = false;
+}
+async function pollOpenCodeGo(generation, delay) {
+  ogTimer = setTimeout(async () => {
+    if (generation !== ogGeneration || !ogAttempt) return;
+    try {
+      const response = await api('/opencode-go/auth/' + ogAttempt + '/poll', { method: 'POST' });
+      if (generation !== ogGeneration) return;
+      if (response.status === 'pending') return pollOpenCodeGo(generation, Math.max(5, response.interval || 5) * 1000);
+      if (response.status !== 'complete') throw new Error(t('授权被取消、拒绝或已过期，请重新授权。'));
+      ogAttempt = null; $('og-auth').hidden = true;
+      showOpenCodeGoResult(response.result); await load(); toast(t('OpenCode Go 已接入'));
+      $('og-prefix').disabled = false; $('og-submit').disabled = false; $('og-submit').textContent = t('浏览器授权并接入');
+    } catch (error) {
+      if (generation !== ogGeneration) return;
+      stopOpenCodeGo(); errorBox('og-error', error.message); $('og-auth').hidden = true;
+      $('og-prefix').disabled = false; $('og-submit').disabled = false; $('og-submit').textContent = t('浏览器授权并接入');
+    }
+  }, delay);
+}
+$('opencode-go-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if ($('og-submit').disabled) return;
+  stopOpenCodeGo(); const generation = ogGeneration;
+  // Open synchronously so popup blockers do not discard the official login tab.
+  const popup = window.open('about:blank', '_blank');
+  if (popup) popup.opener = null;
+  $('og-submit').disabled = true; $('og-prefix').disabled = true;
+  $('og-submit').textContent = t('正在创建授权…'); errorBox('og-error'); $('og-result').hidden = true;
+  try {
+    const attempt = await api('/opencode-go/auth/start', { method: 'POST', body: JSON.stringify({ prefix: $('og-prefix').value.trim() }) });
+    if (generation !== ogGeneration) {
+      api('/opencode-go/auth/' + attempt.attemptId + '/cancel', { method: 'POST' }).catch(() => {});
+      popup?.close(); return;
+    }
+    ogAttempt = attempt.attemptId;
+    $('og-code').textContent = attempt.userCode; $('og-link').href = attempt.url;
+    $('og-auth').hidden = false; $('og-submit').textContent = t('等待浏览器授权…');
+    if (popup) popup.location.replace(attempt.url);
+    pollOpenCodeGo(generation, attempt.interval * 1000);
+  } catch (error) {
+    popup?.close();
+    if (generation !== ogGeneration) return;
+    errorBox('og-error', error.message); $('og-prefix').disabled = false;
+    $('og-submit').disabled = false; $('og-submit').textContent = t('浏览器授权并接入');
+  }
 });
 async function refresh(ids) {
   if (busy) return; busy = true; refreshing = true; errorBox('global-error'); $('refresh-all').textContent = t('正在刷新…'); renderModels(); renderProviders();
@@ -315,6 +479,7 @@ document.addEventListener('click', async event => {
   if (el.dataset.resetUsage) openReset(el.dataset.resetUsage);
   if (el.dataset.refresh) refresh([el.dataset.refresh]);
   if (el.dataset.test) { $('test-model').value = el.dataset.test; capability(); $('test-prompt').focus(); }
+  if (el.dataset.toolCheck !== undefined) checkToolUpdate();
   if (el.dataset.delete && !busy) {
     const p = state.providers.find(p => p.id === el.dataset.delete);
     if (!confirm(t('删除「{name}」及其模型配置？', {name:p.name}))) return;
@@ -408,6 +573,7 @@ function applyLanguage() {
   $('editor-title').textContent = t(editing ? '编辑供应商' : '添加供应商');
   $('key-help').textContent = t(editing && state.providers.find(p => p.id === editing)?.hasApiKey ? '已保存密钥，留空保持原值；输入新密钥可替换。' : '密钥在服务端加密保存。');
   $('save-provider').textContent = t(saving ? '正在保存…' : '保存供应商');
+  if ($('opencode-go-dialog').open) $('og-submit').textContent = t(ogAttempt ? '等待浏览器授权…' : '浏览器授权并接入');
   $('refresh-all').textContent = t(refreshing ? '正在刷新…' : '↻ 刷新模型');
   $('test-submit').textContent = t(testBusy ? '正在等待回复…' : '发送测试消息 →');
   $('reveal-key').textContent = t(keyVisible ? '隐藏' : '显示');

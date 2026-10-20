@@ -99,7 +99,8 @@ test('HTTP gateway: authentication, CRUD, isolation, routes, streaming, function
       }
       assert.equal((await api('/chat/completions', { model: 'unknown' })).status, 404);
       assert.equal((await api('/responses', { model: 'a/shared-model', input: 'hi', previous_response_id: 'x' })).status, 400);
-      assert.equal((await api('/responses', { model: 'a/shared-model', input: 'hi', tools: [{ type: 'custom', name: 'apply_patch' }] })).status, 400);
+      assert.equal((await api('/responses', { model: 'a/shared-model', input: 'hi', tools: [{ type: 'custom', name: 'apply_patch' }] })).status, 200);
+      assert.deepEqual(received.at(-1).body.tools[0].function.parameters.required, ['input']);
     });
     await t.test('nonstream and SSE text Responses conversion with usage', async () => {
       const body = { model: 'a/shared-model', input: 'hello' };

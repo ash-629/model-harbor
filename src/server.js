@@ -15,6 +15,10 @@ import { claudeUsage } from './claude-usage.js';
 import { providerBalance } from './balance.js';
 import { ClaudeCodeBridge } from './claude-code.js';
 import { ImageJobs, runnerFile } from './images.js';
+import { authorizeOpenCodeGo, isOpenCodeGoProvider, classifyOpenCodeGoModel } from './opencode-go.js';
+import { openCodeGoUsage } from './opencode-go-usage.js';
+import { OpenCodeGoAuth } from './opencode-go-auth.js';
+import { ToolDownloads } from './tools.js';
 const root = fileURLToPath(new URL('..', import.meta.url));
 const publicDir = path.join(root, 'public');
 const equal = (a, b) => { const aa = Buffer.from(a || ''), bb = Buffer.from(b || ''); return aa.length === bb.length && crypto.timingSafeEqual(aa, bb); };
@@ -29,15 +33,25 @@ async function readBody(req, limit = 4 * 1024 * 1024) {
   if (!body || Array.isArray(body) || typeof body !== 'object') throw new HttpError(400, '请求体必须为 JSON 对象');
   return body;
 }
+const CLIENT_SESSION_HEADERS = ['x-opencode-session', 'x-session-id', 'session-id', 'session_id', 'x-conversation-id', 'conversation-id', 'conversation_id', 'x-thread-id', 'thread-id', 'thread_id'];
+function clientSessionId(req) {
+  for (const name of CLIENT_SESSION_HEADERS) {
+    const value = req.headers[name];
+    if (typeof value === 'string' && value.trim()) return value.trim().slice(0, 128);
+  }
+  return '';
+}
 export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, publicUrl, adminPassword, nasAgent = new NasAgentBridge(), claudeBridge = new ClaudeCodeBridge(), apiBodyLimitMb = 64 } = {}) {
   if (!Number.isInteger(apiBodyLimitMb) || apiBodyLimitMb < 1 || apiBodyLimitMb > 256) throw new Error('GATEWAY_API_BODY_LIMIT_MB 必须是 1–256 的整数');
   const external = publicUrl ? new URL(publicUrl) : null;
   if (external && (!['http:', 'https:'].includes(external.protocol) || external.username || external.password || external.pathname !== '/' || external.search || external.hash)) throw new Error('GATEWAY_PUBLIC_URL 必须是服务根地址');
   const store = new Store(dataDir), sessions = new Map(), logs = [];
   const adminAuth = new AdminAuth(store, adminPassword);
+  const openCodeAuth = new OpenCodeGoAuth(store);
   let settingsSaving = false;
   if (external && !adminAuth.configured) throw new Error('局域网部署必须设置 GATEWAY_ADMIN_PASSWORD 或已保存的管理密码');
   const imageProviders = new ImageProviders(store), imageJobs = new ImageJobs(store, imageProviders, dataDir);
+  const toolDownloads = new ToolDownloads(dataDir);
   const log = value => { logs.unshift({ time: new Date().toISOString(), ...value }); if (logs.length > 100) logs.pop(); };
   const server = http.createServer(async (req, res) => {
     const started = Date.now(), controller = new AbortController();
@@ -59,6 +73,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
       if (origin && ![`http://127.0.0.1:${actualPort}`, `http://localhost:${actualPort}`, external?.origin].includes(origin)) throw new HttpError(403, '不允许跨站请求');
       const url = new URL(req.url, 'http://' + req.headers.host), pathname = url.pathname;
       const method = req.method;
+      const requestSessionId = clientSessionId(req);
       if (adminAuth.enabled && pathname !== '/health' && !/^\/v1(?:\/|$)/.test(pathname)) {
         if (!await adminAuth.accepts(req.headers.authorization)) {
           res.setHeader('www-authenticate', 'Basic realm="Model Harbor", charset="UTF-8"');
@@ -90,6 +105,15 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
             return json(res, 200, result);
           } finally { settingsSaving = false; }
         }
+        if (pathname === '/api/tools' && method === 'GET') return json(res, 200, { tools: toolDownloads.list() });
+        if (pathname === '/api/tools/chatgpt/check' && method === 'POST') return json(res, 200, { tool: await toolDownloads.check() });
+        if (pathname === '/api/tools/chatgpt/download' && method === 'GET') {
+          const { file, name } = toolDownloads.file();
+          res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': fs.statSync(file).size,
+            'content-disposition': `attachment; filename="${name}"` });
+          const stream = fs.createReadStream(file);
+          stream.on('error', () => res.destroy()); res.on('close', () => stream.destroy()); stream.pipe(res); return;
+        }
         if (pathname === '/api/image/providers' && method === 'GET') return json(res, 200, { providers: imageProviders.list() });
         if (pathname === '/api/image/providers' && method === 'POST') return json(res, 201, imageProviders.upsert(await readBody(req)));
         const imageProviderMatch = /^\/api\/image\/providers\/([a-z0-9_-]+)(\/check)?$/.exec(pathname);
@@ -117,9 +141,17 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
         if (pathname === '/api/config' && method === 'GET') return json(res, 200, { providers: store.list(), models: store.models(), logs, baseUrl: `${external?.origin || `http://127.0.0.1:${actualPort}`}/v1` });
         if (pathname === '/api/key' && method === 'GET') return json(res, 200, { key: store.gatewayKey() });
         if (pathname === '/api/providers' && method === 'POST') return json(res, 201, store.upsert(await readBody(req)));
+        if (pathname === '/api/opencode-go/authorize' && method === 'POST') return json(res, 200, await authorizeOpenCodeGo(store, await readBody(req), { signal: controller.signal }));
+        if (pathname === '/api/opencode-go/auth/start' && method === 'POST') return json(res, 200, await openCodeAuth.start(sessionId, await readBody(req), controller.signal));
+        const openCodeAuthMatch = /^\/api\/opencode-go\/auth\/([a-f0-9-]{36})\/(poll|cancel)$/.exec(pathname);
+        if (openCodeAuthMatch && method === 'POST') {
+          const [, id, action] = openCodeAuthMatch;
+          return json(res, 200, action === 'cancel' ? openCodeAuth.cancel(sessionId, id) : await openCodeAuth.poll(sessionId, id, controller.signal));
+        }
         const usageMatch = /^\/api\/providers\/([a-z0-9_-]+)\/usage$/.exec(pathname);
         if (usageMatch && method === 'GET') {
           const provider = store.get(usageMatch[1]);
+          if (isOpenCodeGoProvider(provider)) return json(res, 200, await openCodeGoUsage(store, provider, controller.signal));
           if (provider.type === 'claude-code') return json(res, 200, await claudeUsage(provider, controller.signal));
           if (provider.type === 'openai') return json(res, 200, await providerBalance(store, provider, controller.signal));
           return json(res, 200, await nasAgent.usage(provider, controller.signal));
@@ -141,10 +173,10 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
           const input = await readBody(req);
           if (typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 16000) throw new HttpError(400, '请输入测试内容（最多 16000 字符）');
           const { provider, model } = store.resolve(input.model);
-          const endpoint = provider.protocol === 'responses' ? 'responses' : 'chat/completions';
+          const endpoint = provider.protocol === 'responses' || (isOpenCodeGoProvider(provider) && classifyOpenCodeGoModel(model) === 'responses') ? 'responses' : 'chat/completions';
           const body = endpoint === 'responses' ? { model: input.model, input: input.prompt, store: false } : { model: input.model, messages: [{ role: 'user', content: input.prompt }] };
           requestModel = body.model; requestEndpoint = 'test';
-          const output = await route(store, provider, model, body, endpoint, res, controller.signal, nasAgent, claudeBridge);
+          const output = await route(store, provider, model, body, endpoint, res, controller.signal, nasAgent, claudeBridge, requestSessionId);
           const text = output.choices?.[0]?.message?.content ?? output.output?.filter(i => i.type === 'message').flatMap(i => i.content || []).map(c => c.text || c.refusal || '').join('\n') ?? '';
           log({ model: body.model, endpoint: 'test', status: 200, duration: Date.now() - started, ...(res.apiMetrics ? { tokenMetrics: res.apiMetrics } : {}) });
           return json(res, 200, { text, usage: output.usage, duration: Date.now() - started, ...(res.apiMetrics ? { tokenMetrics: res.apiMetrics } : {}) });
@@ -160,7 +192,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
           requestModel = body.model; requestEndpoint = 'messages';
           if (req.headers['anthropic-version'] && req.headers['anthropic-version'] !== '2023-06-01') throw new HttpError(400, 'Unsupported anthropic-version; use 2023-06-01');
           const {provider, model} = store.resolve(body.model);
-          const result = await sendMessages(body, res, (request, target) => route(store, provider, model, request, 'responses', target, controller.signal, nasAgent, claudeBridge));
+          const result = await sendMessages(body, res, (request, target) => route(store, provider, model, request, 'responses', target, controller.signal, nasAgent, claudeBridge, requestSessionId));
           log({model:body.model,endpoint:'messages',status:200,duration:Date.now()-started,...(res.apiMetrics?{tokenMetrics:res.apiMetrics}:{})});
           if (result) json(res,200,result);
           return;
@@ -170,7 +202,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
           if (body.stream !== undefined && typeof body.stream !== 'boolean') throw new HttpError(400, 'stream 必须为布尔值');
           const { provider, model } = store.resolve(body.model);
           const endpoint = pathname.slice(4); requestModel = body.model; requestEndpoint = endpoint;
-          const result = await route(store, provider, model, body, endpoint, res, controller.signal, nasAgent, claudeBridge);
+          const result = await route(store, provider, model, body, endpoint, res, controller.signal, nasAgent, claudeBridge, requestSessionId);
           log({ model: body.model, endpoint, status: 200, duration: Date.now() - started, ...(res.apiMetrics ? { tokenMetrics: res.apiMetrics } : {}) });
           if (result) json(res, 200, result);
           return;
@@ -205,8 +237,8 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
   });
   server.requestTimeout = 30000;
   server.headersTimeout = 15000;
-  server.on('close', () => { imageJobs.close(); nasAgent.close(); });
-  return { server, store, logs, imageProviders, imageJobs };
+  server.on('close', () => { imageJobs.close(); toolDownloads.close(); nasAgent.close(); });
+  return { server, store, logs, imageProviders, imageJobs, toolDownloads };
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const port = Number(process.env.PORT || 8317);

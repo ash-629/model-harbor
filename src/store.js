@@ -35,7 +35,7 @@ export class Store {
     fs.writeFileSync(this.file + '.tmp', JSON.stringify(this.data, null, 2), { mode: 0o600 });
     fs.renameSync(this.file + '.tmp', this.file);
   }
-  publicProvider(p) { const { apiKey, ...rest } = p; return { ...rest, hasApiKey: Boolean(apiKey) }; }
+  publicProvider(p) { const { apiKey, ...rest } = p; return { ...rest, hasApiKey: Boolean(apiKey || p.openCodeAuthId) }; }
   list() { return this.data.providers.map(p => this.publicProvider(p)); }
   get(id) { const p = this.data.providers.find(p => p.id === id); if (!p) throw new HttpError(404, '供应商不存在'); return p; }
   upsert(input, oldId) {
@@ -76,6 +76,9 @@ export class Store {
       let url; try { url = new URL(input.baseUrl); } catch { throw new HttpError(400, '请输入有效的 API Base URL'); }
       if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new HttpError(400, 'API 地址只支持 HTTP/HTTPS，不应含认证、查询或片段');
       p.baseUrl = url.toString().replace(/\/+$/, '');
+      // Only server-created OAuth references survive edits; changing the URL
+      // or supplying a manual key detaches the account credential.
+      if (old?.openCodeAuthId && !input.apiKey && !input.clearApiKey && p.baseUrl === old.baseUrl) p.openCodeAuthId = old.openCodeAuthId;
       if (/\/(models|responses|chat\/completions)$/.test(p.baseUrl)) throw new HttpError(400, '请输入 Base URL，例如 https://api.example.com/v1，不包含具体接口路径');
     } else if (type === 'nas-codex') {
       validateRemote();

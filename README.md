@@ -11,6 +11,10 @@
 - 通过 SSH 或 SSH + Docker 接入官方 Claude Code；支持客户端工具、图片输入、工具图片结果和多轮往返。
 - 网页生图：OpenAI 兼容 Images API、MiniMax API、本机或远程 Codex；参考图、后台队列、历史和原图下载。
 - “设置”菜单可启用或关闭管理页面的用户名密码登录，立即生效并持久化。
+- OpenCode Go 一键接入：官方浏览器设备授权，自动创建按模型自动路由 Chat/Responses 的 `ocgo` 供应商，并显示官方额度。
+- Chat 上游支持客户端 custom/namespace 工具；Grok Responses 自动改写不受支持的工具声明，工具仍由客户端执行。
+- 左侧「工具下载」可检测并下载 Windows 版 ChatGPT 桌面端安装包。
+- OpenCode Go 请求可在转发前压缩历史 `data:` 图片，减少多图会话上传体积。
 
 ## 本机启动
 
@@ -42,6 +46,8 @@ sudo chown 1000:1000 data
 docker compose up -d --build
 ```
 
+镜像内已安装 `openssh-client`、`python3`、`python3-pil` 和 `ca-certificates`。构建阶段可通过 `--build-arg DEBIAN_MIRROR=mirrors.tuna.tsinghua.edu.cn` 指定 apt 镜像；该参数只影响构建，不改变运行时网络。
+
 示例只发布本机端口。局域网访问时，调整 Compose 端口绑定和 `GATEWAY_PUBLIC_URL`，使其与浏览器访问地址一致。非回环监听必须同时配置公开根地址和管理密码。个人管理页面不应直接映射至公网，需要公网访问时应自行配置 HTTPS 和访问控制。
 
 | 环境变量 | 用途 |
@@ -52,6 +58,11 @@ docker compose up -d --build
 | `GATEWAY_PUBLIC_URL` | 部署访问根地址，用于 Host/Origin 校验 |
 | `GATEWAY_ADMIN_PASSWORD` | 管理密码，用户名 admin |
 | `GATEWAY_API_BODY_LIMIT_MB` | 聊天 JSON 大小上限，默认 64 MiB，范围 1–256 |
+| `MH_AGENT_MAX_SECONDS` | Codex app-server 进程总时限，默认 7200 |
+| `MH_TOOL_WAIT_SECONDS` | 客户端工具结果等待时间，默认 1800 |
+| `MH_TOOL_PROXY` / `TOOL_DOWNLOAD_PROXY` | 工具下载使用的代理，只在服务端读取 |
+| `MH_IMAGE_OPTIMIZATION` | 请求图片压缩范围，`opencode`（默认）/`all`/`off` |
+| `MH_IMAGE_MAX_DIMENSION` / `MH_IMAGE_QUALITY` | 压缩后最长边默认 1600、JPEG 质量默认 80 |
 
 关闭管理登录后，任何能访问该地址的人都可以管理模型港。此开关不会关闭 `/v1` 的 Bearer API Key 验证。
 
@@ -84,6 +95,33 @@ Claude 聊天链路使用官方 Claude Code 的 `--json-schema` / `stream-json` 
 
 支持 function/custom/namespace、长工具名、客户端 tool search、图片输入、工具图片结果和多轮工具往返；Claude 模型别名默认为 `sonnet`、`opus`、`haiku`。该链路直接使用官方 CLI 登录，不通过模型港读取或转发订阅 token。
 
+## OpenCode Go 接入
+
+供应商页「＋ 添加供应商」→ 快速选择「OpenCode Go · 浏览器授权」→「浏览器授权并接入」。模型港使用 OpenCode 官方公开的设备授权流程（`client_id` 为 `model-harbor`），无需粘贴 API Key；取得的是访问令牌和刷新令牌，不会解析或恢复已有的长期 Key。
+
+授权成功后读取所选工作区的 `/console/api/v2/config`，创建或更新一个 `ocgo` 供应商（`protocol=both`），按每个模型的官方端点自动路由到 Chat 或 Responses；Anthropic/Google-only 与无法识别的模型会被跳过并列出。已有同前缀供应商保留名称、开关、超时与 Token 优化设置。旧版本的 `ocgo-r` 会在再次授权时合并进 `ocgo`。
+
+凭据在服务端加密保存，并随请求自动续期；刷新令牌通过并发锁串行使用，失效时提示重新授权。转发固定发送 `User-Agent: model-harbor/0.1.0` 和稳定的 `x-opencode-session`（优先采用客户端提供的会话头）。供应商卡片的额度来自官方 `/inference/go/v1/usage`，显示滚动（5 小时）/每周/每月剩余百分比，两个协议共享 30 秒缓存；缺失值显示未知而不是零。
+
+管理端接口（均需管理员会话与 CSRF）：
+
+- `POST /api/opencode-go/auth/start`：`{ "prefix": "ocgo" }`，返回临时授权 ID、设备码和官方链接。
+- `POST /api/opencode-go/auth/:id/poll`：等待授权并自动配置供应商。
+- `POST /api/opencode-go/auth/:id/cancel`：取消本次等待。
+- `POST /api/opencode-go/authorize`：旧的手动 Key 接口，继续兼容。
+
+授权等待在服务重启后失效，已保存的凭据会保留；关闭弹窗只取消等待，不会删除凭据。
+
+## OpenCode / Grok 协议兼容
+
+OpenCode Go 的上游是混合形态：Chat 端点不接受 `developer` 角色，Grok 的 Responses 端点拒绝 custom 工具、namespace、`web_search_preview` 系列以及部分搜索参数。模型港在转发前做定向改写，客户端契约保持不变：
+
+- Chat 上游：custom/namespace/tool_search 工具包装成单字符串参数的 function，返回时还原为 `custom_tool_call`；SSE 使用 `custom_tool_call_input` 事件。grammar 只作为说明传递，不声称原生强制。历史中的 `developer` 消息规范化为 `system`，内容与顺序不变。
+- Grok Responses：custom 工具同样以字符串函数包装并在响应中还原；namespace 展开为带稳定别名的普通函数；移除 `web_search_preview` 系列、`programmatic_tool_calling`、`external_web_access` 与 `search_context_size`，保留 `web_search`、`file_search`、`image_generation` 及已支持的搜索参数，并在 instructions 中说明被移除的工具不可用。工具参数根若为 `anyOf`/`oneOf`，会归一化为对象根 schema。
+- 被移除的声明和参数记录在请求日志的 `droppedHosted` / `droppedArguments` 中，原始客户端请求不被修改。
+
+加密历史回退：OpenCode Responses 明确返回 `Could not decode the compaction blob` 或 `Could not decrypt the provided encrypted_content` 时，模型港只重试一次，把 compaction 项替换为可读摘要（无摘要时明确告知加密历史不可读，不编造内容），并移除无可读文本的 opaque reasoning；合法的原生密文原样通过。回退次数记录在 `metrics.compactionFallback`。
+
 ## 网页生图
 
 生图入口位于管理页「生图」，支持 OpenAI 兼容或 MiniMax Images API、本机或远程 Codex。Codex 生图执行器是 `src/codex-image-runner.py`，与 Codex 聊天接入相互独立；远程生图仍需安装、登录 Codex 并部署该执行器。参考图最多 3 张，具体限制以页面和服务商能力为准。
@@ -94,7 +132,31 @@ Codex 桥接要求完整历史和 `store=false`；不支持持久 Responses 查�
 
 原生 API 供应商按所选协议转发。Chat → Responses 转换支持的能力取决于上游，不等同所有原生 Responses 特性。原生文字搜索可在 Codex 支持时启用，图片搜索声明不会被冒充为实际图片检索能力。
 
-Anthropic Messages 支持文本、图片、工具调用与结果、流式 SSE 和 `thinking` 参数；`thinking` 会转换为推理强度提示，历史 thinking 文本按普通助手上下文保留。Anthropic 服务端工具、`stop_sequences`、`top_k`、提示缓存控制和 token-counting 端点不在兼容范围内。消息数组中的 system 消息会转换为 developer 上下文。
+Anthropic Messages 支持文本、图片、工具调用与结果、流式 SSE 和 `thinking` 参数；`thinking` 会转换为推理强度提示，历史 thinking 与 redacted thinking 块按客户端契约省略，不改写成普通助手文本。Anthropic 服务端工具、`stop_sequences`、`top_k`、提示缓存控制和 token-counting 端点不在兼容范围内。消息数组中的 system 消息会转换为 developer 上下文。
+
+## 工具下载
+
+左侧「工具下载」提供 Windows 版 ChatGPT 桌面端。点击「检测更新」后，后台通过固定 Microsoft Store 产品 ID `9PLM9XGG6VKS` 查询最新 x64 MSIX，并使用配置好的 OpenWrt 代理下载。安装包保存到 `data/tools/chatgpt/`，下载有进度、完成后校验 SHA-1，只保留最新安装包，页面可直接下载缓存文件。
+
+Microsoft Store 产品接口不提供安装包版本号，因此版本和包链接由公开的 Windows Update 包索引 `store.rg-adguard.net` 解析；安装包本身只从 `delivery.mp.microsoft.com` 下载。版本号、文件名和下载主机都做白名单校验，半成品文件会被清理。
+
+代理地址通过私密 `deployment.env` 中的 `MH_TOOL_PROXY`（兼容 `TOOL_DOWNLOAD_PROXY`）注入，不会回显到页面或日志；镜像包含 `ca-certificates` 以验证代理后的 HTTPS 证书。
+
+## 请求图片压缩
+
+OpenCode Go 供应商的请求会在协议转换后、转发前压缩历史中的 `data:` 图片（Chat 与 Responses 两条路径都适用），降低多图长会话的上传字节和上游入口耗时；默认只对 OpenCode Go 生效。只处理请求体里的 data URL，不抓取远程图片，也不改写工具 schema 中的示例 URL。
+
+| 环境变量 | 默认 | 用途 |
+| --- | --- | --- |
+| `MH_IMAGE_OPTIMIZATION` | `opencode` | `off` / `opencode` / `all` |
+| `MH_IMAGE_MAX_DIMENSION` | `1600` | 最长边像素，保持比例，不放大 |
+| `MH_IMAGE_QUALITY` | `80` | JPEG 质量，范围 30–95 |
+| `MH_IMAGE_MIN_BYTES` | `350000` | 小于该值且尺寸未超限时跳过 |
+| `MH_IMAGE_MAX_INPUT_BYTES` | `12582912` | 单张原图上限，超过则保留原图 |
+| `MH_IMAGE_TIMEOUT_MS` | `15000` | 单张压缩超时 |
+| `MH_IMAGE_CACHE_LIMIT` | `32` | 相同图片的内存缓存条数 |
+
+压缩失败时保持原图并继续请求，不会阻断推理；带透明通道的图片保留 PNG，不透明图片输出 JPEG。日志的 `imageOptimization` 只记录图片数、原始/压缩后字节数和失败数，不记录图片内容。该步骤减少上传体积，不改变上游自身的排队与限流。
 
 ## 数据与凭据
 
@@ -109,7 +171,7 @@ npm test
 npm run check
 ```
 
-当前 Node 回归测试为 89 项，覆盖管理鉴权、供应商 CRUD、协议转换、流式 SSE、客户端工具往返、长历史注入、模型发现、Codex/Claude 工具桥接、图片队列和 i18n。测试使用模拟上游和临时数据，不调用真实模型、不消耗真实账号重置次数。
+当前 Node 回归测试为 140 项，覆盖管理鉴权、供应商 CRUD、协议转换、流式 SSE、客户端工具往返、长历史注入、模型发现、Codex/Claude 工具桥接、OpenCode Go 授权与额度、Grok 工具改写、加密历史回退、图片压缩、工具下载目录、图片队列和 i18n。测试使用模拟上游和临时数据，不调用真实模型、不消耗真实账号重置次数。
 
 字体及其许可证见 [public/FONT-LICENSE.txt](public/FONT-LICENSE.txt)。
 
