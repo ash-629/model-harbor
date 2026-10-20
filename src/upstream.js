@@ -1,7 +1,7 @@
 // F-03/F-05: upstream requests, streaming backpressure, cancellation and sanitized failures.
 import { HttpError } from './store.js';
 import { optimizeApiPayload, tokenPolicy, usageMetrics, requestStats } from './api-token-policy.js';
-import { toChat, fromChat, bridgeStream, sseEvents, openSSE, writeSSE, chatToResponses, responsesToChat, responsesStreamToChat } from './protocol.js';
+import { toChat, fromChat, bridgeStream, sseEvents, openSSE, writeSSE, chatToResponses, responsesToChat, responsesStreamToChat, normalizeChatToolMessages } from './protocol.js';
 import { sendAgent } from './nas-agent.js';
 import { claudeModels, sendClaude, ClaudeCodeBridge } from './claude-code.js';
 import { discoverOpenCodeGo, isOpenCodeGoProvider, openCodeSessionId, classifyOpenCodeGoModel, OPENCODE_GO_SESSION_HEADER, OPENCODE_GO_USER_AGENT } from './opencode-go.js';
@@ -9,6 +9,7 @@ import { openCodeGoCredential } from './opencode-go-auth.js';
 import { chatToolPlan } from './chat-tools.js';
 import { responsesToolPlan, restoreResponsesResponse, responsesEventRewriter } from './responses-tools.js';
 import { optimizePayloadImages, imageOptimizationSettings, shouldOptimizeProviderImages } from './image-optimizer.js';
+import { createChatReasoningTracker, rememberChatReasoning, restoreCachedReasoning } from './reasoning.js';
 
 export function extractUpstreamError(text) {
   let parsed; try { parsed = JSON.parse(text); } catch {}
@@ -129,7 +130,10 @@ export async function route(store, p, model, body, endpoint, res, signal, nasAge
   const chatToResp = publicFamily === 'chat' && native === 'responses';
   const toolPlan = bridge ? chatToolPlan(body) : undefined;
   const nativeToolPlan = goResponsesNative && publicFamily === 'responses' ? responsesToolPlan(body, { dropHosted: true }) : undefined;
-  let payload = { ...(bridge ? toChat(body, toolPlan) : chatToResp ? chatToResponses(body) : nativeToolPlan ? nativeToolPlan.request : body), model };
+  let payload = { ...(bridge ? toChat(body, toolPlan, p.id) : chatToResp ? chatToResponses(body) : nativeToolPlan ? nativeToolPlan.request : body), model };
+  if (native === 'chat') payload = restoreCachedReasoning(payload, p.id);
+  if (go && native === 'chat') payload = normalizeChatToolMessages(payload);
+  const chatReasoningTracker = native === 'chat' && body.stream ? createChatReasoningTracker(p.id) : null;
   const imageSettings = imageOptimizationSettings();
   let imageResult = null;
   if (shouldOptimizeProviderImages(p, imageSettings, go)) {
@@ -163,15 +167,16 @@ export async function route(store, p, model, body, endpoint, res, signal, nasAge
   if (!body.stream) {
     const data = await upstream.json();
     if (data.error) throw new HttpError(502, '上游返回了错误响应', 'upstream_error');
+    if (native === 'chat') rememberChatReasoning(data, p.id);
     metrics.usage = usageMetrics(data.usage);
     metrics.completion = data.status || data.choices?.[0]?.finish_reason || 'completed';
-    if (bridge) return fromChat(data, body.model, toolPlan);
+    if (bridge) return fromChat(data, body.model, toolPlan, p.id);
     if (chatToResp) return responsesToChat(data, body.model);
     if (nativeToolPlan?.transformed) return { ...restoreResponsesResponse(data, nativeToolPlan), model: body.model };
     return { ...data, model: body.model };
   }
   if (!upstream.headers.get('content-type')?.includes('text/event-stream')) { await upstream.body.cancel(); throw new HttpError(502, '上游没有返回 SSE 流，请检查协议配置'); }
-  if (bridge) { await bridgeStream(upstream.body, res, body.model, (response, rawUsage) => { metrics.usage = usageMetrics(rawUsage); metrics.completion = response.status; }, toolPlan); return null; }
+  if (bridge) { await bridgeStream(upstream.body, res, body.model, (response, rawUsage) => { metrics.usage = usageMetrics(rawUsage); metrics.completion = response.status; }, toolPlan, p.id); return null; }
   if (chatToResp) { await responsesStreamToChat(upstream.body, res, body.model); return null; }
   const rewrite = nativeToolPlan?.transformed ? responsesEventRewriter(nativeToolPlan) : null;
   openSSE(res);
@@ -180,6 +185,7 @@ export async function route(store, p, model, body, endpoint, res, signal, nasAge
     if (event.data === '[DONE]') { terminal = true; await writeSSE(res, '[DONE]', event.event); continue; }
     let data; try { data = JSON.parse(event.data); } catch { throw new HttpError(502, '上游 SSE 包含无效 JSON'); }
     if (data.error || data.type === 'error' || data.type === 'response.failed') throw new HttpError(502, '上游流返回错误', 'upstream_error');
+    chatReasoningTracker?.push(data);
     if (data.usage || data.response?.usage) metrics.usage = usageMetrics(data.usage || data.response.usage);
     if (data.choices?.some(c => c.finish_reason)) metrics.completion = data.choices.find(c => c.finish_reason).finish_reason;
     if (['response.completed', 'response.incomplete'].includes(data.type)) metrics.completion = data.type.slice(9);
@@ -189,6 +195,7 @@ export async function route(store, p, model, body, endpoint, res, signal, nasAge
     for (const emitted of rewrite ? rewrite(data) : [data]) await writeSSE(res, emitted, event.event || emitted.type);
   }
   if (!terminal) throw new HttpError(502, '上游流意外结束，未收到完成标记');
+  chatReasoningTracker?.flush();
   if (metrics.completion === 'pending') metrics.completion = 'completed';
   res.end(); return null;
 }

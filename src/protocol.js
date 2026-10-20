@@ -2,6 +2,7 @@
 import crypto from 'node:crypto';
 import { HttpError } from './store.js';
 import { chatToolPlan, restoreChatTool } from './chat-tools.js';
+import { cachedReasoning, createReasoningItem, reasoningTextFromItem, rememberReasoning } from './reasoning.js';
 export const uid = prefix => prefix + crypto.randomBytes(12).toString('hex');
 const unsupported = message => { throw new HttpError(400, message, 'unsupported_parameter'); };
 
@@ -14,7 +15,62 @@ function chatContent(content) {
     unsupported(`Responses 转换暂不支持内容类型 ${p.type}`);
   });
 }
-export function toChat(body, plan = chatToolPlan(body)) {
+
+function chatImagePart(part) {
+  if (part?.type === 'input_image') return { type: 'image_url', image_url: { url: part.image_url, detail: part.detail || 'auto' } };
+  if (part?.type === 'image_url') return { type: 'image_url', image_url: typeof part.image_url === 'string' ? { url: part.image_url, detail: 'auto' } : { url: part.image_url?.url, detail: part.image_url?.detail || 'auto' } };
+  return null;
+}
+
+// OpenCode's gRPC Chat router requires role=tool content to be a string.
+// Preserve textual output verbatim and move multimodal tool images into a
+// clearly labelled follow-up user message so the model can still inspect them.
+function chatToolResult(output, callId) {
+  if (typeof output === 'string') return { content: output, images: [] };
+  if (!Array.isArray(output)) return { content: JSON.stringify(output ?? ''), images: [] };
+  const texts = [], images = [];
+  for (const part of output) {
+    if (typeof part === 'string') { texts.push(part); continue; }
+    if (['input_text', 'output_text', 'text'].includes(part?.type) && typeof part.text === 'string') { texts.push(part.text); continue; }
+    const image = chatImagePart(part);
+    if (image?.image_url?.url) { images.push(image); continue; }
+    texts.push(JSON.stringify(part));
+  }
+  if (images.length) texts.push(`[Tool call ${callId || 'unknown'} returned ${images.length} image(s); attached in the next user message.]`);
+  return { content: texts.join('\n'), images };
+}
+
+function toolImageMessage(items) {
+  const callIds = [...new Set(items.map(item => item.callId || 'unknown'))];
+  return { role: 'user', content: [
+    { type: 'text', text: `Image output from tool call${callIds.length === 1 ? '' : 's'} ${callIds.join(', ')}:` },
+    ...items.map(item => item.image)
+  ] };
+}
+
+export function normalizeChatToolMessages(payload) {
+  if (!Array.isArray(payload?.messages)) return payload;
+  let changed = false;
+  const messages = [], pendingImages = [];
+  const flushImages = () => {
+    if (pendingImages.length) messages.push(toolImageMessage(pendingImages.splice(0)));
+  };
+  for (const message of payload.messages) {
+    if (message?.role !== 'tool') {
+      flushImages();
+      messages.push(message);
+      continue;
+    }
+    if (typeof message.content === 'string') { messages.push(message); continue; }
+    const { content, images } = chatToolResult(message.content, message.tool_call_id);
+    messages.push({ ...message, content });
+    for (const image of images) pendingImages.push({ callId: message.tool_call_id, image });
+    changed = true;
+  }
+  flushImages();
+  return changed ? { ...payload, messages } : payload;
+}
+export function toChat(body, plan = chatToolPlan(body), reasoningScope = '') {
   for (const key of ['previous_response_id', 'conversation', 'background']) if (body[key]) unsupported(`Chat 上游不支持 ${key}，请发送完整历史或选择原生 Responses 上游`);
   if (body.store === true) unsupported('Chat 上游不支持 store=true；请使用无状态请求');
   if (body.truncation && body.truncation !== 'disabled') unsupported('Chat 上游不支持自动 truncation');
@@ -23,24 +79,52 @@ export function toChat(body, plan = chatToolPlan(body)) {
   if (plan.unsupported?.length) messages.push({ role: 'system', content: 'This Chat upstream cannot execute these hosted tools: ' + plan.unsupported.join(', ') + '. Do not claim to have used them. Use available client tools if appropriate, or explain the limitation.' });
   const input = typeof body.input === 'string' ? [{ role: 'user', content: body.input }] : body.input;
   if (!Array.isArray(input)) throw new HttpError(400, 'Responses 请求必须提供 input');
+  let pendingReasoning = '';
+  const pendingToolImages = [];
+  const flushToolImages = () => {
+    if (pendingToolImages.length) messages.push(toolImageMessage(pendingToolImages.splice(0)));
+  };
   for (const item of input) {
+    if (item.type === 'reasoning') {
+      flushToolImages();
+      pendingReasoning += reasoningTextFromItem(item);
+      continue;
+    }
     if (['function_call', 'custom_tool_call', 'tool_search_call'].includes(item.type)) {
+      flushToolImages();
       const call = { id: item.call_id, type: 'function', function: { name: plan.historyName(item), arguments: item.type === 'custom_tool_call' ? JSON.stringify({ input: item.input }) : typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments || {}) } };
       const last = messages.at(-1);
-      if (last?.role === 'assistant' && last.tool_calls) last.tool_calls.push(call);
-      else messages.push({ role: 'assistant', content: null, tool_calls: [call] });
+      let assistant;
+      if (last?.role === 'assistant' && last.tool_calls) {
+        last.tool_calls.push(call);
+        assistant = last;
+      } else {
+        assistant = { role: 'assistant', content: null, tool_calls: [call] };
+        messages.push(assistant);
+      }
+      const reasoning = pendingReasoning || cachedReasoning(reasoningScope, item.call_id);
+      if (reasoning && !assistant.reasoning_content) assistant.reasoning_content = reasoning;
+      pendingReasoning = '';
     } else if (['function_call_output', 'custom_tool_call_output', 'tool_search_output'].includes(item.type)) {
+      pendingReasoning = '';
       if (item.type === 'tool_search_output') { messages.push({ role: 'tool', tool_call_id: item.call_id, content: JSON.stringify({ tools: item.tools || [] }) }); continue; }
       if (typeof item.output !== 'string' && !Array.isArray(item.output)) unsupported('工具结果必须是字符串或内容数组');
-      messages.push({ role: 'tool', tool_call_id: item.call_id, content: typeof item.output === 'string' ? item.output : chatContent(item.output) });
+      const result = chatToolResult(item.output, item.call_id);
+      messages.push({ role: 'tool', tool_call_id: item.call_id, content: result.content });
+      for (const image of result.images) pendingToolImages.push({ callId: item.call_id, image });
     } else if (!item.type || item.type === 'message') {
+      flushToolImages();
       if (!['system', 'developer', 'user', 'assistant'].includes(item.role)) unsupported('无效的消息角色');
       // OpenCode's gRPC Chat router accepts system but rejects developer.
       // Responses developer messages carry the same authority, so normalize
       // them without changing the conversation's instructions.
-      messages.push({ role: item.role === 'developer' ? 'system' : item.role, content: chatContent(item.content) });
-    } else if (item.type !== 'reasoning') unsupported(`Chat 上游不支持输入项 ${item.type}`);
+      const message = { role: item.role === 'developer' ? 'system' : item.role, content: chatContent(item.content) };
+      if (item.role === 'assistant' && pendingReasoning) message.reasoning_content = pendingReasoning;
+      messages.push(message);
+      pendingReasoning = '';
+    } else { flushToolImages(); unsupported(`Chat 上游不支持输入项 ${item.type}`); }
   }
+  flushToolImages();
   const result = { model: body.model, messages, stream: Boolean(body.stream) };
   for (const k of ['temperature', 'top_p', 'parallel_tool_calls', 'user', 'seed']) if (body[k] !== undefined) result[k] = body[k];
   if (body.max_output_tokens !== undefined) result.max_completion_tokens = body.max_output_tokens;
@@ -69,13 +153,18 @@ export function responseBase(model, id = uid('resp_')) {
     model, output: [], error: null, incomplete_details: null, parallel_tool_calls: true,
     tool_choice: 'auto', tools: [], store: false, usage: null };
 }
-export function fromChat(chat, model, plan) {
+export function fromChat(chat, model, plan, reasoningScope = '') {
   const result = responseBase(model), choice = chat.choices?.[0];
   if (!choice?.message) throw new HttpError(502, '上游未返回有效的 Chat Completion');
   const msg = choice.message;
+  const reasoning = typeof msg.reasoning_content === 'string' ? msg.reasoning_content : '';
+  if (reasoning) result.output.push(createReasoningItem(uid('rs_'), reasoning));
   if (msg.content || msg.refusal) result.output.push({ id: uid('msg_'), type: 'message', status: 'completed', role: 'assistant',
     content: msg.refusal ? [{ type: 'refusal', refusal: msg.refusal }] : [{ type: 'output_text', text: msg.content, annotations: [], logprobs: [] }] });
-  for (const tool of msg.tool_calls || []) result.output.push(restoreChatTool({ id: uid('fc_'), type: 'function_call', status: 'completed', call_id: tool.id, name: tool.function.name, arguments: tool.function.arguments }, plan));
+  for (const tool of msg.tool_calls || []) {
+    rememberReasoning(reasoningScope, tool.id, reasoning);
+    result.output.push(restoreChatTool({ id: uid('fc_'), type: 'function_call', status: 'completed', call_id: tool.id, name: tool.function.name, arguments: tool.function.arguments }, plan));
+  }
   result.status = choice.finish_reason === 'length' || choice.finish_reason === 'content_filter' ? 'incomplete' : 'completed';
   if (result.status === 'incomplete') result.incomplete_details = { reason: choice.finish_reason === 'length' ? 'max_output_tokens' : 'content_filter' };
   result.usage = responseUsage(chat.usage);
@@ -191,8 +280,9 @@ export async function writeSSE(res, data, event) {
     res.once('drain', done); res.once('close', close);
   });
 }
-export async function bridgeStream(upstream, res, model, onCompleted, plan) {
+export async function bridgeStream(upstream, res, model, onCompleted, plan, reasoningScope = '') {
   const response = responseBase(model); let sequence = 0, message, messageIndex, refusal = false, finish, upstreamUsage;
+  let reasoningItem, reasoningIndex, reasoningText = '';
   const tools = new Map();
   const emit = (type, fields = {}) => writeSSE(res, { type, sequence_number: sequence++, ...fields }, type);
   openSSE(res);
@@ -207,6 +297,19 @@ export async function bridgeStream(upstream, res, model, onCompleted, plan) {
     const choice = part.choices?.[0]; if (!choice) continue;
     if (choice.finish_reason) { finish = choice.finish_reason; terminal = true; }
     const delta = choice.delta || {};
+    const reasoningDelta = typeof delta.reasoning_content === 'string' ? delta.reasoning_content : '';
+    if (reasoningDelta) {
+      if (!reasoningItem) {
+        reasoningIndex = response.output.length;
+        reasoningItem = createReasoningItem(uid('rs_'), '');
+        response.output.push(reasoningItem);
+        await emit('response.output_item.added', { output_index: reasoningIndex, item: structuredClone(reasoningItem) });
+        await emit('response.reasoning_summary_part.added', { item_id: reasoningItem.id, output_index: reasoningIndex, summary_index: 0, part: { type: 'summary_text', text: '' } });
+      }
+      reasoningText += reasoningDelta;
+      reasoningItem.summary[0].text = reasoningText;
+      await emit('response.reasoning_summary_text.delta', { item_id: reasoningItem.id, output_index: reasoningIndex, summary_index: 0, delta: reasoningDelta });
+    }
     const text = delta.content || delta.refusal;
     if (text) {
       if (!message) {
@@ -236,6 +339,12 @@ export async function bridgeStream(upstream, res, model, onCompleted, plan) {
     }
   }
   if (!terminal) throw new HttpError(502, '上游流意外结束，未收到完成标记');
+  if (reasoningItem) {
+    reasoningItem.status = 'completed';
+    await emit('response.reasoning_summary_text.done', { item_id: reasoningItem.id, output_index: reasoningIndex, summary_index: 0, text: reasoningText });
+    await emit('response.reasoning_summary_part.done', { item_id: reasoningItem.id, output_index: reasoningIndex, summary_index: 0, part: reasoningItem.summary[0] });
+    await emit('response.output_item.done', { output_index: reasoningIndex, item: reasoningItem });
+  }
   if (message) {
     message.status = 'completed';
     await emit(refusal ? 'response.refusal.done' : 'response.output_text.done', { item_id: message.id, output_index: messageIndex, content_index: 0, [refusal ? 'refusal' : 'text']: message.content[0][refusal ? 'refusal' : 'text'], logprobs: [] });
@@ -245,6 +354,7 @@ export async function bridgeStream(upstream, res, model, onCompleted, plan) {
   for (const { item: rawItem, index, buffered } of tools.values()) {
     const item = restoreChatTool(rawItem, plan); response.output[index] = item;
     item.status = 'completed';
+    rememberReasoning(reasoningScope, item.call_id, reasoningText);
     if (buffered) {
       await emit('response.output_item.added', { output_index: index, item: { ...item, status: 'in_progress', ...(item.type === 'custom_tool_call' ? { input: '' } : {}) } });
       if (item.type === 'custom_tool_call') {

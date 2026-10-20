@@ -57,7 +57,7 @@ docker compose up -d --build
 | `GATEWAY_DATA_DIR` | 数据目录，默认工程下 data/ |
 | `GATEWAY_PUBLIC_URL` | 部署访问根地址，用于 Host/Origin 校验 |
 | `GATEWAY_ADMIN_PASSWORD` | 管理密码，用户名 admin |
-| `GATEWAY_API_BODY_LIMIT_MB` | 聊天 JSON 大小上限，默认 64 MiB，范围 1–256 |
+| `GATEWAY_API_BODY_LIMIT_MB` | 聊天 JSON 大小上限，默认 128 MiB，范围 1–256 |
 | `MH_AGENT_MAX_SECONDS` | Codex app-server 进程总时限，默认 7200 |
 | `MH_TOOL_WAIT_SECONDS` | 客户端工具结果等待时间，默认 1800 |
 | `MH_TOOL_PROXY` / `TOOL_DOWNLOAD_PROXY` | 工具下载使用的代理，只在服务端读取 |
@@ -117,6 +117,8 @@ Claude 聊天链路使用官方 Claude Code 的 `--json-schema` / `stream-json` 
 OpenCode Go 的上游是混合形态：Chat 端点不接受 `developer` 角色，Grok 的 Responses 端点拒绝 custom 工具、namespace、`web_search_preview` 系列以及部分搜索参数。模型港在转发前做定向改写，客户端契约保持不变：
 
 - Chat 上游：custom/namespace/tool_search 工具包装成单字符串参数的 function，返回时还原为 `custom_tool_call`；SSE 使用 `custom_tool_call_input` 事件。grammar 只作为说明传递，不声称原生强制。历史中的 `developer` 消息规范化为 `system`，内容与顺序不变。
+- DeepSeek V4 等要求思考模式工具回合回传 `reasoning_content` 的 Chat 模型：模型港把推理内容暴露为 Responses reasoning 摘要项，并按 tool call ID 在进程内短时缓存；下一轮即使客户端只回传 function call 与结果，也会在对应 assistant 消息上补回原 `reasoning_content`，且不会覆盖客户端已有值。
+- OpenCode gRPC Chat 要求 tool message 的 `content` 必须是字符串：文本工具结果直接展平，含图片的工具结果会保留字符串说明，并把图片放入紧随其后的、明确标注来源的 user 多模态消息，避免丢失视觉结果。
 - Grok Responses：custom 工具同样以字符串函数包装并在响应中还原；namespace 展开为带稳定别名的普通函数；移除 `web_search_preview` 系列、`programmatic_tool_calling`、`external_web_access` 与 `search_context_size`，保留 `web_search`、`file_search`、`image_generation` 及已支持的搜索参数，并在 instructions 中说明被移除的工具不可用。工具参数根若为 `anyOf`/`oneOf`，会归一化为对象根 schema。
 - 被移除的声明和参数记录在请求日志的 `droppedHosted` / `droppedArguments` 中，原始客户端请求不被修改。
 
@@ -171,7 +173,7 @@ npm test
 npm run check
 ```
 
-当前 Node 回归测试为 140 项，覆盖管理鉴权、供应商 CRUD、协议转换、流式 SSE、客户端工具往返、长历史注入、模型发现、Codex/Claude 工具桥接、OpenCode Go 授权与额度、Grok 工具改写、加密历史回退、图片压缩、工具下载目录、图片队列和 i18n。测试使用模拟上游和临时数据，不调用真实模型、不消耗真实账号重置次数。
+当前 Node 回归测试为 151 项，覆盖管理鉴权、供应商 CRUD、协议转换、流式 SSE、客户端工具往返、长历史注入、模型发现、Codex/Claude 工具桥接、OpenCode Go 授权与额度、Grok 工具改写、加密历史回退、图片压缩、工具下载目录、图片队列和 i18n。测试使用模拟上游和临时数据，不调用真实模型、不消耗真实账号重置次数。
 
 字体及其许可证见 [public/FONT-LICENSE.txt](public/FONT-LICENSE.txt)。
 

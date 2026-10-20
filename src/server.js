@@ -41,7 +41,7 @@ function clientSessionId(req) {
   }
   return '';
 }
-export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, publicUrl, adminPassword, nasAgent = new NasAgentBridge(), claudeBridge = new ClaudeCodeBridge(), apiBodyLimitMb = 64 } = {}) {
+export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, publicUrl, adminPassword, nasAgent = new NasAgentBridge(), claudeBridge = new ClaudeCodeBridge(), apiBodyLimitMb = 128 } = {}) {
   if (!Number.isInteger(apiBodyLimitMb) || apiBodyLimitMb < 1 || apiBodyLimitMb > 256) throw new Error('GATEWAY_API_BODY_LIMIT_MB 必须是 1–256 的整数');
   const external = publicUrl ? new URL(publicUrl) : null;
   if (external && (!['http:', 'https:'].includes(external.protocol) || external.username || external.password || external.pathname !== '/' || external.search || external.hash)) throw new Error('GATEWAY_PUBLIC_URL 必须是服务根地址');
@@ -244,7 +244,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const port = Number(process.env.PORT || 8317);
   const host = process.env.HOST || '127.0.0.1';
   if (!['127.0.0.1', 'localhost', '::1'].includes(host) && !process.env.GATEWAY_PUBLIC_URL) throw new Error('非本机监听必须配置公开地址及管理密码');
-  const { server } = createGateway({ port, dataDir: process.env.GATEWAY_DATA_DIR || path.join(root, 'data'), publicUrl: process.env.GATEWAY_PUBLIC_URL, adminPassword: process.env.GATEWAY_ADMIN_PASSWORD, apiBodyLimitMb: Number(process.env.GATEWAY_API_BODY_LIMIT_MB || 64) });
+  const { server } = createGateway({ port, dataDir: process.env.GATEWAY_DATA_DIR || path.join(root, 'data'), publicUrl: process.env.GATEWAY_PUBLIC_URL, adminPassword: process.env.GATEWAY_ADMIN_PASSWORD, apiBodyLimitMb: Number(process.env.GATEWAY_API_BODY_LIMIT_MB || 128) });
   server.on('error', e => { console.error(e.code === 'EADDRINUSE' ? `端口 ${port} 已被占用，请设置 PORT 环境变量` : '服务启动失败：' + e.message); process.exit(1); });
   server.listen(port, host, () => console.log(`Model Harbor ready: ${process.env.GATEWAY_PUBLIC_URL || `http://${host}:${port}`}`));
 }
