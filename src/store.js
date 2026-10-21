@@ -46,7 +46,7 @@ export class Store {
     const old = oldId ? this.get(oldId) : null;
     if (!old && this.data.providers.some(p => p.id === id)) throw new HttpError(409, '供应商前缀已存在');
     const type = input.type || 'openai';
-    if (!['openai', 'nas-codex', 'claude-code'].includes(type)) throw new HttpError(400, '未知供应商类型');
+    if (!['openai', 'nas-codex', 'claude-code', 'grok-code'].includes(type)) throw new HttpError(400, '未知供应商类型');
     if (old && old.type !== type) throw new HttpError(400, '已有供应商的类型不可修改');
     const models = input.models ?? old?.models ?? [];
     if (!Array.isArray(models) || models.length > 2000 || models.some(m => typeof m !== 'string' || !m.trim() || m.length > 200 || /[\r\n\x00]/.test(m))) throw new HttpError(400, '模型列表应为有效模型 ID 数组（最多 2000 项）');
@@ -87,10 +87,17 @@ export class Store {
       if (p.execution === 'ssh-docker') p.dockerPath = String(input.dockerPath ?? old?.dockerPath ?? '/usr/local/bin/docker').trim();
       if (p.dockerPath && !/^\/[A-Za-z0-9_./-]+$/.test(p.dockerPath)) throw new HttpError(400, 'Docker 命令须为目标主机上的绝对路径');
       p.protocol = 'chat';
-    } else {
+    } else if (type === 'claude-code') {
       validateRemote();
       p.claudePath = String(input.claudePath ?? old?.claudePath ?? 'claude').trim();
       if (p.claudePath !== 'claude' && !/^\/[A-Za-z0-9_./-]+$/.test(p.claudePath)) throw new HttpError(400, 'Claude Code 路径须为 claude 或目标主机/容器内的绝对路径');
+      p.dockerPath = String(input.dockerPath ?? old?.dockerPath ?? '/usr/local/bin/docker').trim();
+      if (!/^\/[A-Za-z0-9_./-]+$/.test(p.dockerPath)) throw new HttpError(400, 'Docker 命令须为目标主机上的绝对路径');
+      p.protocol = 'chat';
+    } else {
+      validateRemote();
+      p.grokPath = String(input.grokPath ?? old?.grokPath ?? 'grok').trim();
+      if (p.grokPath !== 'grok' && !/^\/[A-Za-z0-9_./-]*\/grok$/.test(p.grokPath)) throw new HttpError(400, 'Grok 路径须为 grok 或目标主机/容器内以 /grok 结尾的绝对路径');
       p.dockerPath = String(input.dockerPath ?? old?.dockerPath ?? '/usr/local/bin/docker').trim();
       if (!/^\/[A-Za-z0-9_./-]+$/.test(p.dockerPath)) throw new HttpError(400, 'Docker 命令须为目标主机上的绝对路径');
       p.protocol = 'chat';
@@ -109,7 +116,7 @@ export class Store {
     return this.data.providers.filter(p => p.enabled).flatMap(p => p.models.map(model => ({
       id: `${p.id}/${model}`, object: 'model', created: 0, owned_by: p.id,
       name: model, provider_name: p.name, source: p.type,
-      capabilities: { tools: true, custom_tools: p.type === 'nas-codex' || p.type === 'claude-code' || p.protocol !== 'chat', text: true, cli_bridge: p.type === 'nas-codex' || p.type === 'claude-code' }
+      capabilities: { tools: true, custom_tools: p.type === 'nas-codex' || p.type === 'claude-code' || p.type === 'grok-code' || p.protocol !== 'chat', text: true, cli_bridge: p.type === 'nas-codex' || p.type === 'claude-code' || p.type === 'grok-code' }
     })));
   }
   resolve(model) {

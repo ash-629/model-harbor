@@ -1,4 +1,5 @@
 import { createImageUI } from './image-ui.js';
+import { createVideoUI } from './video-ui.js';
 import { t, getLanguage, setLanguage, captureStaticText, translateError } from './i18n.js';
 // P-01/P-02: provider CRUD, model directory, connection instructions, real request test.
 const $ = id => document.getElementById(id);
@@ -9,6 +10,7 @@ const translateStatic = captureStaticText();
 const errorsById = new Map();
 let testResult = null, connectionProtocol = 'anthropic';
 const imageUI = createImageUI({api, toast});
+const videoUI = createVideoUI({api, toast});
 const usageById = new Map();
 const resetKeys = new Map();
 let resetProvider = null, resetBusy = false;
@@ -104,23 +106,24 @@ function openCodeGoUsageMarkup(p) {
 function usageMarkup(p) {
   if (openCodeGoProvider(p)) return openCodeGoUsageMarkup(p);
   if (balanceProvider(p)) return balanceMarkup(p);
-  if (p.type !== 'nas-codex' && p.type !== 'claude-code') return '';
-  const usage = usageById.get(p.id), data = usage?.data, claude = p.type === 'claude-code';
+  if (p.type !== 'nas-codex' && p.type !== 'claude-code' && p.type !== 'grok-code') return '';
+  const usage = usageById.get(p.id), data = usage?.data, claude = p.type === 'claude-code', grok = p.type === 'grok-code';
   let body = '';
   if (data) {
-    const buckets = data.buckets?.length ? data.buckets : [{id: claude ? 'claude' : 'codex', windows:[]}];
+    const buckets = data.buckets?.length ? data.buckets : [{id: claude ? 'claude' : grok ? 'grok' : 'codex', windows:[]}];
     body = buckets.map(bucket => {
       const windows = [...(bucket.windows || [])];
-      for (const durationMins of [300, 10080]) if (!windows.some(w => w.durationMins === durationMins)) windows.push({durationMins, usedPercent:null});
+      for (const durationMins of grok ? [10080] : [300, 10080]) if (!windows.some(w => w.durationMins === durationMins)) windows.push({durationMins, usedPercent:null});
       windows.sort((a,b) => (a.durationMins || Infinity) - (b.durationMins || Infinity));
       return `<div class="quota-bucket">${buckets.length > 1 || bucket.planType ? `<div class="quota-detail">${h(bucket.name || (bucket.id === 'codex' ? t('默认额度') : bucket.id))}${bucket.planType ? ' · ' + h(bucket.planType) : ''}</div>` : ''}${windows.map(usageWindow).join('')}</div>`;
     }).join('');
     if (claude) body += `<div class="quota-detail">${h(t('更新于 {time}', {time:new Date(data.checkedAt).toLocaleTimeString(getLanguage())}))}</div><div class="quota-detail">${t('Claude 用量按账号共享；数据最多缓存 30 秒。')}</div>`;
+    else if (grok) body += `<div class="quota-detail">${h(t('更新于 {time}', {time:new Date(data.checkedAt).toLocaleTimeString(getLanguage())}))}</div><div class="quota-detail">${t('Grok 用量按订阅账号共享；数据最多缓存 30 秒。')}</div>`;
     else body += `<div class="quota-row quota-resets"><strong>${t('剩余重置次数')}</strong><span>${data.resetCredits === null ? t('暂不可用') : h(t('{count} 次', {count:data.resetCredits}))}</span></div><div class="quota-detail">${h(t('更新于 {time}', {time:new Date(data.checkedAt).toLocaleTimeString(getLanguage())}))}</div><div class="quota-detail">${t('同一账号额度共享；数据最多缓存 30 秒。')}</div>`;
   }
-  if (!claude) body += `<button class="button secondary quota-reset-button" data-reset-usage="${h(p.id)}" ${busy || usage?.loading || (!(data?.resetCredits > 0) && !pendingResetKey(p.id)) ? 'disabled' : ''}>${pendingResetKey(p.id) ? t('重试同一次重置') : t('重置额度')}</button>`;
+  if (!claude && !grok) body += `<button class="button secondary quota-reset-button" data-reset-usage="${h(p.id)}" ${busy || usage?.loading || (!(data?.resetCredits > 0) && !pendingResetKey(p.id)) ? 'disabled' : ''}>${pendingResetKey(p.id) ? t('重试同一次重置') : t('重置额度')}</button>`;
   if (usage?.error) body = `<div class="notice error" role="alert">${h(translateError(usage.error))}</div>` + body;
-  return `<section class="provider-quota"><div class="quota-row"><strong>${t(claude ? 'Claude 账号用量' : 'Codex 账号用量')}</strong><button class="button ghost quota-refresh" data-usage="${h(p.id)}" ${usage?.loading ? 'disabled' : ''}>${usage?.loading ? t('查询中…') : data ? t('刷新用量') : t('查看用量')}</button></div>${body || `<div class="quota-detail">${usage?.loading ? t('正在读取账号额度…') : t(claude ? '查看 Claude 的 5 小时与每周用量。' : '查看用量、重置时间与可用重置次数。')}</div>`}</section>`;
+  return `<section class="provider-quota"><div class="quota-row"><strong>${t(claude ? 'Claude 账号用量' : grok ? 'Grok 账号用量' : 'Codex 账号用量')}</strong><button class="button ghost quota-refresh" data-usage="${h(p.id)}" ${usage?.loading ? 'disabled' : ''}>${usage?.loading ? t('查询中…') : data ? t('刷新用量') : t('查看用量')}</button></div>${body || `<div class="quota-detail">${usage?.loading ? t('正在读取账号额度…') : t(claude ? '查看 Claude 的 5 小时与每周用量。' : grok ? '查看 Grok 的每周用量。' : '查看用量、重置时间与可用重置次数。')}</div>`}</section>`;
 }
 async function loadUsage(id, force = false) {
   const previous = usageById.get(id);
@@ -229,7 +232,7 @@ function renderModels() {
   $('models-empty').querySelector('h3').textContent = state.models.length ? t('没有匹配的模型') : t('把第一个模型接进来');
   $('models-empty').querySelector('p').textContent = state.models.length ? t('试试其他关键词或切换供应商筛选。') : t('添加供应商并刷新模型，或手动填写模型 ID。');
   $('empty-add').hidden = Boolean(state.models.length);
-  $('models-body').innerHTML = models.map(m => `<tr><td><span class="model-name" title="${h(m.name)}">${h(m.name)}</span><code class="model-id">${h(m.id)}</code></td><td><span class="source-badge">${h(m.provider_name)}</span></td><td><span class="source-badge ${m.source === 'nas-codex' || m.source === 'claude-code' ? 'bridge-badge' : ''}">${m.source === 'nas-codex' ? t('Codex 工具桥接') : m.source === 'claude-code' ? t('Claude 工具桥接') : 'API'}</span></td><td><button class="button ghost" data-test="${h(m.id)}">${t('测试 ↗')}</button></td></tr>`).join('');
+  $('models-body').innerHTML = models.map(m => `<tr><td><span class="model-name" title="${h(m.name)}">${h(m.name)}</span><code class="model-id">${h(m.id)}</code></td><td><span class="source-badge">${h(m.provider_name)}</span></td><td><span class="source-badge ${m.source === 'nas-codex' || m.source === 'claude-code' || m.source === 'grok-code' ? 'bridge-badge' : ''}">${m.source === 'nas-codex' ? t('Codex 工具桥接') : m.source === 'claude-code' ? t('Claude 工具桥接') : m.source === 'grok-code' ? t('Grok 工具桥接') : 'API'}</span></td><td><button class="button ghost" data-test="${h(m.id)}">${t('测试 ↗')}</button></td></tr>`).join('');
   $('model-footer').textContent = t('共 {count} 个模型 · 仅显示已启用供应商的配置模型', {count: models.length});
   $('refresh-all').disabled = busy || !state.providers.some(p => p.enabled);
 }
@@ -248,9 +251,9 @@ function renderLogs() {
 }
 function capability() {
   const model = state.models.find(m => m.id === $('test-model').value);
-  $('test-capability').textContent = model?.source === 'nas-codex' ? t('远程 Codex 支持客户端工具调用；由客户端执行工具，远端负责推理。') : model?.source === 'claude-code' ? t('Claude Code 支持客户端 function/custom 工具；由客户端执行操作，容器负责推理。') : '';
+  $('test-capability').textContent = model?.source === 'nas-codex' ? t('远程 Codex 支持客户端工具调用；由客户端执行工具，远端负责推理。') : model?.source === 'claude-code' ? t('Claude Code 支持客户端 function/custom 工具；由客户端执行操作，容器负责推理。') : model?.source === 'grok-code' ? t('Grok 支持客户端 function/custom 工具；由客户端执行操作，容器负责推理。') : '';
 }
-const views = new Set(['overview', 'providers', 'images', 'logs', 'tools', 'settings']);
+const views = new Set(['overview', 'providers', 'images', 'videos', 'logs', 'tools', 'settings']);
 function viewFromLocation() {
   const name = location.hash.replace(/^#\/?/, '');
   return views.has(name) ? name : 'overview';
@@ -258,12 +261,13 @@ function viewFromLocation() {
 function view(name, { updateUrl = true } = {}) {
   if (!views.has(name)) name = 'overview';
   currentView = name;
-  document.querySelector('.stats').hidden = ['images', 'tools', 'settings'].includes(name);
-  $('add-btn').hidden = ['images', 'tools', 'settings'].includes(name);
+  document.querySelector('.stats').hidden = ['images', 'videos', 'tools', 'settings'].includes(name);
+  $('add-btn').hidden = ['images', 'videos', 'tools', 'settings'].includes(name);
   imageUI.setVisible(name === 'images');
+  videoUI.setVisible(name === 'videos');
   document.querySelectorAll('.view').forEach(el => el.hidden = el.id !== name + '-view');
   document.querySelectorAll('.nav').forEach(el => el.classList.toggle('active', el.dataset.view === name));
-  const names = { tools: [t('工具下载'), t('常用工具，一处获取。'), t('检查更新并通过 OpenWrt 代理缓存安装包。')], settings: [t('设置'), t('管理你的模型港。'), t('配置管理页面的登录方式。')], images: [t('生成图像'), t('描述你的想象。'), t('从一句话开始，把想法变成可以保存的图像。')], overview: [t('模型总览'), t('所有模型，一个入口。'), t('连接不同来源，在同一份模型列表里自由选择。')], providers: [t('供应商'), t('连接你的模型来源。'), t('统一管理 API 服务与远程 Codex。')], logs: [t('请求记录'), t('每一次调用，都有迹可循。'), t('检查路由结果、响应状态与请求耗时。')] };
+  const names = { videos: [t('生成视频'), t('让描述动起来。'), t('用 Grok 订阅生成短片，可带最多 3 张参考图。')], tools: [t('工具下载'), t('常用工具，一处获取。'), t('检查更新并通过 OpenWrt 代理缓存安装包。')], settings: [t('设置'), t('管理你的模型港。'), t('配置管理页面的登录方式。')], images: [t('生成图像'), t('描述你的想象。'), t('从一句话开始，把想法变成可以保存的图像。')], overview: [t('模型总览'), t('所有模型，一个入口。'), t('连接不同来源，在同一份模型列表里自由选择。')], providers: [t('供应商'), t('连接你的模型来源。'), t('统一管理 API 服务与远程 Codex。')], logs: [t('请求记录'), t('每一次调用，都有迹可循。'), t('检查路由结果、响应状态与请求耗时。')] };
   [$('page-name').textContent, $('heading').textContent, $('subtitle').textContent] = names[name];
   if (name === 'settings') loadSettings();
   if (name === 'tools') loadTools(); else stopToolPoll();
@@ -304,7 +308,8 @@ $('settings-relogin').addEventListener('click', () => location.reload());
 function typeFields() {
   const type = $('p-type').value;
   const claude = type === 'claude-code';
-  const remote = type === 'nas-codex' || claude;
+  const grok = type === 'grok-code';
+  const remote = type === 'nas-codex' || claude || grok;
   $('remote-codex-fields').hidden = !remote; $('http-fields').hidden = remote;
   $('p-url').required = !remote;
   ['p-host', 'p-user', 'p-ssh-key'].forEach(id => $(id).required = remote);
@@ -313,14 +318,18 @@ function typeFields() {
   $('p-docker-label').hidden = !docker; $('p-docker-path').required = remote && docker;
   $('p-codex-label').hidden = !remote;
   if (!remote) return;
-  $('p-remote-notice').textContent = t(claude
+  $('p-remote-notice').textContent = t(grok
+    ? '通过 SSH 调用 Grok 官方 CLI，支持客户端 function/custom 工具；由客户端执行操作，容器负责推理。目标环境需安装并登录 Grok CLI，并部署工具执行器。'
+    : claude
     ? '通过 SSH 调用 Claude Code，支持客户端工具和图片。目标环境需安装并登录 Claude Code，并部署工具执行器；工具由客户端执行。'
     : '通过 SSH 调用主机或容器里的官方 Codex CLI。支持文本、图片与客户端 function/custom 工具；由客户端执行命令和文件修改。目标环境需已安装并登录 Codex。');
-  $('p-cli-label-text').textContent = t(claude ? 'Claude Code 可执行文件路径' : 'Codex 可执行文件路径');
-  $('p-cli-help').textContent = t(claude
+  $('p-cli-label-text').textContent = t(grok ? 'Grok 可执行文件路径' : claude ? 'Claude Code 可执行文件路径' : 'Codex 可执行文件路径');
+  $('p-cli-help').textContent = t(grok
+    ? '填写目标主机或容器内的路径；默认 grok。需要 Linux、timeout、python3 和工具执行器；图片输入暂不支持。'
+    : claude
     ? '填写目标主机或容器内的路径；仅当 PATH 包含 claude 时使用 claude。需要 Linux、timeout、python3 和工具执行器。'
     : '填写 Codex 命令或目标主机/容器内的绝对路径，默认 codex。使用官方 Codex CLI；无需安装 Python 执行器。');
-  $('p-codex').placeholder = claude ? '/home/dev/.local/bin/claude' : '/home/ubuntu/.local/bin/codex';
+  $('p-codex').placeholder = grok ? '/home/dev/.local/bin/grok' : claude ? '/home/dev/.local/bin/claude' : '/home/ubuntu/.local/bin/codex';
 }
 
 function openEditor(id) {
@@ -358,10 +367,18 @@ $('preset').addEventListener('change', () => {
   $('p-type').value = preset === 'remote-codex' ? 'nas-codex' : preset === 'claude-code' ? 'claude-code' : 'openai';
   if (preset === 'opencode-go') { syncOpenCodeGoPreset(); typeFields(); return; }
   syncOpenCodeGoPreset();
-  const config = { custom: ['', '', '', 'chat'], deepseek: ['DeepSeek', 'deepseek', 'https://api.deepseek.com/v1', 'chat'], openai: ['OpenAI', 'openai', 'https://api.openai.com/v1', 'both'], 'remote-codex': [t('远程 Codex'), 'codex', '', 'chat'], 'claude-code': [t('Claude Code'), 'claude', '', 'chat'] }[preset];
+  const config = { custom: ['', '', '', 'chat'], deepseek: ['DeepSeek', 'deepseek', 'https://api.deepseek.com/v1', 'chat'], openai: ['OpenAI', 'openai', 'https://api.openai.com/v1', 'both'], 'remote-codex': [t('远程 Codex'), 'codex', '', 'chat'], 'claude-code': [t('Claude Code'), 'claude', '', 'chat'], 'grok-code': [t('Grok'), 'grok', '', 'chat'] }[preset];
   [$('p-name').value, $('p-id').value, $('p-url').value, $('p-protocol').value] = config;
   $('p-key').value = ''; $('p-models').value = '';
-  if (preset === 'claude-code') {
+  if (preset === 'grok-code') {
+    $('p-execution').value = 'ssh-docker';
+    $('p-container').value = 'claude-linux';
+    $('p-codex').value = 'grok';
+    $('p-ssh-key').value = '/home/node/.ssh/id_ed25519';
+    $('p-ssh-port').value = '22';
+    $('p-docker-path').value = '/usr/local/bin/docker';
+    $('p-models').value = 'grok-4.7\ngrok-4.7-build-fast\ngrok-4.6\ngrok-4.5';
+  } else if (preset === 'claude-code') {
     $('p-execution').value = 'ssh-docker';
     $('p-container').value = 'claude-linux';
     $('p-codex').value = 'claude';
@@ -560,6 +577,7 @@ function renderTestOutput() {
 function applyLanguage() {
   translateStatic();
   imageUI.render();
+  videoUI.render();
   document.title = t('Model Harbor · 模型港');
   const en = getLanguage() === 'en';
   $('language-toggle').textContent = en ? '中文' : 'EN';

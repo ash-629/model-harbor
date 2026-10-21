@@ -57,6 +57,32 @@ claude_usage = claude_prefix + ['python3', '/workspace/model-harbor/claude-usage
 if args == claude_usage:
     allowed = True
 
+grok_prefix = ['sudo', '-n', '/usr/local/bin/docker', 'exec', '-i', 'claude-linux']
+if (len(args) == len(grok_prefix) + 2 and args[:len(grok_prefix)] == grok_prefix
+        and re.fullmatch(r'(?:grok|/[A-Za-z0-9_./-]*/grok)', args[-2]) and args[-1] == 'models'):
+    allowed = True
+grok_runner = grok_prefix + ['timeout', '--signal=TERM', '--kill-after=5s', '610s',
+                             'python3', '/workspace/model-harbor/grok-tool-runner.py', '--cli']
+if (len(args) == len(grok_runner) + 1 and args[:len(grok_runner)] == grok_runner
+        and re.fullmatch(r'(?:grok|/[A-Za-z0-9_./-]*/grok)', args[-1])):
+    allowed = True
+grok_usage = grok_prefix + ['python3', '/workspace/model-harbor/grok-usage.py']
+if args == grok_usage:
+    allowed = True
+grok_image_runner = grok_prefix + ['python3', '/workspace/model-harbor/grok-image-runner.py']
+if args == grok_image_runner + ['check']:
+    allowed = True
+if (len(args) == len(grok_image_runner) + 2 and args[:len(grok_image_runner)] == grok_image_runner
+        and args[-2] == 'generate'
+        and re.fullmatch(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', args[-1])):
+    allowed = True
+grok_video_runner = grok_prefix + ['python3', '/workspace/model-harbor/grok-video-runner.py']
+if args == grok_video_runner + ['check']:
+    allowed = True
+if (len(args) == len(grok_video_runner) + 2 and args[:len(grok_video_runner)] == grok_video_runner
+        and args[-2] == 'generate'
+        and re.fullmatch(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', args[-1])):
+    allowed = True
 if not allowed:
     sys.stderr.write('Model Harbor SSH command denied\n')
     sys.exit(126)

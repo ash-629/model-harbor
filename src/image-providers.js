@@ -24,7 +24,7 @@ export class ImageProviders {
     const old = oldId ? this.get(oldId) : null;
     if (!old && this.store.data.imageProviders.some(p => p.id === id)) throw new HttpError(409, 'Image provider ID already exists');
     const type = input.type || 'openai';
-    if (!['openai', 'minimax', 'codex'].includes(type)) fail('Unknown image provider type');
+    if (!['openai', 'minimax', 'codex', 'grok'].includes(type)) fail('Unknown image provider type');
     if (old && old.type !== type) fail('Existing image provider type cannot be changed');
     if (input.supportsImageInput !== undefined && typeof input.supportsImageInput !== 'boolean') fail('Invalid image input capability');
     const p = { supportsImageInput: input.supportsImageInput ?? old?.supportsImageInput ?? false, id, name: text(input.name, 80), type, enabled: input.enabled !== false,
@@ -32,7 +32,7 @@ export class ImageProviders {
     if (!p.name) fail('Enter an image provider name');
     if (!Number.isInteger(p.timeout) || p.timeout < 30 || p.timeout > 1800) fail('Image timeout must be 30–1800 seconds');
     if (p.model && !/^[A-Za-z0-9][A-Za-z0-9_.:/-]*$/.test(p.model)) fail('Invalid image model ID');
-    if (type !== 'codex') {
+    if (!['codex', 'grok'].includes(type)) {
       if (!p.model) fail('Enter an image model ID');
       let url; try { url = new URL(input.baseUrl); } catch { fail('Enter a valid image API base URL'); }
       if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) fail('Image API URL must use HTTP/HTTPS without credentials or query parameters');
@@ -40,13 +40,19 @@ export class ImageProviders {
       if (/\/(images\/generations|image_generation)$/.test(p.baseUrl)) fail('Enter the base URL without the image endpoint path');
       p.apiKey = input.clearApiKey ? '' : input.apiKey ? this.store.seal(text(input.apiKey, 4096)) : old?.apiKey || '';
     } else {
+      const grok = type === 'grok';
       p.execution = input.execution || 'local';
-      if (!['local', 'ssh', 'ssh-docker'].includes(p.execution)) fail('Invalid Codex execution mode');
+      if (!['local', 'ssh', 'ssh-docker'].includes(p.execution)) fail('Invalid CLI execution mode');
       p.pythonPath = text(input.pythonPath || (process.platform === 'win32' && p.execution === 'local' ? 'python' : 'python3'));
-      p.codexPath = text(input.codexPath || 'codex');
-      p.sandbox = input.sandbox || 'workspace-write';
-      if (!['workspace-write', 'danger-full-access'].includes(p.sandbox)) fail('Invalid Codex sandbox setting');
-      if (p.sandbox === 'danger-full-access' && p.execution !== 'ssh-docker') fail('Container isolation mode requires SSH + Docker execution');
+      if (grok) {
+        p.grokPath = text(input.grokPath || 'grok');
+        if (p.grokPath !== 'grok' && !/^\/[A-Za-z0-9_./-]*\/grok$/.test(p.grokPath)) fail('Grok path must be grok or an absolute path ending in /grok');
+      } else {
+        p.codexPath = text(input.codexPath || 'codex');
+        p.sandbox = input.sandbox || 'workspace-write';
+        if (!['workspace-write', 'danger-full-access'].includes(p.sandbox)) fail('Invalid Codex sandbox setting');
+        if (p.sandbox === 'danger-full-access' && p.execution !== 'ssh-docker') fail('Container isolation mode requires SSH + Docker execution');
+      }
       if (p.execution !== 'local') {
         p.runnerPath = text(input.runnerPath);
         if (!p.runnerPath.startsWith('/')) fail('Remote runner path must be absolute');

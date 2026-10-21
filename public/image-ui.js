@@ -2,7 +2,7 @@
 import { t, getLanguage, translateError } from './i18n.js';
 const $ = id => document.getElementById(id);
 const h = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
-const typeName = p => p.type === 'codex' ? 'Codex' : p.type === 'minimax' ? 'MiniMax API' : 'Images API';
+const typeName = p => p.type === 'codex' ? 'Codex' : p.type === 'grok' ? 'Grok' : p.type === 'minimax' ? 'MiniMax API' : 'Images API';
 const providerDisplayName = name => String(name || '').replace(/\bNAS\b/gi, t('远程主机'));
 const active = job => ['queued', 'running'].includes(job.status);
 
@@ -60,24 +60,41 @@ export function createImageUI({ api, toast }) {
     editorFields();
   }
   function editorFields() {
-    const codex = $('ip-type').value === 'codex', ssh = codex && $('ip-execution').value !== 'local', docker = ssh && $('ip-execution').value === 'ssh-docker';
-    $('ip-api-fields').hidden = codex; $('ip-codex-fields').hidden = !codex; $('ip-ssh-fields').hidden = !ssh; $('ip-docker-fields').hidden = !docker;
-    $('ip-sandbox').querySelector('option[value="danger-full-access"]').disabled = !docker;
-    if (!docker) $('ip-sandbox').value = 'workspace-write';
-    $('ip-api-fields').querySelectorAll('input').forEach(el => el.disabled = codex);
-    $('ip-codex-fields').querySelectorAll('input,select').forEach(el => el.disabled = !codex);
+    const type = $('ip-type').value, codex = type === 'codex', grok = type === 'grok', cli = codex || grok;
+    const ssh = cli && $('ip-execution').value !== 'local', docker = ssh && $('ip-execution').value === 'ssh-docker';
+    $('ip-api-fields').hidden = cli; $('ip-codex-fields').hidden = !cli; $('ip-ssh-fields').hidden = !ssh; $('ip-docker-fields').hidden = !docker;
+    $('ip-sandbox-label').hidden = !codex;
+    $('ip-sandbox').querySelector('option[value="danger-full-access"]').disabled = !codex || !docker;
+    if (!docker || !codex) $('ip-sandbox').value = 'workspace-write';
+    $('ip-api-fields').querySelectorAll('input').forEach(el => el.disabled = cli);
+    $('ip-codex-fields').querySelectorAll('input,select').forEach(el => el.disabled = !cli);
     $('ip-ssh-fields').querySelectorAll('input').forEach(el => el.disabled = !ssh);
     $('ip-docker-fields').querySelectorAll('input').forEach(el => el.disabled = !docker);
-    $('ip-model').placeholder = t(codex ? '可留空，例如：gpt-6.1-sol' : '例如：gpt-image-2');
-    $('ip-url').required = !codex; $('ip-model').required = !codex;
+    $('ip-model').placeholder = t(cli ? '可留空，例如：grok-4.7' : '例如：gpt-image-2');
+    $('ip-url').required = !cli; $('ip-model').required = !cli;
     for (const id of ['ip-host', 'ip-user', 'ip-ssh-key', 'ip-runner']) $(id).required = ssh;
     for (const id of ['ip-container', 'ip-docker']) $(id).required = docker;
-    $('ip-model-help').textContent = t(codex ? '可留空，使用 Codex 默认模型；不是图像模型 ID。' : '填写该服务商支持的生图模型。');
+    $('ip-model-help').textContent = t(cli ? '可留空，使用 CLI 默认模型；不是图像模型 ID。' : '填写该服务商支持的生图模型。');
+    $('ip-cli-label-text').textContent = t(grok ? 'Grok 命令或路径' : 'Codex 命令或路径');
+    $('ip-cli-help').textContent = t(grok ? '填写目标环境中的 Grok 命令或绝对路径。' : '填写目标环境中的 Codex 命令或绝对路径。');
+    $('ip-cli-notice').textContent = t(grok
+      ? '本机是模型港服务所在机器；Grok 订阅出图需要已登录官方 Grok CLI。其他机器还需放置 Grok 执行器。'
+      : '本机是模型港服务所在机器；需要已安装并登录 Codex。其他机器还需放置 Codex 执行器。');
+    $('ip-codex').placeholder = grok ? '/home/dev/.local/bin/grok' : 'codex';
   }
   function preset() {
     const kind = $('ip-type').value;
     $('ip-url').value = kind === 'minimax' ? 'https://api.minimax.cn/v1' : 'https://api.openai.com/v1';
-    $('ip-model').value = kind === 'codex' ? '' : kind === 'minimax' ? 'image-01' : 'gpt-image-2';
+    $('ip-model').value = kind === 'codex' ? '' : kind === 'grok' ? 'grok-4.7' : kind === 'minimax' ? 'image-01' : 'gpt-image-2';
+    if (kind === 'grok') {
+      $('ip-codex').value = 'grok';
+      $('ip-execution').value = 'ssh-docker';
+      $('ip-container').value = 'claude-linux';
+      $('ip-runner').value = '/workspace/model-harbor/grok-image-runner.py';
+      $('ip-ssh-key').value = '/home/node/.ssh/id_ed25519';
+    } else if (kind === 'codex') {
+      $('ip-codex').value = 'codex';
+    }
     editorFields();
   }
   function openEditor(id) {
@@ -87,6 +104,7 @@ export function createImageUI({ api, toast }) {
     if (p) {
       const fields = { 'ip-name': 'name', 'ip-type': 'type', 'ip-url': 'baseUrl', 'ip-model': 'model', 'ip-timeout': 'timeout', 'ip-execution': 'execution', 'ip-host': 'sshHost', 'ip-user': 'sshUser', 'ip-port': 'sshPort', 'ip-ssh-key': 'sshKeyPath', 'ip-runner': 'runnerPath', 'ip-container': 'container', 'ip-docker': 'dockerPath', 'ip-python': 'pythonPath', 'ip-codex': 'codexPath', 'ip-sandbox': 'sandbox' };
       for (const [id, field] of Object.entries(fields)) if (p[field] !== undefined) $(id).value = p[field];
+      if (p.type === 'grok' && p.grokPath) $('ip-codex').value = p.grokPath;
       $('ip-enabled').checked = p.enabled; $('ip-image-input').checked = Boolean(p.supportsImageInput);
     } else preset();
     $('ip-clear-key-label').hidden = !p?.hasApiKey;
@@ -98,7 +116,7 @@ export function createImageUI({ api, toast }) {
     const value = id => $(id).value.trim();
     const input = { name: value('ip-name'), type: value('ip-type'), baseUrl: value('ip-url'), model: value('ip-model'), apiKey: value('ip-key'), clearApiKey: $('ip-clear-key').checked, enabled: $('ip-enabled').checked, supportsImageInput: $('ip-image-input').checked,
       timeout: Number(value('ip-timeout')), execution: value('ip-execution'), sshHost: value('ip-host'), sshUser: value('ip-user'), sshPort: Number(value('ip-port')), sshKeyPath: value('ip-ssh-key'), runnerPath: value('ip-runner'),
-      container: value('ip-container'), dockerPath: value('ip-docker'), pythonPath: value('ip-python'), codexPath: value('ip-codex'), sandbox: value('ip-sandbox') };
+      container: value('ip-container'), dockerPath: value('ip-docker'), pythonPath: value('ip-python'), codexPath: value('ip-codex'), grokPath: value('ip-codex'), sandbox: value('ip-sandbox') };
     try {
       const p = await api('/image/providers' + (editing ? '/' + editing : ''), { method: editing ? 'PUT' : 'POST', body: JSON.stringify(input) });
       $('image-provider-dialog').close(); await load(true); $('image-provider').value = p.id; providerNote(); toast(t('生图配置已保存'));
@@ -146,10 +164,10 @@ export function createImageUI({ api, toast }) {
       providerNote(); $('image-prompt').focus(); $('image-form').scrollIntoView({ block: 'start', behavior: 'smooth' });
     }
     if (button.dataset.imageCheck) {
-      const id = button.dataset.imageCheck; if (checks.has(id)) return; checks.add(id); render();
+      const id = button.dataset.imageCheck; const p = providers.find(value => value.id === id); if (!p || checks.has(id)) return; checks.add(id); render();
       try {
         const result = await api('/image/providers/' + id + '/check', { method: 'POST' });
-        toast(t(result.verified === false ? 'API 配置已保存，实际可用性将在生成时验证。' : result.ok ? 'Codex 已就绪并已登录' : 'Codex 尚未登录，请先在目标环境登录'));
+        toast(t(result.verified === false ? 'API 配置已保存，实际可用性将在生成时验证。' : result.ok ? (p.type === 'grok' ? 'Grok 已就绪并已登录' : 'Codex 已就绪并已登录') : (p.type === 'grok' ? 'Grok 尚未登录，请先在目标环境登录' : 'Codex 尚未登录，请先在目标环境登录')));
       } catch (e) { error('image-error', e.message); }
       finally { checks.delete(id); render(); }
     }

@@ -8,6 +8,7 @@ import { lookup } from 'node:dns/promises';
 import { HttpError } from './store.js';
 
 export const runnerFile = fileURLToPath(new URL('./codex-image-runner.py', import.meta.url));
+export const grokRunnerFile = fileURLToPath(new URL('./grok-image-runner.py', import.meta.url));
 export const sizes = { '1:1': '1024x1024', '3:2': '1536x1024', '2:3': '1024x1536', '16:9': '1536x864', '9:16': '864x1536' };
 const MAX = 20 * 1024 * 1024;
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -127,11 +128,36 @@ export async function codexRun(p, operation, job, workRoot, signal) {
   });
 }
 
+export function grokCommand(p, operation, id) {
+  const tail = [p.pythonPath, p.execution === 'local' ? grokRunnerFile : p.runnerPath, operation, ...(id ? [id] : [])];
+  if (p.execution === 'local') return { command: tail[0], args: tail.slice(1) };
+  const remote = p.execution === 'ssh-docker' ? ['sudo', '-n', p.dockerPath, 'exec', '-i', p.container, ...tail] : tail;
+  return { command: 'ssh', args: ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=8', '-o', 'ServerAliveInterval=15', '-p', String(p.sshPort), '-i', p.sshKeyPath, `${p.sshUser}@${p.sshHost}`, remote.map(quote).join(' ')] };
+}
+export async function grokRun(p, operation, job, signal) {
+  const { command, args } = grokCommand(p, operation, job?.id);
+  const body = JSON.stringify({ prompt: job?.prompt, references: job?.references || [], aspect: job?.aspect, timeout: p.timeout, model: p.model, grokPath: p.grokPath });
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { windowsHide: true, signal });
+    const chunks = []; let size = 0, exceeded = false;
+    child.stdin.on('error', () => {}); child.stderr.on('data', () => {});
+    child.stdout.on('data', bytes => { size += bytes.length; if (size > 32 * 1024 * 1024) { exceeded = true; child.kill(); } else chunks.push(bytes); });
+    child.on('error', () => reject(problem('Cannot start the Grok image runner. Check SSH, Python and executable paths.')));
+    child.on('close', () => {
+      if (exceeded) return reject(problem('Grok image runner output exceeds the size limit'));
+      let data; try { data = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return reject(problem('Grok image runner failed. Check SSH permissions, runner path and Grok login.')); }
+      if (data.error) return reject(problem(String(data.error).slice(0, 600)));
+      resolve(data);
+    });
+    child.stdin.end(body);
+  });
+}
+
 export class ImageJobs {
   constructor(store, providers, dir, { execute } = {}) {
     this.store = store; this.providers = providers; this.dir = path.join(dir, 'images');
     this.workRoot = path.join(dir, 'codex-work'); this.jobs = new Map(); this.queue = []; this.active = false; this.controllers = new Set();
-    this.execute = execute || (async (p, job, signal) => p.type === 'codex' ? fromBase64((await codexRun(p, 'generate', job, this.workRoot, signal)).image) : apiImage(store, p, job, signal));
+    this.execute = execute || (async (p, job, signal) => p.type === 'codex' ? fromBase64((await codexRun(p, 'generate', job, this.workRoot, signal)).image) : p.type === 'grok' ? fromBase64((await grokRun(p, 'generate', job, signal)).image) : apiImage(store, p, job, signal));
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     for (const file of fs.readdirSync(this.dir)) {
       if (!file.endsWith('.json') || !uuid.test(file.slice(0, -5))) continue;
@@ -198,6 +224,7 @@ export class ImageJobs {
   }
   async check(id) {
     const p = this.providers.get(id);
+    if (p.type === 'grok') return grokRun(p, 'check', null, AbortSignal.timeout(45000));
     if (p.type !== 'codex') return { ok: true, verified: false, message: 'API settings saved. Click Generate to verify with a real image request.' };
     return codexRun(p, 'check', null, this.workRoot, AbortSignal.timeout(45000));
   }

@@ -9,7 +9,7 @@ import crypto from 'node:crypto';
 import { createGateway } from '../src/server.js';
 import { Store } from '../src/store.js';
 import { ImageProviders } from '../src/image-providers.js';
-import { ImageJobs, imageInfo, fromBase64, codexCommand } from '../src/images.js';
+import { ImageJobs, imageInfo, fromBase64, codexCommand, grokCommand } from '../src/images.js';
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jO1sAAAAASUVORK5CYII=', 'base64');
 const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(`http://127.0.0.1:${server.address().port}`)));
@@ -118,6 +118,22 @@ test('Codex provider validation and SSH command construction never interpolate a
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+
+test('Grok image provider validates its CLI path and builds a fixed SSH/Docker command', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harbor-grok-image-provider-'));
+  try {
+    const providers = new ImageProviders(new Store(dir));
+    const p = { id: 'grokimg', name: 'Grok Images', type: 'grok', execution: 'ssh-docker', sshHost: '192.0.2.10', sshUser: 'example-user', sshKeyPath: '/keys/key', runnerPath: '/workspace/model-harbor/grok-image-runner.py', container: 'claude-linux', grokPath: '/home/dev/.local/bin/grok', model: 'grok-4.7' };
+    providers.upsert(p); const configured = providers.get('grokimg');
+    const command = grokCommand(configured, 'generate', '12345678-1234-1234-1234-123456789012');
+    assert.equal(command.command, 'ssh');
+    assert.match(command.args.at(-1), /'python3' '\/workspace\/model-harbor\/grok-image-runner.py' 'generate'/);
+    assert.equal(configured.grokPath, '/home/dev/.local/bin/grok');
+    assert.throws(() => providers.upsert({ ...p, id: 'bad', grokPath: '/bin/sh' }), /Grok path/);
+    assert.throws(() => providers.upsert({ ...p, id: 'bad', runnerPath: '../runner.py' }), /absolute/);
+    assert.throws(() => providers.upsert({ ...p, id: 'bad', sshHost: 'host;whoami' }), /SSH/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('reference images: native multipart/MiniMax protocols, capability, limits and private history', async () => {
   const reference = 'data:image/png;base64,' + png.toString('base64'), calls = [];

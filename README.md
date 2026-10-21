@@ -1,6 +1,6 @@
 # Model Harbor · 模型港
 
-个人和可信局域网使用的多供应商模型网关：统一 OpenAI / Anthropic 兼容地址、官方 Codex 与 Claude Code 远程编排、中英文像素风管理页面和网页生图。需要 Node.js 22+，无第三方 npm 运行依赖。
+个人和可信局域网使用的多供应商模型网关：统一 OpenAI / Anthropic 兼容地址、官方 Codex、Claude Code 与 Grok 远程编排、中英文像素风管理页面和网页生图。需要 Node.js 22+，无第三方 npm 运行依赖。
 
 ## 功能
 
@@ -9,7 +9,9 @@
 - `/v1/messages` 接收 Anthropic Messages 请求，并转换到现有 Responses 路由。
 - 通过 SSH 或 SSH + Docker 接入官方 Codex app-server；支持客户端 function/custom/namespace 工具、完整结构化历史、实时文本 SSE、用量查询及确认后手动重置额度。
 - 通过 SSH 或 SSH + Docker 接入官方 Claude Code；支持客户端工具、图片输入、工具图片结果和多轮往返。
-- 网页生图：OpenAI 兼容 Images API、MiniMax API、本机或远程 Codex；参考图、后台队列、历史和原图下载。
+- 通过 SSH 或 SSH + Docker 接入官方 Grok CLI；支持客户端 function/custom 工具与多轮往返，工具始终由客户端执行，当前不支持图片输入。
+- 网页生图：OpenAI 兼容 Images API、MiniMax API、本机或远程 Codex / Grok 订阅；参考图、后台队列、历史和原图下载。
+- 生成视频：Grok 订阅视频工具、最长 15 秒、最多 3 张参考图；接口和后台任务已接入。
 - “设置”菜单可启用或关闭管理页面的用户名密码登录，立即生效并持久化。
 - OpenCode Go 一键接入：官方浏览器设备授权，自动创建按模型自动路由 Chat/Responses 的 `ocgo` 供应商，并显示官方额度。
 - Chat 上游支持客户端 custom/namespace 工具；Grok Responses 自动改写不受支持的工具声明，工具仍由客户端执行。
@@ -95,6 +97,31 @@ Claude 聊天链路使用官方 Claude Code 的 `--json-schema` / `stream-json` 
 
 支持 function/custom/namespace、长工具名、客户端 tool search、图片输入、工具图片结果和多轮工具往返；Claude 模型别名默认为 `sonnet`、`opus`、`haiku`。该链路直接使用官方 CLI 登录，不通过模型港读取或转发订阅 token。
 
+## Grok 官方 CLI 接入
+
+Grok 聊天链路使用官方 Grok CLI 的 `--json-schema` 结构化输出能力。模型港通过 SSH 或 SSH + Docker 启动 `grok-tool-runner.py`，官方 CLI 负责订阅认证和推理；runner 在临时 `HOME` / `GROK_HOME` 和单回合模式中运行，仅链接官方 CLI 的 `auth.json`，并关闭 Cursor/Claude 技能、规则、MCP 与 hooks 扫描；同时禁用 web search、subagent、plan 与内置工具权限。客户端 function/custom 工具只作为结构化输出请求返回给调用方，最终由本地客户端执行，不会在 NAS 容器内执行。
+
+前置条件：
+
+- 目标主机或容器已安装并登录 Grok CLI，`grok models` 能列出订阅可用模型。
+- 目标环境提供 `python3`、`timeout`，并能执行 `grok`。
+- 将 `src/grok-tool-runner.py` 放到目标环境的 `/workspace/model-harbor/grok-tool-runner.py`，或同步修改 SSH guard 中的固定路径。
+- 模型港容器可读取 SSH 私钥；SSH + Docker 模式还需要目标用户的免交互 Docker 权限。
+
+管理页添加供应商时选择「Grok · SSH / Docker」。默认模型为 `grok-4.7`、`grok-4.7-build-fast`、`grok-4.6`、`grok-4.5`，保存后可通过「刷新模型」重新读取 `grok models`。当前转发保持在模型港内部的非流式 CLI 回合，随后按 Responses/Chat/Anthropic 客户端协议回放事件；因此客户端会收到完整 SSE 事件序列，但文本不是逐 token 实时透传。
+
+限制：Grok CLI 当前没有公开的订阅用量接口，供应商卡片不显示额度；本桥接暂不接受图片输入，需要图片时请使用 Codex/Claude 通道或直接走 xAI API。与 Claude 订阅桥一样，这是官方 CLI 的第三方编排用法，不等同于 xAI 官方认可的第三方代理。
+## Grok 视频接入
+
+模型港新增「生成视频」菜单，视频 provider 为 `grok-videos`，通过 SSH + Docker 调用 `grok-video-runner.py`。当前支持 6/10/15 秒、480p/720p、16:9/9:16/1:1/3:2/2:3，以及最多 3 张 PNG、JPEG 或 WebP 参考图。任务与视频文件保存在模型港 `data/videos/`，页面支持预览、下载和复用描述。
+
+Grok 官方 CLI 的视频工具使用 `image_gen` + `reference_to_video`。无参考图时 runner 先生成参考静帧，再生成视频；有参考图时直接调用 `reference_to_video`。执行器使用临时 `HOME` / `GROK_HOME`，只链接登录态和可选配置，不开放 shell、文件、MCP 或 web 工具。
+
+注意：启用 ZDR（零数据保留）的账号需要额外配置公网可访问的 S3-compatible 输出桶，否则 Grok 会拒绝视频生成并返回 `output.upload_url` 错误；也可以按账号隐私设置选择 opt-in 后由 xAI 托管输出。切换隐私设置会改变数据保留策略，应在明确知情后操作。生图功能不受此限制。
+## Grok 用量
+
+Grok 供应商卡片的「查看用量」会通过固定 SSH / SSH+Docker 执行 `grok-usage.py`，启动官方 Grok TUI 的 `/usage` 页面并读取 `x.ai/billing` 返回的每周额度。卡片显示 SuperGrok 每周已用/剩余百分比和下次重置时间；数据缓存 30 秒，不读取或返回登录 token。
+
 ## OpenCode Go 接入
 
 供应商页「＋ 添加供应商」→ 快速选择「OpenCode Go · 浏览器授权」→「浏览器授权并接入」。模型港使用 OpenCode 官方公开的设备授权流程（`client_id` 为 `model-harbor`），无需粘贴 API Key；取得的是访问令牌和刷新令牌，不会解析或恢复已有的长期 Key。
@@ -126,7 +153,7 @@ OpenCode Go 的上游是混合形态：Chat 端点不接受 `developer` 角色�
 
 ## 网页生图
 
-生图入口位于管理页「生图」，支持 OpenAI 兼容或 MiniMax Images API、本机或远程 Codex。Codex 生图执行器是 `src/codex-image-runner.py`，与 Codex 聊天接入相互独立；远程生图仍需安装、登录 Codex 并部署该执行器。参考图最多 3 张，具体限制以页面和服务商能力为准。
+生图入口位于管理页「生图」，支持 OpenAI 兼容或 MiniMax Images API、本机或远程 Codex，以及已登录官方 Grok CLI 的订阅出图。Codex 生图执行器是 `src/codex-image-runner.py`，Grok 订阅生图执行器是 `src/grok-image-runner.py`，两者与聊天接入相互独立。Grok 执行器在临时 `HOME` / `GROK_HOME` 中运行，只链接官方 `auth.json`，只允许调用 `image_gen` 或 `image_edit` 图片工具，不执行客户端聊天工具。远程生图仍需安装、登录对应 CLI 并部署执行器。参考图最多 3 张，具体限制以页面和服务商能力为准。
 
 ## 协议边界
 
@@ -173,7 +200,7 @@ npm test
 npm run check
 ```
 
-当前 Node 回归测试为 151 项，覆盖管理鉴权、供应商 CRUD、协议转换、流式 SSE、客户端工具往返、长历史注入、模型发现、Codex/Claude 工具桥接、OpenCode Go 授权与额度、Grok 工具改写、加密历史回退、图片压缩、工具下载目录、图片队列和 i18n。测试使用模拟上游和临时数据，不调用真实模型、不消耗真实账号重置次数。
+当前 Node 回归测试为 169 项，覆盖管理鉴权、供应商 CRUD、协议转换、流式 SSE、客户端工具往返、长历史注入、模型发现、Codex/Claude/Grok 工具桥接、OpenCode Go 授权与额度、Grok 工具改写、加密历史回退、图片压缩、工具下载目录、图片队列和 i18n。Python 执行器与 SSH guard 可用 `python3 test/grok-tool-runner.test.py`、`python3 test/grok-image-runner.test.py` 和 `python3 test/grok-video-runner.test.py` 单独验证。测试使用模拟上游和临时数据，不调用真实模型、不消耗真实账号重置次数。
 
 字体及其许可证见 [public/FONT-LICENSE.txt](public/FONT-LICENSE.txt)。
 

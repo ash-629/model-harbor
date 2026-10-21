@@ -4,6 +4,7 @@ import { optimizeApiPayload, tokenPolicy, usageMetrics, requestStats } from './a
 import { toChat, fromChat, bridgeStream, sseEvents, openSSE, writeSSE, chatToResponses, responsesToChat, responsesStreamToChat, normalizeChatToolMessages } from './protocol.js';
 import { sendAgent } from './nas-agent.js';
 import { claudeModels, sendClaude, ClaudeCodeBridge } from './claude-code.js';
+import { grokModels, sendGrok, GrokCodeBridge } from './grok-code.js';
 import { discoverOpenCodeGo, isOpenCodeGoProvider, openCodeSessionId, classifyOpenCodeGoModel, OPENCODE_GO_SESSION_HEADER, OPENCODE_GO_USER_AGENT } from './opencode-go.js';
 import { openCodeGoCredential } from './opencode-go-auth.js';
 import { chatToolPlan } from './chat-tools.js';
@@ -24,6 +25,7 @@ export function extractUpstreamError(text) {
   return detail.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/Bearer\s+[^\s,;]+/gi, 'Bearer [redacted]').replace(/\b(?:sk|oc_sk|mh)-[A-Za-z0-9._-]{8,}\b/g, '[redacted]').replace(/\s+/g, ' ').trim().slice(0, 400);
 }
 const defaultClaudeBridge = new ClaudeCodeBridge();
+const defaultGrokBridge = new GrokCodeBridge();
 
 // Compaction ciphertext is provider-specific. Only use this fallback after
 // the destination explicitly rejects it; valid native blobs pass unchanged.
@@ -100,19 +102,23 @@ export async function discover(store, p, signal, nasAgent) {
     return nasAgent.models(p, signal);
   }
   if (p.type === 'claude-code') return claudeModels(p, signal);
+  if (p.type === 'grok-code') return grokModels(p, signal);
   if (isOpenCodeGoProvider(p)) return discoverOpenCodeGo(store, p, signal);
   const response = await upstreamFetch(store, p, 'models', undefined, signal);
   const data = await response.json();
   if (!Array.isArray(data.data)) throw new HttpError(502, '上游模型接口未返回 data 数组，请手工填写模型');
   return data.data.map(m => m.id);
 }
-export async function route(store, p, model, body, endpoint, res, signal, nasAgent, claudeBridge = defaultClaudeBridge, requestSessionId = '') {
+export async function route(store, p, model, body, endpoint, res, signal, nasAgent, claudeBridge = defaultClaudeBridge, requestSessionId = '', grokBridge = defaultGrokBridge) {
   if (p.type === 'nas-codex') {
     if (!nasAgent) throw new HttpError(502, 'Codex 官方 app-server 桥接未初始化', 'codex_bridge_unavailable');
     return sendAgent(nasAgent, p, model, body, endpoint, res, signal);
   }
   if (p.type === 'claude-code') {
     return sendClaude(claudeBridge, p, model, body, endpoint, res, signal);
+  }
+  if (p.type === 'grok-code') {
+    return sendGrok(grokBridge, p, model, body, endpoint, res, signal);
   }
   const sessionId = isOpenCodeGoProvider(p) ? openCodeSessionId(body, requestSessionId) : '';
   if (endpoint === 'chat/completions' && p.protocol === 'responses') throw new HttpError(400, '此上游仅提供 Responses，请使用 /v1/responses 或更改供应商协议');
