@@ -79,6 +79,26 @@ test('tool discovery results merge schemas and return client tool_search calls',
  const next=grokContext({...body,tools:[search],input:[{role:'user',content:'browse'},r.output[0],{type:'tool_search_output',call_id:r.output[0].call_id,tools:[fn]}]},'responses');assert.equal(next.specs.length,2);assert.match(next.transcript.at(-1).output,/run_command/);
 });
 
+test('tier A context compaction removes unusable payloads and duplicate schemas',()=>{
+ const annotated={type:'function',name:'annotated_tool',parameters:{$schema:'https://json-schema.org/draft/2020-12/schema',$id:'urn:annotated',$comment:'drop me',title:'Annotated tool',readOnly:true,writeOnly:false,deprecated:true,type:'object',properties:{title:{type:'string'},cmd:{type:'string',description:'command',default:'echo',examples:['echo ok']}},required:['cmd'],additionalProperties:false}};
+ const search={type:'tool_search',execution:'client',parameters:{type:'object',properties:{query:{type:'string'}},required:['query']}};
+ const input=[{role:'user',content:'first'},{type:'web_search_call',status:'completed',action:{type:'search',query:'secret-query'},encrypted_content:'ENCRYPTED_PAYLOAD_MARKER'},{type:'tool_search_call',call_id:'search1',execution:'client',arguments:{query:'annotated'}},{type:'tool_search_output',call_id:'search1',execution:'client',tools:[annotated]},{role:'user',content:'current'}];
+ const c=grokContext({...body,tools:[search],input,tool_choice:'required'},'responses');
+ const prompt=grokPrompt(c);
+ assert.doesNotMatch(prompt,/ENCRYPTED_PAYLOAD_MARKER/);assert.match(prompt,/secret-query/);
+ assert.ok(prompt.indexOf('"tools":')<prompt.indexOf('The caller requires a tool call this turn.'));
+ const searchResult=c.transcript.find(x=>x.call_id==='search1'&&x.type==='function_call_output');
+ assert.deepEqual(JSON.parse(searchResult.output),{tools:['annotated_tool']});
+ const spec=c.specs.find(s=>c.mappings.get(s.name)?.name==='annotated_tool');
+ assert.equal(spec.inputSchema.$schema,undefined);assert.equal(spec.inputSchema.$id,undefined);assert.equal(spec.inputSchema.$comment,undefined);
+ assert.equal(spec.inputSchema.readOnly,undefined);assert.equal(spec.inputSchema.writeOnly,undefined);assert.equal(spec.inputSchema.deprecated,undefined);
+ assert.ok(spec.inputSchema.properties.title);assert.equal(spec.inputSchema.properties.cmd.default,'echo');assert.deepEqual(spec.inputSchema.properties.cmd.examples,['echo ok']);
+ const defs=grokSchema(c).$defs;assert.equal(defs.t2.$comment,undefined);assert.equal(defs.t2.readOnly,undefined);assert.ok(defs.t2.properties.title);
+ assert.deepEqual(c.compaction,{webSearchPayloadsDropped:1,toolSearchOutputsCompacted:1,toolSchemasCompacted:1});
+ assert.equal(annotated.parameters.$schema,'https://json-schema.org/draft/2020-12/schema');
+ const r=grokResult(ok(call('t1',{query:'x'})),c,body.model);assert.deepEqual(r.metadata.model_harbor_context_compaction,c.compaction);
+});
+
 test('hosted declarations are disclosed, forced hosted tools fail, tool budgets remain hints',()=>{
  const c=grokContext({...body,tools:[{type:'web_search'},...tools],max_tokens:100,max_output_tokens:200},'responses');const r=grokResult(ok(final('ok')),c,body.model);assert.equal(r.metadata.model_harbor_unsupported_hosted_tools,'web_search');assert.equal(r.metadata.model_harbor_requested_output_tokens,'100');
  assert.throws(()=>grokContext({...body,tools:[{type:'web_search'}],tool_choice:{type:'web_search'}},'responses'),e=>e.status===400);
