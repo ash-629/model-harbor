@@ -62,7 +62,7 @@ function usageTone(value) {
   return 'safe';
 }
 function usageWindow(window) {
-  const label = window.durationMins === 300 ? t('5 小时用量') : window.durationMins === 10080 ? t('每周用量') : window.durationMins ? t('{minutes} 分钟用量', {minutes:window.durationMins}) : t('用量窗口');
+  const label = window.durationMins === 300 ? t('5 小时用量') : window.durationMins === 10080 ? t('每周用量') : window.durationMins === 43200 ? t('每月用量') : window.durationMins ? t('{minutes} 分钟用量', {minutes:window.durationMins}) : t('用量窗口');
   const percent = value => Math.round(value * 10) / 10;
   const known = window.usedPercent !== null && window.usedPercent !== undefined;
   const tone = known ? usageTone(window.usedPercent) : 'unknown';
@@ -93,15 +93,10 @@ function balanceMarkup(p) {
 function openCodeGoProvider(p) { return p.type === 'openai' && p.baseUrl === 'https://opencode.ai/inference/go/openai/v1'; }
 function openCodeGoUsageMarkup(p) {
   const usage = usageById.get(p.id), data = usage?.data;
-  const labels = { rolling: '5 小时', weekly: '每周', monthly: '每月' };
-  const percent = value => Math.round(value * 10) / 10;
-  const body = (data?.windows || []).map(w => {
-    const known = Number.isFinite(w.remainingPercent);
-    const reset = w.resetsAt ? new Date(w.resetsAt * 1000).toLocaleString(getLanguage()) : t('暂不可用');
-    return `<div class="quota-window"><div class="quota-row"><strong>${h(t(labels[w.id] || w.id))}</strong><span>${known ? h(t('剩余 {percent}%', { percent: percent(w.remainingPercent) })) : t('暂不可用')}</span></div>${known ? `<progress max="100" value="${w.usedPercent}"></progress>` : ''}<div class="quota-detail">${h(t('重置于 {time}', { time: reset }))}</div></div>`;
-  }).join('');
+  const minutes = { rolling: 300, weekly: 10080, monthly: 43200 };
+  const body = (data?.windows || []).map(w => usageWindow({ ...w, durationMins: w.durationMins || minutes[w.id] })).join('');
   const error = usage?.error ? `<div class="notice error" role="alert">${h(translateError(usage.error))}</div>` : '';
-  return `<section class="provider-quota"><div class="quota-row"><strong>${t('OpenCode Go 剩余额度')}</strong><button class="button ghost quota-refresh" data-usage="${h(p.id)}" ${usage?.loading ? 'disabled' : ''}>${usage?.loading ? t('查询中…') : data ? t('刷新用量') : t('查看用量')}</button></div>${error}${body}<div class="quota-detail">${t('Chat 与 Responses 共享同一 Go 工作区额度；数据最多缓存 30 秒。')}</div>${data ? `<div class="quota-detail">${h(t('更新于 {time}', {time:new Date(data.checkedAt).toLocaleTimeString(getLanguage())}))}</div>` : ''}</section>`;
+  return `<section class="provider-quota"><div class="quota-row"><strong>${t('OpenCode Go 账号用量')}</strong><button class="button ghost quota-refresh" data-usage="${h(p.id)}" ${usage?.loading ? 'disabled' : ''}>${usage?.loading ? t('查询中…') : data ? t('刷新用量') : t('查看用量')}</button></div>${error}${body}${!data && usage?.loading ? `<div class="quota-detail">${t('正在读取账号额度…')}</div>` : ''}<div class="quota-detail">${t('Chat 与 Responses 共享同一 Go 工作区额度；数据最多缓存 30 秒。')}</div>${data ? `<div class="quota-detail">${h(t('更新于 {time}', {time:new Date(data.checkedAt).toLocaleTimeString(getLanguage())}))}</div>` : ''}</section>`;
 }
 function usageMarkup(p) {
   if (openCodeGoProvider(p)) return openCodeGoUsageMarkup(p);
@@ -271,7 +266,7 @@ function view(name, { updateUrl = true } = {}) {
   [$('page-name').textContent, $('heading').textContent, $('subtitle').textContent] = names[name];
   if (name === 'settings') loadSettings();
   if (name === 'tools') loadTools(); else stopToolPoll();
-  if (name === 'providers') for (const p of state.providers) if ((p.type === 'nas-codex' || p.type === 'claude-code' || balanceProvider(p) || openCodeGoProvider(p)) && p.enabled) loadUsage(p.id);
+  if (name === 'providers') for (const p of state.providers) if ((p.type === 'nas-codex' || p.type === 'claude-code' || p.type === 'grok-code' || balanceProvider(p) || openCodeGoProvider(p)) && p.enabled) loadUsage(p.id);
   if (updateUrl && location.hash !== '#' + name) history.pushState({ view: name }, '', '#' + name);
 }
 let settingsLoading = false;

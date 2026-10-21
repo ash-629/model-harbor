@@ -9,7 +9,8 @@ export function normalizeOpenCodeGoUsage(data, checkedAt = new Date().toISOStrin
     const source = usage[id], value = source?.percent;
     const usedPercent = typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : null;
     const resets = typeof source?.resetsAt === 'string' ? Date.parse(source.resetsAt) : NaN;
-    return { id, usedPercent, remainingPercent: usedPercent === null ? null : 100 - usedPercent,
+    return { id, durationMins: { rolling: 300, weekly: 10080, monthly: 43200 }[id] || null,
+      usedPercent, remainingPercent: usedPercent === null ? null : 100 - usedPercent,
       resetsAt: Number.isFinite(resets) ? resets / 1000 : null,
       status: ['ok', 'limited', 'exceeded'].includes(source?.status) ? source.status : null };
   }) };
