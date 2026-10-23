@@ -14,8 +14,8 @@ const close = server => new Promise(resolve => { server.closeAllConnections(); s
 
 test('LAN deployment requires a password and protects administration separately from Bearer API', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'model-harbor-lan-'));
-  assert.throws(() => createGateway({ dataDir: dir, publicUrl: 'http://192.0.2.10:8317' }), /PASSWORD/);
-  const { server, store } = createGateway({ dataDir: dir, publicUrl: 'http://192.0.2.10:8317', adminPassword: 'test-password' });
+  assert.throws(() => createGateway({ dataDir: dir, publicUrl: 'http://192.168.2.37:8317' }), /PASSWORD/);
+  const { server, store } = createGateway({ dataDir: dir, publicUrl: 'http://192.168.2.37:8317', adminPassword: 'test-password' });
   const base = await listen(server);
   const headers = { authorization: 'Basic ' + Buffer.from('admin:test-password').toString('base64') };
   try {
@@ -27,9 +27,9 @@ test('LAN deployment requires a password and protects administration separately 
     const session = await fetch(base + '/api/session', { headers });
     const cookie = session.headers.get('set-cookie').split(';')[0];
     const config = await (await fetch(base + '/api/config', { headers: { ...headers, cookie } })).json();
-    assert.equal(config.baseUrl, 'http://192.0.2.10:8317/v1');
+    assert.equal(config.baseUrl, 'http://192.168.2.37:8317/v1');
     const requestHost = host => new Promise(resolve => http.get(base + '/health', { headers: { host } }, res => { res.resume(); resolve(res.statusCode); }));
-    assert.equal(await requestHost('192.0.2.10:8317'), 200);
+    assert.equal(await requestHost('192.168.2.37:8317'), 200);
     assert.equal(await requestHost('evil.example:8317'), 403);
   } finally { await close(server); fs.rmSync(dir, { recursive: true, force: true }); }
 });

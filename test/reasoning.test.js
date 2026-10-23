@@ -109,3 +109,27 @@ test('native stream Chat chunks cache reasoning after fragmented tool call IDs a
   tracker.flush();
   assert.equal(cachedReasoning('ocgo', 'call_7'), 'stream chain');
 });
+
+test('missing cached reasoning can be filled with an explicit empty value for thinking-mode tool turns', () => {
+  const request = { messages: [{ role: 'assistant', content: null, tool_calls: [{ id: 'call_empty' }] }] };
+  const filled = restoreCachedReasoning(request, 'ocgo', { fillEmpty: true });
+  assert.equal(filled.messages[0].reasoning_content, '');
+  const untouched = restoreCachedReasoning(request, 'ocgo');
+  assert.equal('reasoning_content' in untouched.messages[0], false);
+  rememberReasoning('ocgo', 'call_empty', 'cached chain');
+  const cached = restoreCachedReasoning(request, 'ocgo', { fillEmpty: true });
+  assert.equal(cached.messages[0].reasoning_content, 'cached chain');
+});
+
+test('client reasoning fields are copied and empty fill reaches Responses tool history', () => {
+  const restored = restoreCachedReasoning({ messages: [
+    { role: 'assistant', content: null, reasoning: 'client chain', tool_calls: [{ id: 'call_reasoning' }] }
+  ] }, 'ocgo', { fillEmpty: true });
+  assert.equal(restored.messages[0].reasoning_content, 'client chain');
+
+  const request = toChat({ model: 'm', input: [
+    { type: 'function_call', call_id: 'call_fill', name: 'echo', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'call_fill', output: 'ok' }
+  ] }, undefined, 'ocgo', { fillReasoning: true });
+  assert.equal(request.messages[0].reasoning_content, '');
+});

@@ -64,18 +64,26 @@ export function createReasoningItem(id, text) {
 
 // Restore provider-specific reasoning for clients that call the Chat endpoint
 // directly and only send back assistant tool calls plus tool results.
-export function restoreCachedReasoning(payload, scope, now = Date.now()) {
+// DeepSeek thinking mode rejects a tool-call assistant message without the
+// field even when the original chain of thought is no longer available, so
+// `fillEmpty` keeps the protocol valid with an explicitly empty value.
+export function restoreCachedReasoning(payload, scope, options = {}) {
   if (!Array.isArray(payload?.messages)) return payload;
+  const now = typeof options === 'number' ? options : (options?.now ?? Date.now());
+  const fillEmpty = typeof options === 'object' && options.fillEmpty === true;
   let changed = false;
   const messages = payload.messages.map(message => {
     if (message?.role !== 'assistant' || !Array.isArray(message.tool_calls) || (typeof message.reasoning_content === 'string' && message.reasoning_content)) return message;
+    let reasoning = '';
     for (const call of message.tool_calls) {
-      const reasoning = cachedReasoning(scope, call?.id, now);
-      if (!reasoning) continue;
-      changed = true;
-      return { ...message, reasoning_content: reasoning };
+      reasoning = cachedReasoning(scope, call?.id, now);
+      if (reasoning) break;
     }
-    return message;
+    // Some OpenAI-compatible clients echo the provider field as `reasoning`.
+    if (!reasoning && typeof message.reasoning === 'string') reasoning = message.reasoning;
+    if (!reasoning && !fillEmpty) return message;
+    changed = true;
+    return { ...message, reasoning_content: reasoning };
   });
   return changed ? { ...payload, messages } : payload;
 }

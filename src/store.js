@@ -112,15 +112,119 @@ export class Store {
     p.models = [...new Set(models)]; p.lastSync = new Date().toISOString(); this.save(); return this.publicProvider(p);
   }
   gatewayKey() { return this.unseal(this.data.gatewayKey); }
+
+  // Provider groups: one public prefix over several Codex accounts.
+  groups() { return (this.data.providerGroups ||= []); }
+  groupState() { return (this.data.groupState ||= {}); }
+  groupModels(g) {
+    const seen = new Set();
+    for (const id of g.members || []) {
+      const p = this.data.providers.find(p => p.id === id);
+      if (!p || !p.enabled) continue;
+      for (const model of p.models) seen.add(model);
+    }
+    return [...seen];
+  }
+  publicGroup(g) {
+    const now = Date.now();
+    const members = (g.members || []).map(id => {
+      const p = this.data.providers.find(p => p.id === id);
+      const cd = this.data.groupState?.[g.id]?.[id];
+      const cooling = Boolean(cd && cd.until > now);
+      return { id, name: p?.name || id, enabled: Boolean(p?.enabled), container: p?.container || null, cooling, until: cooling ? cd.until : null, reason: cooling ? cd.reason || cd.kind || null : null };
+    });
+    return { ...g, members, modelIds: this.groupModels(g) };
+  }
+  listGroups() { return this.groups().map(g => this.publicGroup(g)); }
+  getGroup(id) { const g = this.groups().find(g => g.id === id); if (!g) throw new HttpError(404, '供应商组不存在'); return g; }
+  upsertGroup(input, oldId) {
+    if (!input || typeof input !== 'object') throw new HttpError(400, '配置必须是对象');
+    const id = String(input.id || '').trim();
+    if (!/^[a-z0-9][a-z0-9_-]{0,39}$/.test(id)) throw new HttpError(400, '组前缀只能包含小写字母、数字、下划线、短横线，最多 40 字符');
+    if (oldId && oldId !== id) throw new HttpError(400, '已有组的前缀不可修改');
+    const old = oldId ? this.getGroup(oldId) : null;
+    if (!old && this.groups().some(g => g.id === id)) throw new HttpError(409, '组前缀已存在');
+    if (this.data.providers.some(p => p.id === id)) throw new HttpError(409, '组前缀不能与供应商前缀相同');
+    const members = input.members ?? old?.members ?? [];
+    if (!Array.isArray(members) || !members.length || members.length > 10) throw new HttpError(400, '请选择 1–10 个 Codex 供应商');
+    const unique = [...new Set(members.map(m => String(m)))];
+    if (unique.length !== members.length) throw new HttpError(400, '组内供应商不能重复');
+    for (const mid of unique) {
+      const p = this.data.providers.find(p => p.id === mid);
+      if (!p) throw new HttpError(400, `供应商 ${mid} 不存在`);
+      if (p.type !== 'nas-codex') throw new HttpError(400, `供应商 ${mid} 不是 Codex 供应商`);
+    }
+    const g = {
+      id,
+      name: String(input.name || old?.name || id).trim().slice(0, 80) || id,
+      enabled: input.enabled !== false,
+      hideMembers: input.hideMembers !== false,
+      members: unique,
+      updatedAt: new Date().toISOString()
+    };
+    if (old) this.groups()[this.groups().indexOf(old)] = g; else this.groups().push(g);
+    this.save(); return this.publicGroup(g);
+  }
+  removeGroup(id) {
+    this.getGroup(id);
+    this.data.providerGroups = this.groups().filter(g => g.id !== id);
+    if (this.data.groupState) delete this.data.groupState[id];
+    this.save();
+  }
+  groupCooldown(groupId, providerId) {
+    const cd = this.data.groupState?.[groupId]?.[providerId];
+    return cd && Number(cd.until) > Date.now() ? cd : null;
+  }
+  setGroupCooldown(groupId, providerId, value) {
+    const state = this.groupState();
+    (state[groupId] ||= {})[providerId] = value;
+    this.save();
+  }
+  clearGroupCooldown(groupId, providerId) {
+    const state = this.data.groupState?.[groupId];
+    if (!state || !state[providerId]) return;
+    delete state[providerId];
+    if (!Object.keys(state).length) delete this.data.groupState[groupId];
+    this.save();
+  }
+  clearGroupCooldowns(groupId) {
+    if (this.data.groupState?.[groupId]) { delete this.data.groupState[groupId]; this.save(); }
+  }
   models() {
-    return this.data.providers.filter(p => p.enabled).flatMap(p => p.models.map(model => ({
-      id: `${p.id}/${model}`, object: 'model', created: 0, owned_by: p.id,
-      name: model, provider_name: p.name, source: p.type,
-      capabilities: { tools: true, custom_tools: p.type === 'nas-codex' || p.type === 'claude-code' || p.type === 'grok-code' || p.protocol !== 'chat', text: true, cli_bridge: p.type === 'nas-codex' || p.type === 'claude-code' || p.type === 'grok-code' }
-    })));
+    const groups = this.groups().filter(g => g.enabled);
+    const hidden = new Set();
+    for (const g of groups) if (g.hideMembers !== false) for (const id of g.members || []) hidden.add(id);
+    const out = [];
+    for (const g of groups) {
+      for (const model of this.groupModels(g)) out.push({
+        id: `${g.id}/${model}`, object: 'model', created: 0, owned_by: g.id,
+        name: model, provider_name: g.name, source: 'codex-group',
+        capabilities: { tools: true, custom_tools: true, text: true, cli_bridge: true, group: true, members: g.members.length }
+      });
+    }
+    for (const p of this.data.providers) {
+      if (!p.enabled || hidden.has(p.id)) continue;
+      for (const model of p.models) out.push({
+        id: `${p.id}/${model}`, object: 'model', created: 0, owned_by: p.id,
+        name: model, provider_name: p.name, source: p.type,
+        capabilities: { tools: true, custom_tools: p.type === 'nas-codex' || p.type === 'claude-code' || p.type === 'grok-code' || p.protocol !== 'chat', text: true, cli_bridge: p.type === 'nas-codex' || p.type === 'claude-code' || p.type === 'grok-code' }
+      });
+    }
+    return out;
   }
   resolve(model) {
     if (typeof model !== 'string') throw new HttpError(400, '必须指定 model');
+    for (const g of this.groups()) {
+      if (!g.enabled || !model.startsWith(g.id + '/')) continue;
+      const name = model.slice(g.id.length + 1);
+      if (!this.groupModels(g).includes(name)) continue;
+      const candidates = [];
+      for (const id of g.members || []) {
+        const p = this.data.providers.find(p => p.id === id);
+        if (p && p.enabled && p.models.includes(name)) candidates.push({ provider: p, model: name });
+      }
+      if (candidates.length) return { group: g, model: name, provider: candidates[0].provider, candidates };
+    }
     for (const p of this.data.providers) {
       if (p.enabled && model.startsWith(p.id + '/') && p.models.includes(model.slice(p.id.length + 1))) return { provider: p, model: model.slice(p.id.length + 1) };
     }

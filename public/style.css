@@ -82,3 +82,68 @@ html[lang=en] .provider-actions{flex-wrap:wrap}
 
 /* Tool downloads: package cards, progress and update actions. */
 .tools-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:20px}.tool-card{padding:22px}.tool-card-top{display:flex;align-items:flex-start;gap:16px}.tool-card-top>div:nth-child(2){min-width:0;flex:1}.tool-card-top h3{margin:4px 0;font-size:24px}.tool-card-top p{margin:0;color:#617778;font-size:13px}.tool-card-top .status-pill{flex-shrink:0}.tool-mark{width:60px;height:60px;display:grid;place-items:center;background:var(--mint);border:2px solid var(--ink);box-shadow:4px 4px 0 var(--ink);font-weight:700;font-size:18px;color:#205440;flex-shrink:0}.tool-versions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:22px 0;border-top:2px dashed #bdc7b8;padding-top:18px}.tool-versions span{display:block;font-size:12px;color:#6b7f72;margin-bottom:5px}.tool-versions strong{display:block;font-size:16px;color:#203f32;overflow-wrap:anywhere}.tool-progress{margin:0 0 18px;padding:12px 14px;background:#edf5e9;border:2px solid #b7cbb6}.tool-progress-row{display:flex;justify-content:space-between;gap:12px;font-size:13px;margin-bottom:8px}.tool-progress progress{display:block;width:100%;height:14px;appearance:none;border:2px solid #718d76;border-radius:0;background:#e5ebdd}.tool-progress progress::-webkit-progress-bar{background:#e5ebdd}.tool-progress progress::-webkit-progress-value{background:#79b98c}.tool-progress progress::-moz-progress-bar{background:#79b98c}.tool-progress-checking progress{height:10px;background:#dbe8d4}.tool-progress-checking progress::-webkit-progress-value{background:#79b98c}.tool-progress small{display:block;color:#53685c;font-size:12px;margin-top:6px}.tool-card-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:#617778;font-size:12px;line-height:1.8}.tool-card-meta .tool-proxy-ok{color:#2d7448;font-weight:600}.tool-card-meta .tool-proxy-missing{color:#9b6420;font-weight:600}.tool-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}.tool-actions .button{min-width:120px}.tool-proxy-note{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-top:20px;padding:18px 22px;background:#f6e6bc}.tool-proxy-note h3{margin:0 0 5px;font-size:17px}.tool-proxy-note p{margin:0;color:#68502a;font-size:13px}.tool-status-dot{width:12px;height:12px;background:#6ebc7d;border:2px solid var(--ink);box-shadow:2px 2px 0 var(--ink);flex-shrink:0}.tool-empty{padding:34px;text-align:center}@media(max-width:700px){.tool-versions{grid-template-columns:1fr}.tool-card{padding:16px}.tool-card-top{gap:12px}.tool-card-top h3{font-size:20px}.tool-actions .button{flex:1}}
+
+/* Codex provider groups */
+.groups-section{margin:0 0 26px}
+.groups-section>.section-title{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.groups-section>.section-title h2{margin:0}
+.groups-section>.section-title p{margin:0;color:#617778;font-size:13px;flex:1;min-width:200px}
+.groups-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:20px;margin-top:16px}
+.group-card .group-member-list{list-style:none;margin:14px 0;padding:0;display:grid;gap:8px}
+.group-member-list li{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px dashed #bdc7b8;background:#fbfcf6;font-size:13px;flex-wrap:wrap}
+.group-rank{width:20px;height:20px;border:1px solid #8fa194;display:inline-flex;align-items:center;justify-content:center;font-size:11px;color:#4a6a58;background:#eef2e6}
+.group-member-name{font-weight:600;color:#243d46}
+.group-order{margin-left:auto;display:flex;gap:4px}
+.group-choice{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px dashed #bdc7b8;margin-bottom:8px;background:#fffef8}
+.group-choice.chosen{border-style:solid;border-color:#8fa194;background:#eef5e7}
+.group-choice label{margin:0;flex:1;display:flex;align-items:center;gap:8px;font-size:14px}
+.group-choice code{font-size:12px;color:#697e72}
+.group-choice-list{margin:6px 0 18px}
+@media(max-width:700px){.groups-grid{grid-template-columns:1fr}}
+
+/* Provider management: one group/provider per row; keep every existing control. */
+#providers-view .providers-grid,#providers-view .groups-grid{grid-template-columns:minmax(0,1fr);gap:12px}
+#providers-view .provider-card{display:grid;grid-template-columns:64px minmax(180px,.9fr) minmax(280px,1.5fr) 164px;grid-template-rows:auto auto auto 1fr;column-gap:18px;row-gap:4px;padding:16px;box-shadow:3px 3px 0 var(--ink);align-items:start;min-width:0}
+#providers-view .provider-top{grid-column:1;grid-row:1/5;flex-direction:column;align-items:center;gap:12px;min-width:0}
+#providers-view .provider-mark{width:34px;height:34px;font-size:20px;margin:0;box-shadow:2px 2px 0 var(--ink)}
+#providers-view .status-pill{font-size:12px;padding:2px 6px;white-space:nowrap}
+#providers-view .provider-card>h3{grid-column:2;grid-row:1;font-size:18px;margin:0;overflow-wrap:anywhere;line-height:1.5}
+#providers-view .provider-card>.model-id{grid-column:2;grid-row:2;margin:0;font-size:12px}
+#providers-view .provider-card>p{grid-column:2;grid-row:3;margin:2px 0;font-size:12px;line-height:1.6}
+#providers-view .provider-meta{grid-column:2;grid-row:4;margin:4px 0 0;font-size:12px;gap:5px;line-height:1.6}
+#providers-view .provider-quota{grid-column:3;grid-row:1/5;margin:0;padding:0 16px;border-top:0;border-left:1px dashed #bdc7b8;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:14px;row-gap:4px}
+#providers-view .provider-quota>*,#providers-view .quota-bucket>.quota-detail{grid-column:1/-1;min-width:0}
+#providers-view .provider-quota>.quota-window{grid-column:auto}
+#providers-view .quota-bucket{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 14px}
+#providers-view .quota-bucket+.quota-bucket{padding-top:6px}
+#providers-view .quota-window{margin:2px 0 4px;min-width:0}
+#providers-view .quota-row{font-size:12px;gap:6px}
+#providers-view .quota-detail{font-size:11px;line-height:1.5}
+#providers-view .quota-window progress{height:10px;margin:5px 0}
+#providers-view .quota-row .button.quota-refresh{font-size:12px;padding:3px 7px}
+#providers-view .quota-resets{padding-top:5px;margin:0}
+#providers-view .quota-reset-button{width:auto;justify-self:start;margin:2px 0 0;padding:4px 10px;font-size:12px}
+#providers-view .provider-quota .notice{margin:4px 0;padding:6px 8px}
+#providers-view .balance-title strong{font-size:22px}
+#providers-view .balance-split,#providers-view .balance-foot{margin-top:0}
+#providers-view .provider-actions{grid-column:4;grid-row:1/5;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 4px;border-top:0;border-left:1px dashed #bdc7b8;padding:0 0 0 12px;align-content:start}
+#providers-view .provider-actions .button{font-size:12px;padding:6px 8px;white-space:normal;min-width:0}
+#providers-view .provider-actions [data-refresh]{grid-column:1/-1}
+#providers-view .group-member-list{grid-column:3;grid-row:1/5;margin:0;padding:0 0 0 16px;border-left:1px dashed #bdc7b8;gap:6px;min-width:0}
+#providers-view .group-member-list li{padding:5px 8px;gap:6px;min-width:0}
+#providers-view .group-member-name{overflow-wrap:anywhere;min-width:0}
+#providers-view .group-member-list .model-id{margin:0;font-size:11px}
+#providers-view .group-order .icon-button{width:26px;height:26px;padding:0}
+#providers-view .section-title{margin-bottom:16px}
+@media(max-width:1250px) and (min-width:1001px){
+  #providers-view .provider-card{grid-template-columns:64px minmax(160px,.9fr) minmax(240px,1.5fr);column-gap:14px}
+  #providers-view .provider-actions{grid-column:2/4;grid-row:5;display:flex;flex-wrap:wrap;border-left:0;border-top:1px dashed #bdc7b8;padding:8px 0 0;margin-top:6px;gap:8px}
+}
+@media(max-width:1000px){
+  #providers-view .provider-card{grid-template-columns:64px minmax(0,1fr);column-gap:12px;padding:14px}
+  #providers-view .provider-quota,#providers-view .group-member-list{grid-column:1/-1;grid-row:5;border-left:0;border-top:1px dashed #bdc7b8;padding:10px 0 0;margin-top:6px}
+  #providers-view .provider-actions{grid-column:1/-1;grid-row:6;display:flex;flex-wrap:wrap;border-left:0;border-top:1px dashed #bdc7b8;padding:8px 0 0;margin-top:6px;gap:8px}
+}
+@media(max-width:420px){
+  #providers-view .provider-quota,#providers-view .quota-bucket{grid-template-columns:minmax(0,1fr)}
+}

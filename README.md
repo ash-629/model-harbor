@@ -89,6 +89,31 @@ Codex 聊天链路使用目标环境中的官方 `codex app-server`，通过 SSH
 
 `examples/ssh-command-guard.py` 是可选的受限 SSH 强制命令示例。它默认使用 `codex-linux`、`/usr/local/bin/docker` 和固定 Codex 路径；使用前必须按自己的容器、用户目录、CLI 路径和时间限制修改。
 
+## Codex 多账号组（优先级与自动切换）
+
+当多个 Codex 账号分别跑在不同容器里时，可以把它们合成一个「账号组」：对外只暴露一个模型前缀，内部按优先级依次尝试，某个账号额度用尽后自动切到下一个。
+
+- 组前缀会替代成员的单独前缀出现在 `/v1/models` 中，例如 `codex/gpt-6.1-sol`；默认隐藏成员的单独模型（可在组设置里关闭）。
+- 成员顺序就是优先级，可在「模型来源 → Codex 账号组」里用 ↑↓ 调整。
+- 组内成员只允许 `nas-codex` 类型，1–10 个，前缀不能与现有供应商重名。
+- 失败切换只发生在尚未向客户端写出任何内容时，并且只针对额度类错误（`usage limit`、`quota`、`429` 等）。其它错误（网络、登录、上下文超限）会直接返回，不会盲目重试。
+- 触发额度切换后，该账号会进入冷却：优先读取用量接口的 `resetsAt`（5 小时/每周窗口），读不到时按 30 分钟处理；速率限制按 1 分钟处理。冷却期间请求直接跳过该账号。
+- 组请求在流式模式下会先完成上游回合再打开 SSE（只影响组请求），这样才能在额度错误时安全切换；单供应商请求仍保持原有实时输出。
+- 管理接口：`GET/POST /api/groups`、`PUT/DELETE /api/groups/:id`、`POST /api/groups/:id/sync`（按实时用量刷新冷却）、`POST /api/groups/:id/clear-cooldowns`（手动清除冷却）。
+- 组状态（冷却时间）保存在 `data/config.json` 的 `groupState` 中，重启后仍然生效。
+
+示例：
+
+```json
+{
+  "id": "codex",
+  "name": "Codex 组合",
+  "members": ["nas", "nas2"],
+  "enabled": true,
+  "hideMembers": true
+}
+```
+
 ## Claude Code 官方 CLI 接入
 
 Claude 聊天链路使用官方 Claude Code 的 `--json-schema` / `stream-json` 能力。模型港通过 SSH 或 SSH + Docker 启动 `claude-tool-runner.py`，官方 CLI 负责认证和推理，客户端工具在调用方执行。
@@ -243,3 +268,28 @@ OpenAI 兼容 API Key 供应商支持独立的 `tokenOptimization` 配置，默�
 `test/helpers/api-token-benchmark.mjs` 是需要显式启用的真实模型基准，默认测试不会运行它。执行时必须设置 `MH_LIVE_BENCH=1` 和 `MH_BENCH_DATA`，会消耗上游额度；报告中的合成任务结果不代表生产平均节省率。
 
 DeepSeek 供应商支持账户余额查询；管理会话过期后页面会尝试重新建立会话并重试一次。
+
+
+## 局域网媒体生成 Skill
+
+「生成图像」提供 Codex 生图、Grok 生图 Skill ZIP；「生成视频」提供 Grok 生视频 Skill ZIP。解压后将整个 skill 文件夹导入客户端或放到 `~/.codex/skills/`，重新打开客户端。需要 Python 3.9+，仅使用标准库。
+
+首次执行 skill 内 `scripts/media_client.py --configure`，交互填写网关地址和网页接入指南中的 API Key；三个 skill 共用用户目录下的 `.model-harbor/client.json`。也可设置 `MODEL_HARBOR_URL` / `MODEL_HARBOR_API_KEY`。包内不含密钥，无需分发 NAS SSH 密钥或订阅凭据。现有网关 Key 同时授权其他网关 API，只应提供给已获授权的设备。
+
+客户端接口使用 Bearer 网关 Key，不需要管理密码、浏览器 session 或 CSRF：
+
+- `GET /v1/media/{image|video}/providers`：仅返回启用服务商的 ID、名称、类型与参考图能力。
+- `POST /v1/media/{image|video}/jobs`：沿用网页任务参数与校验；最多三张 base64 data URL 参考图。
+- `GET /v1/media/{image|video}/jobs/:id`：查询任务。
+- `GET /v1/media/{image|video}/files/:id`：取回原始文件。
+
+脚本打印任务 ID，轮询并下载原始字节，输出绝对路径、大小及 SHA-256。用 `--job-id` 恢复查询和下载，不重新生成；默认拒绝覆盖。同一网关 Key 的客户端共享媒体任务访问权限。媒体生成使用已配置服务商的额度。
+
+维护下载包：修改 `examples/media-client.py` 或 `examples/build-media-skills.py` 后运行 `python3 examples/build-media-skills.py`，重新构建并部署镜像。下载地址 `/api/skills/model-harbor-{codex-image|grok-image|grok-video}.zip`，受管理登录和会话保护。
+
+
+## 供应商管理布局
+
+供应商和 Codex 账号组采用单列行布局，用量窗口并排显示；窄屏自动换行。保留余额、用量刷新、额度重置、成员排序、冷却重置及编辑删除等操作。
+
+Grok CLI 执行器使用 `--verbatim` 保留完整提示词，并按固定原因码报告认证、额度、上下文和结构化输出错误；不会把原始 stderr 或凭据返回客户端。

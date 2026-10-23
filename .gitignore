@@ -28,3 +28,8 @@ __pycache__/
 *-backup-*/
 .DS_Store
 Thumbs.db
+
+# Public downloadable skill packages served by /api/skills/.
+!/src/media-skills/model-harbor-codex-image.zip
+!/src/media-skills/model-harbor-grok-image.zip
+!/src/media-skills/model-harbor-grok-video.zip

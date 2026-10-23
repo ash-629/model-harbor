@@ -151,3 +151,14 @@ test('schema data keys and defaults are preserved while only schema pointers are
  assert.deepEqual(s.properties,parameters.properties);assert.deepEqual(s.default,parameters.default);
  assert.equal(matchesSchema('x',{if:false,else:{const:'y'}}),false);assert.equal(matchesSchema({a:1},{propertyNames:false}),false);assert.equal(matchesSchema([1],{contains:false}),false);assert.equal(matchesSchema('x',{not:false}),true);
 });
+
+test('runner errors expose fixed diagnoses without leaking CLI text',()=>{
+ const c=grokContext(body,'responses');
+ for(const reason of ['missing_auth','auth_failed','rate_limited','context_limit','schema_rejected','upstream_failed','cli_failed','missing_structured_output','invalid_cli_output','permission_denied','runner_failed']){
+  assert.throws(()=>grokResult({is_error:true,bridge_error:reason,stderr:'SECRET_MARKER'},c,body.model),e=>e.status===502&&e.code==='grok_cli_error'&&e.message.includes(reason)&&!e.message.includes('SECRET_MARKER'));
+ }
+ assert.throws(()=>grokResult({is_error:true,bridge_error:'SECRET_MARKER'},c,body.model),e=>e.message.includes('runner_failed')&&!e.message.includes('SECRET_MARKER'));
+ assert.throws(()=>grokResult({is_error:true,bridge_error:'timeout'},c,body.model),e=>e.status===504);
+ assert.throws(()=>grokResult(ok(call('t1',{cmd:7})),c,body.model),e=>e.message.includes('tool_arguments_schema'));
+ assert.throws(()=>grokResult(ok({kind:'tool_calls',text:'',calls:[]}),c,body.model),e=>e.message.includes('kind_calls_mismatch'));
+});

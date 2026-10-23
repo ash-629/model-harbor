@@ -4,7 +4,7 @@ import { t, getLanguage, setLanguage, captureStaticText, translateError } from '
 // P-01/P-02: provider CRUD, model directory, connection instructions, real request test.
 const $ = id => document.getElementById(id);
 const h = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
-let csrf, state = { providers: [], models: [], logs: [] }, editing = null, busy = false, testBusy = false, keyVisible = false, connectionKey = '';
+let csrf, state = { providers: [], groups: [], models: [], logs: [] }, editing = null, busy = false, testBusy = false, keyVisible = false, connectionKey = '';
 let toastTimer, currentView = 'overview', saving = false, refreshing = false;
 const translateStatic = captureStaticText();
 const errorsById = new Map();
@@ -212,7 +212,7 @@ async function load() {
 }
 function renderSelectors() {
   const selected = $('provider-filter').value;
-  $('provider-filter').innerHTML = `<option value="">${t('所有供应商')}</option>` + state.providers.map(p => `<option value="${h(p.id)}">${h(p.name)}</option>`).join('');
+  $('provider-filter').innerHTML = `<option value="">${t('所有供应商')}</option>` + state.providers.map(p => `<option value="${h(p.id)}">${h(p.name)}</option>`).join('') + (state.groups || []).map(g => `<option value="${h(g.id)}">${h(g.name)}</option>`).join('');
   if (state.providers.some(p => p.id === selected)) $('provider-filter').value = selected;
   const selectedModel = $('test-model').value;
   $('test-model').innerHTML = state.models.length ? state.models.map(m => `<option value="${h(m.id)}">${h(m.id)}</option>`).join('') : `<option value="">${t('请先添加模型')}</option>`;
@@ -227,14 +227,77 @@ function renderModels() {
   $('models-empty').querySelector('h3').textContent = state.models.length ? t('没有匹配的模型') : t('把第一个模型接进来');
   $('models-empty').querySelector('p').textContent = state.models.length ? t('试试其他关键词或切换供应商筛选。') : t('添加供应商并刷新模型，或手动填写模型 ID。');
   $('empty-add').hidden = Boolean(state.models.length);
-  $('models-body').innerHTML = models.map(m => `<tr><td><span class="model-name" title="${h(m.name)}">${h(m.name)}</span><code class="model-id">${h(m.id)}</code></td><td><span class="source-badge">${h(m.provider_name)}</span></td><td><span class="source-badge ${m.source === 'nas-codex' || m.source === 'claude-code' || m.source === 'grok-code' ? 'bridge-badge' : ''}">${m.source === 'nas-codex' ? t('Codex 工具桥接') : m.source === 'claude-code' ? t('Claude 工具桥接') : m.source === 'grok-code' ? t('Grok 工具桥接') : 'API'}</span></td><td><button class="button ghost" data-test="${h(m.id)}">${t('测试 ↗')}</button></td></tr>`).join('');
+  $('models-body').innerHTML = models.map(m => `<tr><td><span class="model-name" title="${h(m.name)}">${h(m.name)}</span><code class="model-id">${h(m.id)}</code></td><td><span class="source-badge">${h(m.provider_name)}</span></td><td><span class="source-badge ${m.source === 'nas-codex' || m.source === 'codex-group' || m.source === 'claude-code' || m.source === 'grok-code' ? 'bridge-badge' : ''}">${m.source === 'nas-codex' || m.source === 'codex-group' ? t('Codex 工具桥接') : m.source === 'claude-code' ? t('Claude 工具桥接') : m.source === 'grok-code' ? t('Grok 工具桥接') : 'API'}</span></td><td><button class="button ghost" data-test="${h(m.id)}">${t('测试 ↗')}</button></td></tr>`).join('');
   $('model-footer').textContent = t('共 {count} 个模型 · 仅显示已启用供应商的配置模型', {count: models.length});
   $('refresh-all').disabled = busy || !state.providers.some(p => p.enabled);
 }
 function renderProviders() {
   $('providers-empty').hidden = Boolean(state.providers.length);
   $('providers-grid').innerHTML = state.providers.map(p => `<article class="panel provider-card"><div class="provider-top"><div class="provider-mark">${p.type === 'nas-codex' ? '⌂' : p.type === 'claude-code' ? '✦' : h(p.name.slice(0, 1).toUpperCase())}</div><span class="status-pill ${p.enabled ? '' : 'off'}">${p.enabled ? t('已启用') : t('已停用')}</span></div><h3>${h(p.name)}</h3><code class="model-id">${h(p.id)} / ${p.type === 'nas-codex' ? (p.execution === 'ssh' ? 'Codex · SSH' : 'Codex · SSH + Docker') : p.type === 'claude-code' ? (p.execution === 'ssh' ? 'Claude · SSH' : 'Claude · SSH + Docker') : openCodeGoProvider(p) ? t('Chat + Responses · 自动路由') : h(p.protocol)}</code><p>${h(p.baseUrl || `${p.sshUser}@${p.sshHost}${p.execution === 'ssh' ? '' : ' · ' + p.container}`)}</p><div class="provider-meta"><span>${t('{count} 个模型', {count: p.models.length})}</span><span>·</span><span>${p.lastSync ? t('同步于 {time}', {time: new Date(p.lastSync).toLocaleTimeString(getLanguage(), {hour:'2-digit',minute:'2-digit'})}) : t('尚未同步')}</span></div>${usageMarkup(p)}<div class="provider-actions"><button class="button ghost" data-refresh="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('↻ 刷新模型')}</button><button class="button ghost" data-edit="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('编辑')}</button><button class="button ghost danger" data-delete="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('删除')}</button></div></article>`).join('');
+  renderGroups();
 }
+
+let groupEditing = null, groupMemberIds = [];
+const groupById = id => (state.groups || []).find(g => g.id === id);
+
+function renderGroupChoices() {
+  const codex = state.providers.filter(p => p.type === 'nas-codex');
+  const chosen = groupMemberIds.map(id => codex.find(p => p.id === id) || state.providers.find(p => p.id === id)).filter(Boolean);
+  const rest = codex.filter(p => !groupMemberIds.includes(p.id));
+  const row = (p, index) => `<div class="group-choice${index >= 0 ? ' chosen' : ''}"><label><input type="checkbox" data-gm="${h(p.id)}" ${index >= 0 ? 'checked' : ''}> ${h(p.name)} <code>${h(p.id)}</code></label>${index >= 0 ? `<span class="group-order"><button type="button" class="icon-button" data-gmove="${h(p.id)}" data-delta="-1" ${index === 0 ? 'disabled' : ''}>↑</button><button type="button" class="icon-button" data-gmove="${h(p.id)}" data-delta="1" ${index === chosen.length - 1 ? 'disabled' : ''}>↓</button></span>` : ''}</div>`;
+  const html = chosen.map((p, i) => row(p, i)).join('') + rest.map(p => row(p, -1)).join('');
+  $('g-choices').innerHTML = html || `<div class="muted small">${t('没有可用的 Codex 供应商，请先添加并登录。')}</div>`;
+}
+
+function openGroupEditor(id) {
+  const g = id ? groupById(id) : null;
+  groupEditing = g ? g.id : null;
+  groupMemberIds = g ? g.members.map(m => m.id) : [];
+  $('g-name').value = g ? g.name : '';
+  $('g-id').value = g ? g.id : '';
+  $('g-id').disabled = Boolean(g);
+  $('g-enabled').checked = g ? g.enabled : true;
+  $('g-hide').checked = g ? g.hideMembers !== false : true;
+  $('group-dialog-title').textContent = t(g ? '编辑 Codex 账号组' : '新建 Codex 账号组');
+  renderGroupChoices(); errorBox('group-error'); $('group-dialog').showModal();
+}
+
+function renderGroups() {
+  const groups = state.groups || [];
+  $('groups-empty').hidden = Boolean(groups.length);
+  $('groups-grid').innerHTML = groups.map(g => {
+    const members = g.members.map((m, i) => {
+      const till = m.cooling && m.until ? t('至 {time}', { time: new Date(m.until).toLocaleTimeString(getLanguage(), { hour: '2-digit', minute: '2-digit' }) }) : '';
+      return `<li><span class="group-rank">${i + 1}</span><span class="group-member-name">${h(m.name)}</span><code class="model-id">${h(m.container || m.id)}</code><span class="status-pill ${m.cooling ? 'off' : ''}">${m.cooling ? t('额度用尽') + till : m.enabled ? t('可用') : t('已停用')}</span><span class="group-order"><button class="icon-button" data-group="${h(g.id)}" data-group-up="${h(m.id)}" ${i === 0 ? 'disabled' : ''} title="${t('提高优先级')}">↑</button><button class="icon-button" data-group="${h(g.id)}" data-group-down="${h(m.id)}" ${i === g.members.length - 1 ? 'disabled' : ''} title="${t('降低优先级')}">↓</button></span></li>`;
+    }).join('');
+    return `<article class="panel provider-card group-card"><div class="provider-top"><div class="provider-mark">⛓</div><span class="status-pill ${g.enabled ? '' : 'off'}">${g.enabled ? t('已启用') : t('已停用')}</span></div><h3>${h(g.name)}</h3><code class="model-id">${h(g.id)}/…</code><p>${h(t('{count} 个账号 · 按优先级自动切换', { count: g.members.length }))}</p><ol class="group-member-list">${members}</ol><div class="provider-meta"><span>${h(t('{count} 个模型', { count: (g.modelIds || []).length }))}</span><span>·</span><span>${g.hideMembers !== false ? t('已隐藏单独入口') : t('保留单独入口')}</span></div><div class="provider-actions"><button class="button ghost" data-group-sync="${h(g.id)}" ${busy ? 'disabled' : ''}>${t('同步用量')}</button><button class="button ghost" data-group-clear="${h(g.id)}" ${busy ? 'disabled' : ''}>${t('重置冷却')}</button><button class="button ghost" data-group-edit="${h(g.id)}" ${busy ? 'disabled' : ''}>${t('编辑')}</button><button class="button ghost danger" data-group-delete="${h(g.id)}" ${busy ? 'disabled' : ''}>${t('删除')}</button></div></article>`;
+  }).join('');
+}
+
+async function syncGroup(id) {
+  busy = true;
+  try { await api('/groups/' + id + '/sync', { method: 'POST' }); await load(); }
+  catch (e) { errorBox('global-error', e.message); }
+  finally { busy = false; renderProviders(); }
+}
+
+async function clearGroupCooldowns(id) {
+  try { await api('/groups/' + id + '/clear-cooldowns', { method: 'POST' }); await load(); toast(t('冷却已重置')); }
+  catch (e) { errorBox('global-error', e.message); }
+}
+
+async function moveGroupMember(groupId, memberId, delta) {
+  const g = groupById(groupId); if (!g) return;
+  const ids = g.members.map(m => m.id);
+  const i = ids.indexOf(memberId), j = i + delta;
+  if (i < 0 || j < 0 || j >= ids.length) return;
+  [ids[i], ids[j]] = [ids[j], ids[i]];
+  try {
+    await api('/groups/' + groupId, { method: 'PUT', body: JSON.stringify({ id: groupId, name: g.name, members: ids, enabled: g.enabled, hideMembers: g.hideMembers !== false }) });
+    await load();
+  } catch (e) { errorBox('global-error', e.message); }
+}
+
 function tokenMetricsMarkup(m) {
   if (!m) return '';
   const u = m.usage, val = n => Number.isFinite(n) ? n.toLocaleString(getLanguage()) : '—';
@@ -246,7 +309,7 @@ function renderLogs() {
 }
 function capability() {
   const model = state.models.find(m => m.id === $('test-model').value);
-  $('test-capability').textContent = model?.source === 'nas-codex' ? t('远程 Codex 支持客户端工具调用；由客户端执行工具，远端负责推理。') : model?.source === 'claude-code' ? t('Claude Code 支持客户端 function/custom 工具；由客户端执行操作，容器负责推理。') : model?.source === 'grok-code' ? t('Grok 支持客户端 function/custom 工具；由客户端执行操作，容器负责推理。') : '';
+  $('test-capability').textContent = model?.source === 'nas-codex' || model?.source === 'codex-group' ? t('远程 Codex 支持客户端工具调用；由客户端执行工具，远端负责推理。') : model?.source === 'claude-code' ? t('Claude Code 支持客户端 function/custom 工具；由客户端执行操作，容器负责推理。') : model?.source === 'grok-code' ? t('Grok 支持客户端 function/custom 工具；由客户端执行操作，容器负责推理。') : '';
 }
 const views = new Set(['overview', 'providers', 'images', 'videos', 'logs', 'tools', 'settings']);
 function viewFromLocation() {
@@ -487,6 +550,19 @@ document.addEventListener('click', async event => {
   if (el.dataset.view) view(el.dataset.view);
   if (el.classList.contains('close-dialog')) el.closest('dialog').close();
   if (el.dataset.edit) openEditor(el.dataset.edit);
+  if (el.dataset.groupEdit) openGroupEditor(el.dataset.groupEdit);
+  if (el.dataset.groupSync) syncGroup(el.dataset.groupSync);
+  if (el.dataset.groupClear) clearGroupCooldowns(el.dataset.groupClear);
+  if (el.dataset.groupUp) moveGroupMember(el.dataset.group, el.dataset.groupUp, -1);
+  if (el.dataset.groupDown) moveGroupMember(el.dataset.group, el.dataset.groupDown, 1);
+  if (el.dataset.groupDelete && !busy) {
+    const g = groupById(el.dataset.groupDelete);
+    if (!g || !confirm(t('删除账号组「{name}」？组内供应商不会被删除。', { name: g.name }))) return;
+    busy = true;
+    try { await api('/groups/' + g.id, { method: 'DELETE' }); await load(); toast(t('账号组已删除')); }
+    catch (e) { errorBox('global-error', e.message); }
+    finally { busy = false; renderProviders(); }
+  }
   if (el.dataset.usage) loadUsage(el.dataset.usage, true);
   if (el.dataset.resetUsage) openReset(el.dataset.resetUsage);
   if (el.dataset.refresh) refresh([el.dataset.refresh]);
@@ -559,6 +635,30 @@ $('copy-url-openai').addEventListener('click', () => copy(apiBase('openai')));
 $('copy-url-anthropic').addEventListener('click', () => copy(apiBase('anthropic')));
 $('connect-copy-url').addEventListener('click', () => copy(connectionURL()));
 ['add-btn', 'empty-add'].forEach(id => $(id).addEventListener('click', () => openEditor()));
+$('add-group').addEventListener('click', () => openGroupEditor());
+$('g-choices').addEventListener('change', event => {
+  const id = event.target.dataset.gm; if (!id) return;
+  if (event.target.checked) { if (!groupMemberIds.includes(id)) groupMemberIds.push(id); }
+  else groupMemberIds = groupMemberIds.filter(m => m !== id);
+  renderGroupChoices();
+});
+$('g-choices').addEventListener('click', event => {
+  const el = event.target.closest('button[data-gmove]'); if (!el) return;
+  const id = el.dataset.gmove, delta = Number(el.dataset.delta);
+  const i = groupMemberIds.indexOf(id), j = i + delta;
+  if (i < 0 || j < 0 || j >= groupMemberIds.length) return;
+  [groupMemberIds[i], groupMemberIds[j]] = [groupMemberIds[j], groupMemberIds[i]];
+  renderGroupChoices();
+});
+$('group-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (!groupMemberIds.length) return errorBox('group-error', t('请至少选择一个 Codex 供应商'));
+  const payload = { id: $('g-id').value.trim(), name: $('g-name').value.trim(), members: groupMemberIds, enabled: $('g-enabled').checked, hideMembers: $('g-hide').checked };
+  try {
+    await api(groupEditing ? '/groups/' + groupEditing : '/groups', { method: groupEditing ? 'PUT' : 'POST', body: JSON.stringify(payload) });
+    $('group-dialog').close(); await load(); toast(t('账号组已保存'));
+  } catch (e) { errorBox('group-error', e.message); }
+});
 $('search').addEventListener('input', renderModels); $('provider-filter').addEventListener('change', renderModels);
 $('test-model').addEventListener('change', capability);
 $('refresh-all').addEventListener('click', () => refresh(state.providers.filter(p => p.enabled).map(p => p.id)));

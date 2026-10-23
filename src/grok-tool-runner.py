@@ -20,6 +20,21 @@ SYSTEM_PROMPT = (
 DENY_TOOLS = ('Bash', 'Edit', 'Read', 'Grep', 'MCPTool', 'WebFetch', 'WebSearch')
 
 
+def failure_reason(details):
+    # Classify explicit errors without exposing stderr, prompts or credentials.
+    patterns = (
+        ('auth_failed', r'not logged in|authentication failed|invalid (?:access )?token|token expired|unauthorized|http[ /:]*(?:401|403)\b'),
+        ('rate_limited', r'rate.?limit|too many requests|quota exceeded|insufficient (?:credits|quota)|http[ /:]*429\b'),
+        ('context_limit', r'context (?:window|length|limit)|maximum context|too many (?:input )?tokens|prompt (?:is )?too long'),
+        ('schema_rejected', r'invalid (?:json )?schema|schema (?:validation failed|not supported)|unsupported schema'),
+        ('upstream_failed', r'connection (?:reset|refused)|fetch failed|network error|service unavailable|bad gateway|http[ /:]*5\d\d\b'),
+    )
+    for reason, pattern in patterns:
+        if re.search(pattern, details, re.IGNORECASE):
+            return reason
+    return 'cli_failed'
+
+
 def parse_output(raw):
     try:
         payload = json.loads(raw)
@@ -87,7 +102,7 @@ def run(request, cli='grok'):
         os.mkdir(grok_home)
         os.symlink(source_auth, os.path.join(grok_home, 'auth.json'))
         args = [
-            cli, '--no-auto-update', '--prompt-file', prompt_path,
+            cli, '--no-auto-update', '--verbatim', '--prompt-file', prompt_path,
             '--output-format', 'json', '--json-schema', encoded,
             '--model', model, '--permission-mode', 'dontAsk',
             '--no-plan', '--no-subagents', '--disable-web-search',
@@ -130,7 +145,8 @@ def run(request, cli='grok'):
                         child.wait()
                     raise ValueError('timeout')
                 if child.returncode:
-                    raise ValueError('cli_failed')
+                    err.seek(0)
+                    raise ValueError(failure_reason(err.read(8192).decode('utf-8', 'replace')))
                 if out.tell() > 16 * 1024 * 1024:
                     raise ValueError('output_too_large')
                 out.seek(0)
@@ -177,6 +193,7 @@ if __name__ == '__main__':
             'invalid_payload', 'schema_too_large', 'timeout', 'cli_failed',
             'output_too_large', 'invalid_cli_output', 'missing_structured_output',
             'permission_denied', 'missing_auth', 'invalid_cli', 'request_too_large',
+            'auth_failed', 'rate_limited', 'context_limit', 'schema_rejected', 'upstream_failed',
         }
         reason = str(error) if isinstance(error, ValueError) and str(error) in known else 'runner_failed'
         print(json.dumps({'type': 'result', 'subtype': 'error', 'is_error': True, 'bridge_error': reason}))

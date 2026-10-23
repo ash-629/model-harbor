@@ -1,5 +1,14 @@
 // UI-only language preference. Model IDs, provider names and user input are never translated.
 export const messages = {
+"图片 Skill 下载": "Image skill downloads",
+"局域网电脑导入后，直接调用远程生成并取回文件。": "Import on a LAN computer to generate remotely and retrieve files.",
+"需要 Python 3.9+；首次配置一次模型港 API Key，三个 Skill 共用。无需 SSH 密钥或本机订阅登录。": "Requires Python 3.9+. Configure the Model Harbor API key once for all three skills. No SSH key or local subscription login needed.",
+"解压后将整个 Skill 文件夹导入客户端，或放入 ~/.codex/skills/，重新打开客户端。首次使用按 SKILL.md 运行 --configure。": "Extract the skill folder and import it into your client, or place it in ~/.codex/skills/ and reopen the client. Run --configure as described in SKILL.md before first use.",
+"如何导入和配置？": "How do I import and configure it?",
+"下载 Codex 生图 Skill ↓": "Download Codex Image Skill ↓",
+"下载 Grok 生图 Skill ↓": "Download Grok Image Skill ↓",
+"视频 Skill 下载": "Video skill downloads",
+"下载 Grok 生视频 Skill ↓": "Download Grok Video Skill ↓",
 "检测到新版本，正在下载安装包": "New version found. Downloading the package.",
 "工具已是最新版本": "The tool is up to date.",
 
@@ -656,3 +665,40 @@ export function captureStaticText() {
     for (const [el, name, key] of attributes) el.setAttribute(name, t(key));
   };
 }
+
+Object.assign(messages, {
+  "Codex 账号组": "Codex account groups",
+  "把多个 Codex 供应商合成一个入口；按优先级自动切换，额度用尽自动换下一个。": "Combine several Codex providers behind one entry. Accounts are tried by priority and switch automatically when a quota runs out.",
+  "＋ 新建组": "+ New group",
+  "还没有账号组": "No account groups yet",
+  "添加两个以上 Codex 供应商后，可以把它们合成一个组。": "Once you have two or more Codex providers, you can combine them into one group.",
+  "新建 Codex 账号组": "New Codex account group",
+  "编辑 Codex 账号组": "Edit Codex account group",
+  "组名称": "Group name",
+  "模型前缀": "Model prefix",
+  "模型会显示为 前缀/模型名，例如 codex/gpt-6.1-sol。": "Models appear as prefix/model, for example codex/gpt-6.1-sol.",
+  "启用此组": "Enable this group",
+  "隐藏组内供应商的单独模型（调用方只看到组入口）": "Hide the members' individual models (callers only see the group entry)",
+  "勾选 Codex 供应商；勾选顺序就是优先级，可用 ↑↓ 调整。": "Select Codex providers. Selection order is priority; use \u2191\u2193 to reorder.",
+  "没有可用的 Codex 供应商，请先添加并登录。": "No Codex providers available. Add and sign in to one first.",
+  "请至少选择一个 Codex 供应商": "Select at least one Codex provider",
+  "账号组已保存": "Account group saved",
+  "账号组已删除": "Account group deleted",
+  "删除账号组「{name}」？组内供应商不会被删除。": "Delete account group \"{name}\"? Member providers are kept.",
+  "额度用尽": "Quota exhausted",
+  "可用": "Ready",
+  "至 {time}": " until {time}",
+  "{count} 个账号 · 按优先级自动切换": "{count} accounts \u00b7 automatic failover by priority",
+  "已隐藏单独入口": "Individual entries hidden",
+  "保留单独入口": "Individual entries kept",
+  "同步用量": "Sync usage",
+  "重置冷却": "Reset cooldown",
+  "冷却已重置": "Cooldown cleared"
+});
+Object.assign(messages, {
+  "保存组": "Save group",
+  "例如：Codex 合并组": "e.g. Codex combined",
+  "例如：codex": "e.g. codex",
+  "提高优先级": "Raise priority",
+  "降低优先级": "Lower priority"
+});

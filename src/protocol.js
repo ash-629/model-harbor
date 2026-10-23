@@ -70,7 +70,7 @@ export function normalizeChatToolMessages(payload) {
   flushImages();
   return changed ? { ...payload, messages } : payload;
 }
-export function toChat(body, plan = chatToolPlan(body), reasoningScope = '') {
+export function toChat(body, plan = chatToolPlan(body), reasoningScope = '', options = {}) {
   for (const key of ['previous_response_id', 'conversation', 'background']) if (body[key]) unsupported(`Chat 上游不支持 ${key}，请发送完整历史或选择原生 Responses 上游`);
   if (body.store === true) unsupported('Chat 上游不支持 store=true；请使用无状态请求');
   if (body.truncation && body.truncation !== 'disabled') unsupported('Chat 上游不支持自动 truncation');
@@ -104,6 +104,7 @@ export function toChat(body, plan = chatToolPlan(body), reasoningScope = '') {
       }
       const reasoning = pendingReasoning || cachedReasoning(reasoningScope, item.call_id);
       if (reasoning && !assistant.reasoning_content) assistant.reasoning_content = reasoning;
+      else if (!reasoning && options.fillReasoning === true && assistant.reasoning_content === undefined) assistant.reasoning_content = '';
       pendingReasoning = '';
     } else if (['function_call_output', 'custom_tool_call_output', 'tool_search_output'].includes(item.type)) {
       pendingReasoning = '';

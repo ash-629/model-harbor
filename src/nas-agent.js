@@ -507,11 +507,11 @@ export class NasAgentBridge {
         'codex_models_failed');
     } finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); rpc.close(); this.usageReaders.delete(rpc); }
   }
-  async usage(p, signal) {
+  async usage(p, signal, force = false) {
     if (p.type !== 'nas-codex') throw new HttpError(400, '仅 Codex 供应商支持账号用量查询');
     if (signal?.aborted) throw new HttpError(499, '请求已取消');
     const signature = JSON.stringify(p), cached = this.usageCache.get(p.id), generation = this.usageGeneration;
-    if (cached?.signature === signature && Date.now() - cached.at < 30000) return structuredClone(cached.value);
+    if (!force && cached?.signature === signature && Date.now() - cached.at < 30000) return structuredClone(cached.value);
     if (this.usageReaders.size >= 4) throw new HttpError(429, '用量查询繁忙，请稍后重试');
     const rpc = new RPC(this.launch(p)); this.usageReaders.add(rpc);
     let timedOut = false;
@@ -719,14 +719,17 @@ export function agentChat(response) {
     ...(response.usage ? { usage: { prompt_tokens: response.usage.input_tokens, completion_tokens: response.usage.output_tokens, total_tokens: response.usage.total_tokens } } : {}) };
 }
 
-export async function sendAgent(bridge, p, model, body, endpoint, res, signal) {
+export async function sendAgent(bridge, p, model, body, endpoint, res, signal, options = {}) {
   if (!body.stream) { const response = await bridge.run(p, model, body, endpoint, signal); return endpoint === 'responses' ? response : agentChat(response); }
   const normalized = agentInput(body, endpoint); validateAgent(normalized); const toolPlan = toolSpecs(normalized.tools, normalized.tool_choice);
-  openSSE(res); let seq = 0;
+  const deferred = options.deferOpen === true;
+  if (!deferred) openSSE(res);
+  let seq = 0;
   const emit = (type, fields) => writeSSE(res, { type, sequence_number: seq++, ...fields }, type);
   const initial = budgetResponse(responseBase(body.model), outputBudget(normalized));
-  if (endpoint === 'responses') { await emit('response.created', { response: initial }); await emit('response.in_progress', { response: initial }); }
-  const heartbeat = setInterval(() => { if (!res.destroyed) res.write(': keepalive\n\n'); }, 15000); heartbeat.unref();
+  if (!deferred && endpoint === 'responses') { await emit('response.created', { response: initial }); await emit('response.in_progress', { response: initial }); }
+  let heartbeat = null;
+  if (!deferred) { heartbeat = setInterval(() => { if (!res.destroyed) res.write(': keepalive\n\n'); }, 15000); heartbeat.unref(); }
   const streamed = new Set(), live = new Map();
   const ensureMessage = async item => {
     if (!item?.id) return null;
@@ -763,8 +766,14 @@ export async function sendAgent(bridge, p, model, body, endpoint, res, signal) {
   };
   // Native web search can emit a separate output item before the final message;
   // keep that path buffered so its output indices remain stable.
-  const liveText = endpoint === 'responses' && toolPlan.webSearch.mode === 'disabled';
-  let response; try { response = await bridge.run(p, model, body, endpoint, signal, liveText ? onEvent : undefined); } finally { clearInterval(heartbeat); }
+  const liveText = !deferred && endpoint === 'responses' && toolPlan.webSearch.mode === 'disabled';
+  let response;
+  try { response = await bridge.run(p, model, body, endpoint, signal, liveText ? onEvent : undefined); }
+  finally { clearInterval(heartbeat); }
+  if (deferred) {
+    openSSE(res);
+    if (endpoint === 'responses') { await emit('response.created', { response: initial }); await emit('response.in_progress', { response: initial }); }
+  }
   response.id = initial.id;
   if (endpoint === 'responses') {
     for (let index = 0; index < response.output.length; index++) {

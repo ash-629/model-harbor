@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { Store, HttpError } from './store.js';
 import { AdminAuth } from './admin-auth.js';
 import { sendMessages, errorType as anthropicErrorType } from './anthropic.js';
-import { route, discover } from './upstream.js';
+import { route, routeWithFailover, discover } from './upstream.js';
 import { writeSSE } from './protocol.js';
 import { NasAgentBridge } from './nas-agent.js';
 import { ImageProviders } from './image-providers.js';
@@ -24,6 +24,7 @@ import { authorizeOpenCodeGo, isOpenCodeGoProvider, classifyOpenCodeGoModel } fr
 import { openCodeGoUsage } from './opencode-go-usage.js';
 import { OpenCodeGoAuth } from './opencode-go-auth.js';
 import { ToolDownloads } from './tools.js';
+import { mediaAPI } from './media-api.js';
 const root = fileURLToPath(new URL('..', import.meta.url));
 const publicDir = path.join(root, 'public');
 const equal = (a, b) => { const aa = Buffer.from(a || ''), bb = Buffer.from(b || ''); return aa.length === bb.length && crypto.timingSafeEqual(aa, bb); };
@@ -46,6 +47,24 @@ function clientSessionId(req) {
   }
   return '';
 }
+async function syncGroupCooldowns(store, group, nasAgent, signal) {
+  for (const id of group.members || []) {
+    const provider = store.data.providers.find(p => p.id === id);
+    if (!provider || provider.type !== 'nas-codex' || !provider.enabled) continue;
+    try {
+      const usage = await nasAgent.usage(provider, signal, true);
+      const windows = (usage?.buckets || []).flatMap(bucket => bucket.windows || []);
+      const exhausted = windows.filter(w => Number(w.usedPercent) >= 100 && Number(w.resetsAt) > 0);
+      if (exhausted.length) {
+        const until = Math.max(Date.now() + 60 * 1000, ...exhausted.map(w => Number(w.resetsAt) * 1000));
+        store.setGroupCooldown(group.id, id, { until, kind: 'quota', at: new Date().toISOString() });
+      } else {
+        store.clearGroupCooldown(group.id, id);
+      }
+    } catch {}
+  }
+}
+
 export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, publicUrl, adminPassword, nasAgent = new NasAgentBridge(), claudeBridge = new ClaudeCodeBridge(), grokBridge = new GrokCodeBridge(), apiBodyLimitMb = 128 } = {}) {
   if (!Number.isInteger(apiBodyLimitMb) || apiBodyLimitMb < 1 || apiBodyLimitMb > 256) throw new Error('GATEWAY_API_BODY_LIMIT_MB 必须是 1–256 的整数');
   const external = publicUrl ? new URL(publicUrl) : null;
@@ -80,6 +99,10 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
       const url = new URL(req.url, 'http://' + req.headers.host), pathname = url.pathname;
       const method = req.method;
       const requestSessionId = clientSessionId(req);
+      if (pathname.startsWith('/v1/media/')) {
+        if (!equal(req.headers.authorization, `Bearer ${store.gatewayKey()}`)) throw new HttpError(401, '无效的网关 API Key', 'invalid_api_key');
+        return await mediaAPI({ pathname, method, url, req, res, imageProviders, videoProviders, imageJobs, videoJobs, json, readBody });
+      }
       if (adminAuth.enabled && pathname !== '/health' && !/^\/v1(?:\/|$)/.test(pathname)) {
         if (!await adminAuth.accepts(req.headers.authorization)) {
           res.setHeader('www-authenticate', 'Basic realm="Model Harbor", charset="UTF-8"');
@@ -117,6 +140,14 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
           const { file, name } = toolDownloads.file();
           res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': fs.statSync(file).size,
             'content-disposition': `attachment; filename="${name}"` });
+          const stream = fs.createReadStream(file);
+          stream.on('error', () => res.destroy()); res.on('close', () => stream.destroy()); stream.pipe(res); return;
+        }
+        const skillDownload = /^\/api\/skills\/(model-harbor-(?:codex-image|grok-image|grok-video))\.zip$/.exec(pathname);
+        if (skillDownload && method === 'GET') {
+          const name = skillDownload[1] + '.zip';
+          const file = path.join(root, 'src', 'media-skills', name);
+          res.writeHead(200, { 'content-type': 'application/zip', 'content-length': fs.statSync(file).size, 'content-disposition': `attachment; filename="${name}"` });
           const stream = fs.createReadStream(file);
           stream.on('error', () => res.destroy()); res.on('close', () => stream.destroy()); stream.pipe(res); return;
         }
@@ -172,9 +203,30 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
           res.writeHead(200, { 'content-type': 'text/x-python; charset=utf-8', 'content-disposition': 'attachment; filename="grok-video-runner.py"' });
           return res.end(fs.readFileSync(grokVideoRunnerFile));
         }
-        if (pathname === '/api/config' && method === 'GET') return json(res, 200, { providers: store.list(), models: store.models(), logs, baseUrl: `${external?.origin || `http://127.0.0.1:${actualPort}`}/v1` });
+        if (pathname === '/api/config' && method === 'GET') return json(res, 200, { providers: store.list(), groups: store.listGroups(), models: store.models(), logs, baseUrl: `${external?.origin || `http://127.0.0.1:${actualPort}`}/v1` });
         if (pathname === '/api/key' && method === 'GET') return json(res, 200, { key: store.gatewayKey() });
         if (pathname === '/api/providers' && method === 'POST') return json(res, 201, store.upsert(await readBody(req)));
+        if (pathname === '/api/groups' && method === 'GET') return json(res, 200, { groups: store.listGroups() });
+        if (pathname === '/api/groups' && method === 'POST') {
+          const created = store.upsertGroup(await readBody(req));
+          await syncGroupCooldowns(store, store.getGroup(created.id), nasAgent, controller.signal);
+          return json(res, 201, store.publicGroup(store.getGroup(created.id)));
+        }
+        const groupMatch = /^\/api\/groups\/([a-z0-9_-]+)(?:\/(clear-cooldowns|sync))?$/.exec(pathname);
+        if (groupMatch) {
+          const [, groupId, groupAction] = groupMatch;
+          const group = store.getGroup(groupId);
+          if (method === 'PUT' && !groupAction) {
+            store.upsertGroup(await readBody(req), groupId);
+            return json(res, 200, store.publicGroup(store.getGroup(groupId)));
+          }
+          if (method === 'DELETE' && !groupAction) { store.removeGroup(groupId); return json(res, 200, { deleted: true }); }
+          if (method === 'POST' && groupAction === 'clear-cooldowns') { store.clearGroupCooldowns(groupId); return json(res, 200, store.publicGroup(group)); }
+          if (method === 'POST' && groupAction === 'sync') {
+            await syncGroupCooldowns(store, group, nasAgent, controller.signal);
+            return json(res, 200, store.publicGroup(group));
+          }
+        }
         if (pathname === '/api/opencode-go/authorize' && method === 'POST') return json(res, 200, await authorizeOpenCodeGo(store, await readBody(req), { signal: controller.signal }));
         if (pathname === '/api/opencode-go/auth/start' && method === 'POST') return json(res, 200, await openCodeAuth.start(sessionId, await readBody(req), controller.signal));
         const openCodeAuthMatch = /^\/api\/opencode-go\/auth\/([a-f0-9-]{36})\/(poll|cancel)$/.exec(pathname);
@@ -207,11 +259,12 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
         if (pathname === '/api/test' && method === 'POST') {
           const input = await readBody(req);
           if (typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 16000) throw new HttpError(400, '请输入测试内容（最多 16000 字符）');
-          const { provider, model } = store.resolve(input.model);
+          const resolved = store.resolve(input.model);
+          const { provider, model } = resolved;
           const endpoint = provider.protocol === 'responses' || (isOpenCodeGoProvider(provider) && classifyOpenCodeGoModel(model) === 'responses') ? 'responses' : 'chat/completions';
           const body = endpoint === 'responses' ? { model: input.model, input: input.prompt, store: false } : { model: input.model, messages: [{ role: 'user', content: input.prompt }] };
           requestModel = body.model; requestEndpoint = 'test';
-          const output = await route(store, provider, model, body, endpoint, res, controller.signal, nasAgent, claudeBridge, requestSessionId, grokBridge);
+          const output = await routeWithFailover(store, resolved, body, endpoint, res, controller.signal, nasAgent, claudeBridge, requestSessionId, grokBridge);
           const text = output.choices?.[0]?.message?.content ?? output.output?.filter(i => i.type === 'message').flatMap(i => i.content || []).map(c => c.text || c.refusal || '').join('\n') ?? '';
           log({ model: body.model, endpoint: 'test', status: 200, duration: Date.now() - started, ...(res.apiMetrics ? { tokenMetrics: res.apiMetrics } : {}) });
           return json(res, 200, { text, usage: output.usage, duration: Date.now() - started, ...(res.apiMetrics ? { tokenMetrics: res.apiMetrics } : {}) });
@@ -226,8 +279,8 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
           const body = await readBody(req, apiBodyLimitMb * 1024 * 1024);
           requestModel = body.model; requestEndpoint = 'messages';
           if (req.headers['anthropic-version'] && req.headers['anthropic-version'] !== '2023-06-01') throw new HttpError(400, 'Unsupported anthropic-version; use 2023-06-01');
-          const {provider, model} = store.resolve(body.model);
-          const result = await sendMessages(body, res, (request, target) => route(store, provider, model, request, 'responses', target, controller.signal, nasAgent, claudeBridge, requestSessionId, grokBridge));
+          const resolved = store.resolve(body.model);
+          const result = await sendMessages(body, res, (request, target) => routeWithFailover(store, resolved, request, 'responses', target, controller.signal, nasAgent, claudeBridge, requestSessionId, grokBridge));
           log({model:body.model,endpoint:'messages',status:200,duration:Date.now()-started,...(res.apiMetrics?{tokenMetrics:res.apiMetrics}:{})});
           if (result) json(res,200,result);
           return;
@@ -235,9 +288,9 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
         if (['/v1/chat/completions', '/v1/responses'].includes(pathname) && method === 'POST') {
           const body = await readBody(req, apiBodyLimitMb * 1024 * 1024);
           if (body.stream !== undefined && typeof body.stream !== 'boolean') throw new HttpError(400, 'stream 必须为布尔值');
-          const { provider, model } = store.resolve(body.model);
+          const resolved = store.resolve(body.model);
           const endpoint = pathname.slice(4); requestModel = body.model; requestEndpoint = endpoint;
-          const result = await route(store, provider, model, body, endpoint, res, controller.signal, nasAgent, claudeBridge, requestSessionId, grokBridge);
+          const result = await routeWithFailover(store, resolved, body, endpoint, res, controller.signal, nasAgent, claudeBridge, requestSessionId, grokBridge);
           log({ model: body.model, endpoint, status: 200, duration: Date.now() - started, ...(res.apiMetrics ? { tokenMetrics: res.apiMetrics } : {}) });
           if (result) json(res, 200, result);
           return;

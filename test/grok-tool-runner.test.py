@@ -53,6 +53,7 @@ class Tests(unittest.TestCase):
         args = seen['args']
         self.assertEqual(args[0], '/home/dev/.local/bin/grok')
         self.assertIn('--no-auto-update', args)
+        self.assertIn('--verbatim', args)
         self.assertIn('--json-schema', args)
         self.assertEqual(args[args.index('--tools') + 1], '')
         self.assertEqual(args[args.index('--max-turns') + 1], '1')
@@ -66,6 +67,21 @@ class Tests(unittest.TestCase):
         self.assertEqual(result['structured_output']['text'], 'ok')
         self.assertEqual(result['usage']['input_tokens'], 2)
         self.assertEqual(result['usage']['cache_read_input_tokens'], 3)
+
+
+    def test_error_classification_never_returns_cli_text(self):
+        for text, reason in [
+            ('Unauthorized HTTP 401 token=SECRET', 'auth_failed'),
+            ('rate limit exceeded SECRET', 'rate_limited'),
+            ('maximum context length exceeded SECRET', 'context_limit'),
+            ('invalid JSON schema SECRET', 'schema_rejected'),
+            ('network error SECRET', 'upstream_failed'),
+            ('unknown failure SECRET', 'cli_failed'),
+        ]:
+            self.assertEqual(runner.failure_reason(text), reason)
+        for payload in [{'text': 'not JSON SECRET'}, {'structuredOutput': []}]:
+            with self.assertRaisesRegex(ValueError, 'missing_structured_output'):
+                runner.parse_output(json.dumps(payload))
 
     def test_bad_envelopes_fail_before_launch(self):
         values = [

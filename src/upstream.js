@@ -109,10 +109,11 @@ export async function discover(store, p, signal, nasAgent) {
   if (!Array.isArray(data.data)) throw new HttpError(502, '上游模型接口未返回 data 数组，请手工填写模型');
   return data.data.map(m => m.id);
 }
-export async function route(store, p, model, body, endpoint, res, signal, nasAgent, claudeBridge = defaultClaudeBridge, requestSessionId = '', grokBridge = defaultGrokBridge) {
+export async function route(store, p, model, body, endpoint, res, signal, nasAgent, claudeBridge = defaultClaudeBridge, requestSessionId = '', grokBridge = defaultGrokBridge, options = {}) {
   if (p.type === 'nas-codex') {
     if (!nasAgent) throw new HttpError(502, 'Codex 官方 app-server 桥接未初始化', 'codex_bridge_unavailable');
-    return sendAgent(nasAgent, p, model, body, endpoint, res, signal);
+    res.apiMetrics = { provider: p.id, protocol: 'chat', usage: null, completion: 'pending' };
+    return sendAgent(nasAgent, p, model, body, endpoint, res, signal, options);
   }
   if (p.type === 'claude-code') {
     return sendClaude(claudeBridge, p, model, body, endpoint, res, signal);
@@ -134,10 +135,16 @@ export async function route(store, p, model, body, endpoint, res, signal, nasAge
   const native = go ? group : p.protocol === 'responses' ? 'responses' : p.protocol === 'both' ? publicFamily : 'chat';
   const bridge = publicFamily === 'responses' && native === 'chat';
   const chatToResp = publicFamily === 'chat' && native === 'responses';
+  // DeepSeek thinking-mode tool turns require the assistant message to carry
+  // `reasoning_content`. When the client dropped it and the short-lived cache
+  // no longer has the original chain, send an explicit empty value instead of
+  // failing the whole conversation with a 400.
+  const reasoningEcho = native === 'chat' && (/deepseek/i.test(String(model)) || /deepseek/i.test(String(p.baseUrl || '')));
+  const reasoningOptions = reasoningEcho ? { fillEmpty: true } : undefined;
   const toolPlan = bridge ? chatToolPlan(body) : undefined;
   const nativeToolPlan = goResponsesNative && publicFamily === 'responses' ? responsesToolPlan(body, { dropHosted: true }) : undefined;
-  let payload = { ...(bridge ? toChat(body, toolPlan, p.id) : chatToResp ? chatToResponses(body) : nativeToolPlan ? nativeToolPlan.request : body), model };
-  if (native === 'chat') payload = restoreCachedReasoning(payload, p.id);
+  let payload = { ...(bridge ? toChat(body, toolPlan, p.id, reasoningEcho ? { fillReasoning: true } : undefined) : chatToResp ? chatToResponses(body) : nativeToolPlan ? nativeToolPlan.request : body), model };
+  if (native === 'chat') payload = restoreCachedReasoning(payload, p.id, reasoningOptions);
   if (go && native === 'chat') payload = normalizeChatToolMessages(payload);
   const chatReasoningTracker = native === 'chat' && body.stream ? createChatReasoningTracker(p.id) : null;
   const imageSettings = imageOptimizationSettings();
@@ -204,4 +211,73 @@ export async function route(store, p, model, body, endpoint, res, signal, nasAge
   chatReasoningTracker?.flush();
   if (metrics.completion === 'pending') metrics.completion = 'completed';
   res.end(); return null;
+}
+
+// Provider groups: one public prefix, ordered Codex accounts, automatic failover.
+const QUOTA_PATTERN = /usage limit|quota|额度|用量上限|已用完|超出额度|insufficient_quota|billing hard limit|credit balance/i;
+const RATE_PATTERN = /rate limit|too many requests|请求过于频繁/i;
+
+export function isQuotaError(error) {
+  const text = `${error?.message || ''} ${error?.code || ''}`;
+  return QUOTA_PATTERN.test(text) || RATE_PATTERN.test(text);
+}
+
+function cooldownKind(error) {
+  const text = String(error?.message || '');
+  return RATE_PATTERN.test(text) && !QUOTA_PATTERN.test(text) ? 'rate' : 'quota';
+}
+
+function withTimeout(promise, ms) {
+  let timer;
+  return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), ms); })]).finally(() => clearTimeout(timer));
+}
+
+export async function markGroupCooldown(store, group, provider, error, nasAgent) {
+  const now = Date.now(), kind = cooldownKind(error);
+  let until = now + (kind === 'rate' ? 60 * 1000 : 30 * 60 * 1000);
+  if (kind === 'quota' && nasAgent?.usage) {
+    try {
+      const usage = await withTimeout(nasAgent.usage(provider, undefined, true), 8000);
+      const windows = (usage?.buckets || []).flatMap(bucket => bucket.windows || []);
+      const exhausted = windows.filter(w => Number(w.usedPercent) >= 100 && Number(w.resetsAt) > 0);
+      if (exhausted.length) until = Math.max(now + 60 * 1000, ...exhausted.map(w => Number(w.resetsAt) * 1000));
+    } catch {}
+  }
+  store.setGroupCooldown(group.id, provider.id, { until, kind, at: new Date(now).toISOString(), error: String(error?.message || '').slice(0, 200) });
+  return until;
+}
+
+export async function routeWithFailover(store, resolved, body, endpoint, res, signal, nasAgent, claudeBridge = defaultClaudeBridge, requestSessionId = '', grokBridge = defaultGrokBridge) {
+  const group = resolved.group || null;
+  const candidates = resolved.candidates?.length ? resolved.candidates : [{ provider: resolved.provider, model: resolved.model }];
+  if (!group) return route(store, resolved.provider, resolved.model, body, endpoint, res, signal, nasAgent, claudeBridge, requestSessionId, grokBridge);
+  const deferred = candidates.length > 1;
+  const skipped = [];
+  const trail = [];
+  let lastError = null;
+  for (let index = 0; index < candidates.length; index++) {
+    const { provider, model } = candidates[index];
+    const cooldown = store.groupCooldown(group.id, provider.id);
+    if (cooldown) { skipped.push({ provider, until: Number(cooldown.until) }); continue; }
+    try {
+      const output = await route(store, provider, model, body, endpoint, res, signal, nasAgent, claudeBridge, requestSessionId, grokBridge, { deferOpen: deferred });
+      store.clearGroupCooldown(group.id, provider.id);
+      if (trail.length && res.apiMetrics) res.apiMetrics.failover = trail;
+      return output;
+    } catch (error) {
+      const quota = isQuotaError(error);
+      if (quota) {
+        const until = await markGroupCooldown(store, group, provider, error, nasAgent);
+        trail.push({ provider: provider.id, until });
+      }
+      if (!quota || res.headersSent || index >= candidates.length - 1) throw error;
+      lastError = error;
+    }
+  }
+  if (skipped.length) {
+    const until = Math.min(...skipped.map(entry => entry.until));
+    const when = new Date(until).toLocaleString('zh-CN', { hour12: false });
+    throw new HttpError(429, `组「${group.name}」内的 Codex 账号额度暂不可用，最早 ${when} 恢复；可在模型港中重置冷却`, 'group_exhausted');
+  }
+  throw lastError || new HttpError(429, `组「${group.name}」内没有可用的 Codex 账号`, 'group_exhausted');
 }
