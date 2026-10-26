@@ -226,3 +226,86 @@ python3 test/grok-video-runner.test.py
 ~~~
 
 测试使用模拟上游和临时数据，不调用真实模型或真实账号。
+
+## 11. 上下文与 Token 优化
+
+模型港把减少请求体积和减少计费 Token 分开处理。所有有损裁剪默认只对明确启用的 API Key 供应商生效；Codex 官方 app-server 使用独立的工具延迟加载和历史策略。网关记录裁剪前后的请求字节、工具字节、文本字符、工具结果字符、图片数量和上游 usage，但不会把字节数直接当成 Token 节省量。
+
+~~~mermaid
+flowchart TD
+    R[客户端请求] --> P[协议转换与模型选择]
+    P --> I{是否允许图片优化?}
+    I -->|OpenCode 默认 / all| IC[压缩 data URL 图片<br/>不抓取远程 URL]
+    I -->|off / 其他供应商| IS[保留图片]
+    IC --> T[API Key Token Policy]
+    IS --> T
+    T --> D{tokenOptimization.enabled?}
+    D -->|否| N[保留工具 schema 与历史]
+    D -->|是| C[截短工具描述和旧工具结果]
+    P --> Q{Codex app-server?}
+    Q -->|是| L[工具 schema 去元数据 + 描述限长]
+    L --> F{工具多或 schema 大?}
+    F -->|是| NS[核心工具 eager<br/>长尾放入 deferLoading namespace]
+    F -->|否| E[全部工具 eager]
+    C --> O[发送上游并记录 metrics]
+    N --> O
+    NS --> O
+    E --> O
+~~~
+
+### 11.1 API Key 供应商的有损裁剪
+
+供应商字段 tokenOptimization 默认关闭。开启后，网关先深复制请求，再截短工具描述和较早轮次的工具结果。JSON Schema、属性名、类型、约束、默认值和 custom 工具格式提示保持不变；最近用户轮次保持完整，旧文本采用头尾保留并插入省略说明。
+
+| 字段 | 默认值 | 作用 |
+| --- | ---: | --- |
+| enabled | false | 开启工具描述和旧工具结果裁剪。 |
+| toolDescriptionChars | 2000 | 函数工具描述上限，范围 256–16000。 |
+| oldToolResultChars | 32768 | 较早工具结果上限，范围 4096–262144。 |
+| keepRecentUserTurns | 3 | 最近用户轮次保持完整，范围 2–20。 |
+| captureStreamUsage | false | 对支持的 Chat 流请求要求上游返回 usage。 |
+
+客户端可通过请求头 X-Model-Harbor-Optimize: off 临时跳过有损裁剪；原始请求对象不会被修改。
+
+### 11.2 Codex 工具 schema 精简与延迟加载
+
+Codex app-server 对动态工具需要在 thread/start 注册工具，因此工具定义本身会进入会话启动消息。模型港分两层控制体积：
+
+1. fitToolSpecs() 去除 schema 元数据（例如 title、default、examples 等不影响调用的字段），保留属性名、类型、必要约束和调用名称；描述按 800、400、200、100、50 字符逐级收缩，直到满足约 900 KiB 的工具预算。custom 工具的 formatHint 单独保留，不被普通描述限长吞掉。
+2. deferToolSpecs() 在工具数达到 24 或 schema 超过 48 KiB 时进入 auto 模式。核心工具最多 10 个保持 eager，eager schema 目标不超过 64 KiB，其他工具按每组 12 个放入 mh_group_N namespace 并标记 deferLoading: true。至少保留 4 个 eager 工具，避免小工具集完全延迟。
+
+可用环境变量：MH_DEFER_TOOLS=off|auto|always、MH_DEFER_MIN_TOOLS、MH_DEFER_MIN_BYTES、MH_DEFER_GROUP_SIZE、MH_DEFER_MAX_EAGER、MH_DEFER_MAX_EAGER_BYTES 和 MH_DEFER_MIN_EAGER。延迟加载只改变工具声明的注入方式，不改变客户端工具的执行归属；当前 CLI 不支持 namespace/deferLoading 时应关闭该能力或使用兼容回退。
+
+### 11.3 Codex 历史注入策略
+
+Codex 将结构化历史分块注入 thread/inject_items，默认每块最多 256 KiB、64 项，当前用户消息单独发送给 turn/start。为减少重复上下文，历史处理遵循以下顺序：
+
+1. 丢弃早期 reasoning 项及无法提供可读内容的加密推理。
+2. 最近两轮用户消息保留原始图片和工具结果；更早图片替换为 [image omitted]。
+3. 更早的工具输出保留头尾，中间插入省略标记，默认上限 16 KiB。
+4. 工具结果回传时若原 app-server 会话消失，重建 ephemeral thread 并重新注入经过同样处理的历史。
+
+这些处理只针对历史副本，不修改客户端随后看到的原始消息。它们可能丢失旧图片或工具输出细节；需要完整内容时应让客户端重新读取源文件或关闭相应的有损策略。
+
+### 11.4 图片压缩
+
+src/image-optimizer.js 只处理请求中的 data: 图片，不访问远程 URL，也跳过工具 schema 中的示例 URL，避免引入服务端抓取和 SSRF 风险。默认只对 OpenCode Go 生效；MH_IMAGE_OPTIMIZATION=all 可扩展到全部供应商，off 完全关闭。
+
+默认参数：最长边 1600 像素、JPEG 质量 80、原图小于 350000 字节时跳过、单图输入上限 12 MiB、单图压缩超时 15 秒、内存缓存 32 条。透明图片保留 PNG；压缩失败、超时或结果没有变小会保留原图并继续请求。metrics 只记录数量和字节统计，不记录图片内容。
+
+### 11.5 Reasoning、Compaction 与观测
+
+- DeepSeek thinking-mode 的 Chat 工具回合如果客户端没有回传 reasoning_content，网关优先按 tool call ID 恢复短时缓存；缓存不存在时补充显式空字符串，避免协议 400，同时不伪造不可恢复的思考内容。
+- OpenCode Responses 只有在上游明确返回 compaction blob 解码/解密错误时才触发一次 fallback：保留可读摘要，把不可读的密文替换成明确的不可用提示；合法密文原样通过，不主动解密或重写。
+- 请求 metrics 中分别记录 before / after 统计、changes、imageOptimization、usage、cachedInputTokens、reasoningTokens 和 compactionFallback。真实收益必须用同一模型、同一任务和同一 usage 口径做 A/B；合成字节下降不能直接宣称费用下降。
+
+### 11.6 优化取舍与验证
+
+优化顺序是先保证协议和工具可用，再降低重复上下文：
+
+1. 先验证工具名称、schema 可调用性、工具结果配对和图片内容没有被错误改写。
+2. 再比较裁剪前后请求字节和上游 input_tokens / cached_tokens。
+3. 对流式请求分别验证首包延迟、完成事件和取消；账号组还要验证额度错误发生前不能向客户端写出内容。
+4. 任何出现上下文超限、工具参数丢失或模型行为退化的请求，都可以通过关闭供应商 tokenOptimization、设置 MH_DEFER_TOOLS=off 或设置 MH_IMAGE_OPTIMIZATION=off 回退。
+
+当前相关测试覆盖工具 schema 精简、DeferLoading、历史裁剪、reasoning 回填、compaction fallback、图片压缩和 usage metrics；运行 npm test 与 npm run check 验证整体回归。
