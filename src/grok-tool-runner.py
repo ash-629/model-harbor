@@ -7,10 +7,25 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 LIMIT = 64 * 1024 * 1024
 SCHEMA_LIMIT = 110000
 PROMPT_LIMIT = 32 * 1024 * 1024
+MAX_ATTEMPTS = 2
+MIN_RETRY_SECONDS = 5
+RETRYABLE = frozenset((
+    'missing_structured_output',
+    'invalid_cli_output',
+    'upstream_failed',
+    'cli_failed',
+))
+RETRY_HINT = (
+    '\n\nRETRY INSTRUCTION: The previous attempt did not produce the required '
+    'structured output. Answer the same conversation again. Return only the '
+    'single JSON object required by the schema (kind, text, calls). Do not add '
+    'prose, markdown fences, or claims of executed tools outside that object.'
+)
 SYSTEM_PROMPT = (
     'You are a stateless text-only reasoning service behind an API gateway. '
     'You have no tools and cannot access files, run commands, or browse. '
@@ -35,6 +50,30 @@ def failure_reason(details):
     return 'cli_failed'
 
 
+def parse_json_object(value):
+    """Accept the CLI structured value or recover one JSON object from text."""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    candidates = [value]
+    candidates.extend(re.findall(r'```(?:json)?\s*(.*?)```', value, re.DOTALL))
+    start, end = value.find('{'), value.rfind('}')
+    if 0 <= start < end:
+        candidates.append(value[start:end + 1])
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except (ValueError, UnicodeError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
 def parse_output(raw):
     try:
         payload = json.loads(raw)
@@ -42,15 +81,16 @@ def parse_output(raw):
         raise ValueError('invalid_cli_output')
     if not isinstance(payload, dict):
         raise ValueError('invalid_cli_output')
-    structured = payload.get('structuredOutput')
+    structured = parse_json_object(payload.get('structuredOutput'))
+    if isinstance(structured, dict) and 'kind' not in structured:
+        structured = None
     if structured is None:
-        text = payload.get('text')
-        if isinstance(text, str):
-            try:
-                structured = json.loads(text)
-            except ValueError:
-                structured = None
-    if not isinstance(structured, dict):
+        candidate = parse_json_object(payload.get('text'))
+        # Recover a fenced/prefixed JSON answer, but never mistake an example
+        # object in prose for the bridge envelope.
+        if isinstance(candidate, dict) and 'kind' in candidate:
+            structured = candidate
+    if not isinstance(structured, dict) or 'kind' not in structured:
         raise ValueError('missing_structured_output')
     usage = payload.get('usage') if isinstance(payload.get('usage'), dict) else {}
     def number(key):
@@ -71,27 +111,9 @@ def parse_output(raw):
     }
 
 
-def run(request, cli='grok'):
-    if not isinstance(request, dict) or set(request) - {'model', 'timeout', 'prompt', 'schema'}:
-        raise ValueError('invalid_request')
-    model, timeout, prompt, schema = (request.get(k) for k in ['model', 'timeout', 'prompt', 'schema'])
-    if not isinstance(model, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}', model):
-        raise ValueError('invalid_model')
-    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not 10 <= timeout <= 600:
-        raise ValueError('invalid_timeout')
-    if not isinstance(prompt, str) or not prompt or len(prompt.encode()) > PROMPT_LIMIT:
-        raise ValueError('invalid_prompt')
-    if not isinstance(schema, dict):
-        raise ValueError('invalid_payload')
+def run_once(request, cli, timeout, prompt, source_auth):
+    model, schema = request.get('model'), request.get('schema')
     encoded = json.dumps(schema, ensure_ascii=False, separators=(',', ':'))
-    if len(encoded.encode()) > SCHEMA_LIMIT:
-        raise ValueError('schema_too_large')
-
-    source_home = os.environ.get('GROK_HOME') or os.path.join(os.path.expanduser('~'), '.grok')
-    source_auth = os.path.join(source_home, 'auth.json')
-    if not os.path.isfile(source_auth):
-        raise ValueError('missing_auth')
-
     with tempfile.TemporaryDirectory(prefix='grok-runner-') as tmp:
         prompt_path = os.path.join(tmp, 'prompt.txt')
         with open(prompt_path, 'w', encoding='utf-8') as handle:
@@ -170,6 +192,49 @@ def run(request, cli='grok'):
                         except ProcessLookupError:
                             pass
                         child.wait()
+
+
+def run(request, cli='grok'):
+    if not isinstance(request, dict) or set(request) - {'model', 'timeout', 'prompt', 'schema'}:
+        raise ValueError('invalid_request')
+    model, timeout, prompt, schema = (request.get(k) for k in ['model', 'timeout', 'prompt', 'schema'])
+    if not isinstance(model, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}', model):
+        raise ValueError('invalid_model')
+    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not 10 <= timeout <= 600:
+        raise ValueError('invalid_timeout')
+    if not isinstance(prompt, str) or not prompt or len(prompt.encode()) > PROMPT_LIMIT:
+        raise ValueError('invalid_prompt')
+    if not isinstance(schema, dict):
+        raise ValueError('invalid_payload')
+    encoded = json.dumps(schema, ensure_ascii=False, separators=(',', ':'))
+    if len(encoded.encode()) > SCHEMA_LIMIT:
+        raise ValueError('schema_too_large')
+
+    source_home = os.environ.get('GROK_HOME') or os.path.join(os.path.expanduser('~'), '.grok')
+    source_auth = os.path.join(source_home, 'auth.json')
+    if not os.path.isfile(source_auth):
+        raise ValueError('missing_auth')
+
+    deadline = time.monotonic() + timeout
+    last_error = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining < 1:
+            raise last_error or ValueError('timeout')
+        attempt_prompt = prompt if attempt == 1 else prompt + RETRY_HINT
+        try:
+            result = run_once(request, cli, remaining, attempt_prompt, source_auth)
+            result['attempts'] = attempt
+            return result
+        except ValueError as error:
+            last_error = error
+            reason = str(error)
+            if reason not in RETRYABLE or attempt >= MAX_ATTEMPTS:
+                raise
+            if deadline - time.monotonic() < MIN_RETRY_SECONDS:
+                raise
+            time.sleep(0.4)
+    raise last_error or ValueError('runner_failed')
 
 
 def main():

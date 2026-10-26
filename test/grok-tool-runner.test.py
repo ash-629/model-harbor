@@ -79,9 +79,62 @@ class Tests(unittest.TestCase):
             ('unknown failure SECRET', 'cli_failed'),
         ]:
             self.assertEqual(runner.failure_reason(text), reason)
-        for payload in [{'text': 'not JSON SECRET'}, {'structuredOutput': []}]:
+        for payload in [
+            {'text': 'not JSON SECRET'},
+            {'structuredOutput': []},
+            {'structuredOutput': {}},
+            {'structuredOutput': {'text': 'x'}},
+        ]:
             with self.assertRaisesRegex(ValueError, 'missing_structured_output'):
                 runner.parse_output(json.dumps(payload))
+
+    def test_recovers_structured_json_from_text(self):
+        for payload in [
+            {'text': 'Result:\n```json\n{"kind":"final","text":"ok","calls":[]}\n```'},
+            {'text': 'prefix {"kind":"final","text":"ok","calls":[]} suffix'},
+            {'structuredOutput': '{"kind":"final","text":"ok","calls":[]}'},
+        ]:
+            result = runner.parse_output(json.dumps(payload))
+            self.assertEqual(result['structured_output']['text'], 'ok')
+
+    def test_retries_once_after_missing_structured_output(self):
+        outputs = [
+            {'text': 'plain prose', 'usage': {'input_tokens': 2}},
+            {'text': '{"kind":"final","text":"retried","calls":[]}',
+             'structuredOutput': {'kind': 'final', 'text': 'retried', 'calls': []},
+             'usage': {'input_tokens': 3}},
+        ]
+        launches, prompts = [], []
+        def popen(args, **kwargs):
+            child = Child(outputs[len(launches)])
+            def wait(timeout=None, child=child):
+                prompts.append(Path(args[args.index('--prompt-file') + 1]).read_text())
+                child.write(kwargs['stdout'])
+                return 0
+            child.wait = wait
+            launches.append(args)
+            return child
+        with tempfile.TemporaryDirectory() as auth_dir:
+            Path(auth_dir, 'auth.json').write_text('{}')
+            with patch.object(runner.subprocess, 'Popen', popen), patch.dict(os.environ, {'GROK_HOME': auth_dir}), patch.object(runner.os, 'symlink'):
+                result = runner.run(request())
+        self.assertEqual(len(launches), 2)
+        self.assertEqual(result['attempts'], 2)
+        self.assertEqual(result['structured_output']['text'], 'retried')
+        self.assertNotIn('RETRY INSTRUCTION', prompts[0])
+        self.assertIn('RETRY INSTRUCTION', prompts[1])
+
+    def test_does_not_retry_auth_failure(self):
+        calls = []
+        def popen(args, **kwargs):
+            calls.append(args)
+            return Child()
+        with tempfile.TemporaryDirectory() as auth_dir:
+            Path(auth_dir, 'auth.json').write_text('{}')
+            with patch.object(runner.subprocess, 'Popen', popen), patch.dict(os.environ, {'GROK_HOME': auth_dir}), patch.object(runner.os, 'symlink'), patch.object(runner, 'parse_output', side_effect=ValueError('auth_failed')):
+                with self.assertRaisesRegex(ValueError, 'auth_failed'):
+                    runner.run(request())
+        self.assertEqual(len(calls), 1)
 
     def test_bad_envelopes_fail_before_launch(self):
         values = [
