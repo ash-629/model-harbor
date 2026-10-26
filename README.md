@@ -122,6 +122,10 @@ Codex 桥接要求客户端发送完整历史和 `store=false`。它不提供 `p
 
 远程 CLI 只在目标环境中使用其登录态。模型港不会把 Codex、Claude 或 Grok 登录文件写入仓库，也不会把客户端工具交给远程环境执行。不要把生产配置、SSH 文件、登录缓存或个人部署记录提交到 Git。
 
+## 设计文档
+
+系统架构见 [docs/architecture.md](docs/architecture.md)。
+
 ## 开发和验证
 
 ~~~sh
