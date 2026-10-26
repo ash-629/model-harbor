@@ -702,3 +702,9 @@ Object.assign(messages, {
   "提高优先级": "Raise priority",
   "降低优先级": "Lower priority"
 });
+Object.assign(messages, {
+  '拖动排序；方向键上下移动': 'Drag to reorder; use Up/Down arrow keys',
+  '供应商顺序已保存': 'Provider order saved',
+  '供应商排序必须是不重复的 ID 数组': 'Provider order must be an array of unique IDs',
+  '供应商列表已变化，请刷新后重新排序': 'Provider list changed. Refresh and reorder again.'
+});

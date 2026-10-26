@@ -14,6 +14,7 @@ const videoUI = createVideoUI({api, toast});
 const usageById = new Map();
 const resetKeys = new Map();
 let resetProvider = null, resetBusy = false;
+let providerDrag = null;
 let toolState = { tools: [] }, toolBusy = false, toolPollTimer = null;
 function pendingResetKey(id) {
   try { const key = localStorage.getItem('mh_reset_' + id); if (key) resetKeys.set(id, key); else resetKeys.delete(id); } catch {}
@@ -232,10 +233,75 @@ function renderModels() {
   $('refresh-all').disabled = busy || !state.providers.some(p => p.enabled);
 }
 function renderProviders() {
+  if (providerDrag) return;
   $('providers-empty').hidden = Boolean(state.providers.length);
-  $('providers-grid').innerHTML = state.providers.map(p => `<article class="panel provider-card"><div class="provider-top"><div class="provider-mark">${p.type === 'nas-codex' ? '⌂' : p.type === 'claude-code' ? '✦' : h(p.name.slice(0, 1).toUpperCase())}</div><span class="status-pill ${p.enabled ? '' : 'off'}">${p.enabled ? t('已启用') : t('已停用')}</span></div><h3>${h(p.name)}</h3><code class="model-id">${h(p.id)} / ${p.type === 'nas-codex' ? (p.execution === 'ssh' ? 'Codex · SSH' : 'Codex · SSH + Docker') : p.type === 'claude-code' ? (p.execution === 'ssh' ? 'Claude · SSH' : 'Claude · SSH + Docker') : openCodeGoProvider(p) ? t('Chat + Responses · 自动路由') : h(p.protocol)}</code><p>${h(p.baseUrl || `${p.sshUser}@${p.sshHost}${p.execution === 'ssh' ? '' : ' · ' + p.container}`)}</p><div class="provider-meta"><span>${t('{count} 个模型', {count: p.models.length})}</span><span>·</span><span>${p.lastSync ? t('同步于 {time}', {time: new Date(p.lastSync).toLocaleTimeString(getLanguage(), {hour:'2-digit',minute:'2-digit'})}) : t('尚未同步')}</span></div>${usageMarkup(p)}<div class="provider-actions"><button class="button ghost" data-refresh="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('↻ 刷新模型')}</button><button class="button ghost" data-edit="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('编辑')}</button><button class="button ghost danger" data-delete="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('删除')}</button></div></article>`).join('');
+  $('providers-grid').innerHTML = state.providers.map(p => `<article class="panel provider-card" data-provider-row="${h(p.id)}"><div class="provider-top"><button type="button" class="provider-drag-handle" data-provider-drag="${h(p.id)}" aria-label="${h(t('拖动排序；方向键上下移动'))}" title="${h(t('拖动排序；方向键上下移动'))}" ${busy ? 'disabled' : ''}>⠿</button><div class="provider-mark">${p.type === 'nas-codex' ? '⌂' : p.type === 'claude-code' ? '✦' : h(p.name.slice(0, 1).toUpperCase())}</div><span class="status-pill ${p.enabled ? '' : 'off'}">${p.enabled ? t('已启用') : t('已停用')}</span></div><h3>${h(p.name)}</h3><code class="model-id">${h(p.id)} / ${p.type === 'nas-codex' ? (p.execution === 'ssh' ? 'Codex · SSH' : 'Codex · SSH + Docker') : p.type === 'claude-code' ? (p.execution === 'ssh' ? 'Claude · SSH' : 'Claude · SSH + Docker') : openCodeGoProvider(p) ? t('Chat + Responses · 自动路由') : h(p.protocol)}</code><p>${h(p.baseUrl || `${p.sshUser}@${p.sshHost}${p.execution === 'ssh' ? '' : ' · ' + p.container}`)}</p><div class="provider-meta"><span>${t('{count} 个模型', {count: p.models.length})}</span><span>·</span><span>${p.lastSync ? t('同步于 {time}', {time: new Date(p.lastSync).toLocaleTimeString(getLanguage(), {hour:'2-digit',minute:'2-digit'})}) : t('尚未同步')}</span></div>${usageMarkup(p)}<div class="provider-actions"><button class="button ghost" data-refresh="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('↻ 刷新模型')}</button><button class="button ghost" data-edit="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('编辑')}</button><button class="button ghost danger" data-delete="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('删除')}</button></div></article>`).join('');
   renderGroups();
 }
+
+// Display order is independent of account-group member priority.
+async function saveProviderOrder(ids, focusId) {
+  if (busy || ids.every((id, index) => state.providers[index]?.id === id)) { renderProviders(); return; }
+  busy = true; errorBox('global-error'); renderProviders();
+  try {
+    const result = await api('/providers/order', { method: 'PUT', body: JSON.stringify({ ids }) });
+    state.providers = result.providers;
+    renderSelectors(); renderModels(); toast(t('供应商顺序已保存'));
+  } catch (error) {
+    errorBox('global-error', error.message);
+    try { await load(); } catch {}
+  } finally {
+    busy = false; renderProviders();
+    if (focusId) [...$('providers-grid').querySelectorAll('[data-provider-drag]')].find(el => el.dataset.providerDrag === focusId)?.focus();
+  }
+}
+$('providers-grid').addEventListener('pointerdown', event => {
+  const handle = event.target.closest('[data-provider-drag]');
+  if (!handle || busy || providerDrag || event.button !== 0 || state.providers.length < 2) return;
+  event.preventDefault(); handle.focus();
+  const row = handle.closest('[data-provider-row]');
+  providerDrag = { id: handle.dataset.providerDrag, pointerId: event.pointerId, row, handle, y: event.clientY, moved: false };
+  handle.setPointerCapture(event.pointerId);
+});
+document.addEventListener('pointermove', event => {
+  const drag = providerDrag;
+  if (!drag || drag.pointerId !== event.pointerId) return;
+  if (!drag.moved && Math.abs(event.clientY - drag.y) < 5) return;
+  drag.moved = true; drag.row.classList.add('provider-dragging');
+  event.preventDefault();
+  if (event.clientY < 80) window.scrollBy(0, -18);
+  else if (event.clientY > innerHeight - 80) window.scrollBy(0, 18);
+  const others = [...$('providers-grid').querySelectorAll('[data-provider-row]')].filter(row => row !== drag.row);
+  const next = others.find(row => event.clientY < row.getBoundingClientRect().top + row.getBoundingClientRect().height / 2);
+  drag.next = next || null;
+  $('providers-grid').querySelectorAll('.provider-drop-before,.provider-drop-after').forEach(row => row.classList.remove('provider-drop-before', 'provider-drop-after'));
+  if (next) next.classList.add('provider-drop-before');
+  else others.at(-1)?.classList.add('provider-drop-after');
+}, { passive: false });
+function finishProviderDrag(event, cancel = false) {
+  const drag = providerDrag;
+  if (!drag || (event.pointerId !== undefined && drag.pointerId !== event.pointerId)) return;
+  if (!cancel && drag.moved) $('providers-grid').insertBefore(drag.row, drag.next || null);
+  const ids = [...$('providers-grid').querySelectorAll('[data-provider-row]')].map(el => el.dataset.providerRow);
+  providerDrag = null; drag.row.classList.remove('provider-dragging');
+  if (drag.handle.hasPointerCapture(drag.pointerId)) drag.handle.releasePointerCapture(drag.pointerId);
+  if (cancel || !drag.moved) renderProviders();
+  else void saveProviderOrder(ids, drag.id);
+}
+document.addEventListener('pointerup', event => finishProviderDrag(event));
+document.addEventListener('pointercancel', event => finishProviderDrag(event, true));
+window.addEventListener('blur', event => finishProviderDrag(event, true));
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && providerDrag) { event.preventDefault(); finishProviderDrag(event, true); return; }
+  const handle = event.target.closest?.('[data-provider-drag]');
+  if (!handle || busy || providerDrag || !['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+  event.preventDefault();
+  const ids = state.providers.map(p => p.id), index = ids.indexOf(handle.dataset.providerDrag);
+  const target = index + (event.key === 'ArrowUp' ? -1 : 1);
+  if (index < 0 || target < 0 || target >= ids.length) return;
+  [ids[index], ids[target]] = [ids[target], ids[index]];
+  void saveProviderOrder(ids, handle.dataset.providerDrag);
+});
 
 let groupEditing = null, groupMemberIds = [];
 const groupById = id => (state.groups || []).find(g => g.id === id);

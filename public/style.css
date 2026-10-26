@@ -147,3 +147,14 @@ html[lang=en] .provider-actions{flex-wrap:wrap}
 @media(max-width:420px){
   #providers-view .provider-quota,#providers-view .quota-bucket{grid-template-columns:minmax(0,1fr)}
 }
+
+/* Display order handle leaves buttons and text independently interactive. */
+#providers-view .provider-top{position:relative;padding-top:26px}
+.provider-drag-handle{position:absolute;top:0;left:50%;transform:translateX(-50%);border:1px solid #91aa93;background:#edf5e9;color:#426754;width:38px;height:24px;font:20px/1 sans-serif;cursor:grab;touch-action:none;user-select:none}
+.provider-drag-handle:focus-visible{outline:2px solid #b97723;outline-offset:3px}
+.provider-drag-handle:disabled{opacity:.4;cursor:wait}
+#providers-view .provider-dragging{outline:2px dashed #225c4a;background:#edf5e9;opacity:.85}
+.provider-dragging .provider-drag-handle{cursor:grabbing}
+
+#providers-view .provider-drop-before{border-top-color:#b97723;box-shadow:0 -4px 0 #b97723}
+#providers-view .provider-drop-after{border-bottom-color:#b97723;box-shadow:0 4px 0 #b97723}

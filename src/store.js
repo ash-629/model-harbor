@@ -37,6 +37,14 @@ export class Store {
   }
   publicProvider(p) { const { apiKey, ...rest } = p; return { ...rest, hasApiKey: Boolean(apiKey || p.openCodeAuthId) }; }
   list() { return this.data.providers.map(p => this.publicProvider(p)); }
+  reorderProviders(ids) {
+    const current = this.data.providers;
+    if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string') || new Set(ids).size !== ids.length) throw new HttpError(400, '供应商排序必须是不重复的 ID 数组');
+    if (ids.length !== current.length || ids.some(id => !current.some(p => p.id === id))) throw new HttpError(409, '供应商列表已变化，请刷新后重新排序');
+    this.data.providers = ids.map(id => current.find(p => p.id === id));
+    try { this.save(); } catch (error) { this.data.providers = current; throw error; }
+    return this.list();
+  }
   get(id) { const p = this.data.providers.find(p => p.id === id); if (!p) throw new HttpError(404, '供应商不存在'); return p; }
   upsert(input, oldId) {
     if (!input || typeof input !== 'object') throw new HttpError(400, '配置必须是对象');

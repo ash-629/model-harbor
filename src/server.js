@@ -205,6 +205,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
         }
         if (pathname === '/api/config' && method === 'GET') return json(res, 200, { providers: store.list(), groups: store.listGroups(), models: store.models(), logs, baseUrl: `${external?.origin || `http://127.0.0.1:${actualPort}`}/v1` });
         if (pathname === '/api/key' && method === 'GET') return json(res, 200, { key: store.gatewayKey() });
+        if (pathname === '/api/providers/order' && method === 'PUT') return json(res, 200, { providers: store.reorderProviders((await readBody(req))?.ids) });
         if (pathname === '/api/providers' && method === 'POST') return json(res, 201, store.upsert(await readBody(req)));
         if (pathname === '/api/groups' && method === 'GET') return json(res, 200, { groups: store.listGroups() });
         if (pathname === '/api/groups' && method === 'POST') {
