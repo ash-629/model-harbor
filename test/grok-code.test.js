@@ -45,6 +45,24 @@ test('namespace, custom grammar, long names, discovery and scoped JSON Schema su
  const r=grokResult(ok(call('t3',{x:'yes'})),c,body.model);assert.equal(r.output[0].name,name);assert.equal(r.usage.input_tokens,15);assert.equal(r.usage.total_tokens,26);
 });
 
+test('image inputs become runner attachments and enable only the image Read tool',()=>{
+ const png='data:image/png;base64,iVBORw0KGgo=';
+ const c=grokContext({...body,input:[{role:'user',content:[{type:'input_text',text:'look'},{type:'input_image',image_url:png}]}]},'responses');
+ assert.equal(c.images.length,1);assert.equal(c.images[0].source.media_type,'image/png');assert.equal(c.images[0].source.data,'iVBORw0KGgo=');
+ assert.match(c.transcript[0].content[1].text,/Attached image 1/);
+ assert.match(grokPrompt(c),/transcription produced from the actual image files/);
+ assert.doesNotMatch(grokPrompt({...c,images:[]}),/transcription produced from the actual image files/);
+ for(const url of ['http://example.test/a.png','data:image/tiff;base64,AAAA','data:image/png;base64,***'])assert.throws(()=>grokContext({...body,input:[{role:'user',content:[{type:'input_image',image_url:url}]}]},'responses'),e=>e.status===400);
+});
+
+test('bridge forwards image attachments to the fixed runner',async()=>{
+ let seen;
+ const bridge=new GrokCodeBridge({remote:async(p,command,stdin)=>{seen=JSON.parse(stdin);return JSON.stringify(ok(final('seen')));}});
+ await bridge.run(provider,'grok-4.7',{...body,input:[{role:'user',content:[{type:'input_text',text:'look'},{type:'input_image',image_url:'data:image/png;base64,iVBORw0KGgo='}]}]},'responses');
+ assert.equal(seen.images.length,1);assert.deepEqual(seen.images[0],{type:'image',source:{type:'base64',media_type:'image/png',data:'iVBORw0KGgo='}});
+ assert.match(seen.prompt,/Attached image 1/);
+});
+
 test('tool calls and results retain IDs, namespaces and multiline custom inputs',()=>{
  const input=[{role:'user',content:'write and inspect'},{type:'custom_tool_call',call_id:'patch1',namespace:'functions',name:'apply_patch',input:'*** Begin Patch\n+ok\n*** End Patch'},{type:'custom_tool_call_output',call_id:'patch1',output:[{type:'input_text',text:'PATCH_OK'}]},{type:'function_call',call_id:'run1',name:'run_command',arguments:'{"cmd":"echo ok"}'},{type:'function_call_output',call_id:'run1',output:'{"exit_code":1,"error":"not found"}'}];
  const c=grokContext({...body,input},'responses');assert.equal(c.transcript[1].input,input[1].input);assert.equal(c.transcript[2].call_id,'patch1');assert.match(c.transcript.at(-1).output,/exit_code/);

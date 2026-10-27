@@ -67,7 +67,9 @@ export class GrokCodeBridge {
     if (this.active >= this.maxConcurrent) throw new HttpError(429, 'Grok 工具桥接繁忙，请稍后重试');
     this.active++;
     try {
-      const raw = await this.remote(p, grokToolCommand(p), JSON.stringify({ model, timeout: p.timeout || 180, prompt: grokPrompt(context), schema }), signal);
+      const payload = { model, timeout: p.timeout || 180, prompt: grokPrompt(context), schema };
+      if (context.images.length) payload.images = context.images;
+      const raw = await this.remote(p, grokToolCommand(p), JSON.stringify(payload), signal);
       if (signal?.aborted) throw new HttpError(499, '请求已取消');
       let data; try { data = JSON.parse(raw); } catch { throw new HttpError(502, 'Grok CLI 执行器没有返回有效 JSON'); }
       return grokResult(data, context, body.model);
