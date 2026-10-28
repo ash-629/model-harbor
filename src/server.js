@@ -24,6 +24,7 @@ import { authorizeOpenCodeGo, isOpenCodeGoProvider, classifyOpenCodeGoModel } fr
 import { openCodeGoUsage } from './opencode-go-usage.js';
 import { OpenCodeGoAuth } from './opencode-go-auth.js';
 import { GrokOAuth } from './grok-oauth.js';
+import { testSavedProxy } from './proxy-test.js';
 import { ToolDownloads } from './tools.js';
 import { mediaAPI } from './media-api.js';
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -205,7 +206,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
           res.writeHead(200, { 'content-type': 'text/x-python; charset=utf-8', 'content-disposition': 'attachment; filename="grok-video-runner.py"' });
           return res.end(fs.readFileSync(grokVideoRunnerFile));
         }
-        if (pathname === '/api/config' && method === 'GET') return json(res, 200, { providers: store.list(), groups: store.listGroups(), models: store.models(), logs, baseUrl: `${external?.origin || `http://127.0.0.1:${actualPort}`}/v1` });
+        if (pathname === '/api/config' && method === 'GET') return json(res, 200, { providers: store.list(), groups: store.listGroups(), proxies: store.listProxies(), models: store.models(), logs, baseUrl: `${external?.origin || `http://127.0.0.1:${actualPort}`}/v1` });
         if (pathname === '/api/key' && method === 'GET') return json(res, 200, { key: store.gatewayKey() });
         if (pathname === '/api/providers/order' && method === 'PUT') return json(res, 200, { providers: store.reorderProviders((await readBody(req))?.ids) });
         if (pathname === '/api/providers' && method === 'POST') return json(res, 201, store.upsert(await readBody(req)));
@@ -229,6 +230,15 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
             await syncGroupCooldowns(store, group, nasAgent, controller.signal);
             return json(res, 200, store.publicGroup(group));
           }
+        }
+        if (pathname === '/api/proxies' && method === 'GET') return json(res, 200, { proxies: store.listProxies() });
+        if (pathname === '/api/proxies' && method === 'POST') return json(res, 201, store.upsertProxy(await readBody(req)));
+        const proxyMatch = /^\/api\/proxies\/([a-z0-9_-]+)(\/test)?$/.exec(pathname);
+        if (proxyMatch) {
+          const [, proxyId, action] = proxyMatch;
+          if (method === 'POST' && action === '/test') return json(res, 200, await testSavedProxy(store.getProxy(proxyId), value => store.unseal(value), { signal: controller.signal }));
+          if (method === 'PUT' && !action) return json(res, 200, store.upsertProxy(await readBody(req), proxyId));
+          if (method === 'DELETE' && !action) { store.removeProxy(proxyId); return json(res, 200, { deleted: true }); }
         }
         const grokOAuthMatch = /^\/api\/providers\/([a-z0-9_-]+)\/grok\/oauth\/(start|exchange|revoke)$/.exec(pathname);
         if (grokOAuthMatch && method === 'POST') {

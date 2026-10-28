@@ -2,7 +2,7 @@
 // Tokens never leave the encrypted store; only access tokens reach the upstream.
 import crypto from 'node:crypto';
 import { HttpError } from './store.js';
-import { dispatcherFor } from './provider-proxy.js';
+import { dispatcherForProvider } from './provider-proxy.js';
 
 import { GROK_AUTHORIZE_URL, GROK_TOKEN_URL, GROK_CLIENT_ID, GROK_SCOPE, GROK_REDIRECT_URI, GROK_CLI_HOST } from './grok-config.js';
 export { GROK_AUTHORIZE_URL, GROK_TOKEN_URL, GROK_CLIENT_ID, GROK_SCOPE, GROK_REDIRECT_URI, GROK_CLI_HOST, GROK_CLI_BASE_URL, GROK_API_BASE_URL } from './grok-config.js';
@@ -109,7 +109,7 @@ async function tokenCall(store, provider, form, { fetchImpl = fetch, signal } = 
       headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded', 'user-agent': 'model-harbor/0.1.0' },
       body,
       signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(TOKEN_TIMEOUT)]) : AbortSignal.timeout(TOKEN_TIMEOUT),
-      dispatcher: dispatcherFor(provider, GROK_TOKEN_URL, value => store.unseal(value))
+      dispatcher: dispatcherForProvider(store, provider, GROK_TOKEN_URL)
     });
   } catch {
     throw new HttpError(502, '无法连接 xAI 授权服务，请检查供应商代理设置', 'grok_oauth_network');

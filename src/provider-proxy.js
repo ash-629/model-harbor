@@ -50,6 +50,29 @@ export function proxyDispatcher(provider, unseal = value => value) {
   return agent;
 }
 
+// A provider either points at a saved proxy (proxyId) or keeps inline settings.
+export function proxySettingsFor(store, provider) {
+  if (provider?.proxyId) {
+    const saved = store?.data?.proxies?.find(item => item.id === provider.proxyId);
+    if (!saved || saved.enabled === false) return { enabled: false };
+    return { enabled: true, url: saved.url, username: saved.username || '', password: saved.password || '', noProxy: saved.noProxy || [] };
+  }
+  return {
+    enabled: Boolean(provider?.proxyEnabled && provider.proxyUrl),
+    url: provider?.proxyUrl || '', username: provider?.proxyUsername || '',
+    password: provider?.proxyPassword || '', noProxy: provider?.noProxy || []
+  };
+}
+
+export function dispatcherForProvider(store, provider, targetUrl) {
+  const settings = proxySettingsFor(store, provider);
+  if (!settings.enabled || !settings.url) return undefined;
+  let hostname;
+  try { hostname = new URL(String(targetUrl)).hostname; } catch { return undefined; }
+  if (proxyBypass({ noProxy: settings.noProxy }, hostname)) return undefined;
+  return proxyDispatcher({ proxyEnabled: true, proxyUrl: settings.url, proxyUsername: settings.username, proxyPassword: settings.password }, value => store.unseal(value));
+}
+
 // Undefined means a direct connection, which fetch treats as the default dispatcher.
 export function dispatcherFor(provider, targetUrl, unseal) {
   if (!provider?.proxyEnabled || !provider.proxyUrl) return undefined;

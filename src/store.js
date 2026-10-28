@@ -49,6 +49,43 @@ export class Store {
     } catch { return { mode: 'oauth', authorized: false }; }
   }
   list() { return this.data.providers.map(p => this.publicProvider(p)); }
+  publicProxy(p) { const { password, ...rest } = p; return { ...rest, hasPassword: Boolean(password) }; }
+  listProxies() { return (this.data.proxies || []).map(p => this.publicProxy(p)); }
+  getProxy(id) {
+    const proxy = (this.data.proxies || []).find(item => item.id === id);
+    if (!proxy) throw new HttpError(404, '代理不存在');
+    return proxy;
+  }
+  upsertProxy(input, oldId) {
+    if (!input || typeof input !== 'object') throw new HttpError(400, '代理配置必须是对象');
+    const id = String(input.id || '').trim();
+    if (!/^[a-z0-9][a-z0-9_-]{0,39}$/.test(id)) throw new HttpError(400, '代理 ID 只能包含小写字母、数字、下划线、短横线，最多 40 字符');
+    if (oldId && oldId !== id) throw new HttpError(400, '已有代理的 ID 不可修改');
+    const old = oldId ? this.getProxy(oldId) : null;
+    if (!old && (this.data.proxies || []).some(item => item.id === id)) throw new HttpError(409, '代理 ID 已存在');
+    const url = parseProxyUrl(input.url ?? old?.url ?? '');
+    if (url === null || !url) throw new HttpError(400, '代理地址只支持 HTTP/HTTPS，且不能包含账号、查询或片段');
+    const username = String(input.username ?? old?.username ?? '').trim();
+    if (username.length > 128 || /[\x00-\x1f\x7f]/.test(username)) throw new HttpError(400, '代理用户名应为 0–128 个可见字符');
+    const password = input.clearPassword ? '' : input.password ? this.seal(String(input.password)) : old?.password || '';
+    const noProxy = normalizeNoProxy(input.noProxy ?? old?.noProxy ?? []);
+    if (noProxy === null) throw new HttpError(400, '直连例外应为逗号分隔的域名，最多 50 项');
+    const proxy = {
+      id, name: String(input.name || old?.name || id).trim().slice(0, 80), url, username, password, noProxy,
+      enabled: input.enabled !== false, updatedAt: new Date().toISOString()
+    };
+    this.data.proxies ||= [];
+    if (old) this.data.proxies[this.data.proxies.indexOf(old)] = proxy; else this.data.proxies.push(proxy);
+    this.save();
+    return this.publicProxy(proxy);
+  }
+  removeProxy(id) {
+    const proxy = this.getProxy(id);
+    const users = this.data.providers.filter(p => p.proxyId === id).map(p => p.id);
+    if (users.length) throw new HttpError(409, `代理仍被供应商使用：${users.join('、')}`);
+    this.data.proxies = this.data.proxies.filter(item => item !== proxy);
+    this.save();
+  }
   reorderProviders(ids) {
     const current = this.data.providers;
     if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string') || new Set(ids).size !== ids.length) throw new HttpError(400, '供应商排序必须是不重复的 ID 数组');
@@ -87,6 +124,12 @@ export class Store {
     if (noProxy === null) throw new HttpError(400, '直连例外应为逗号分隔的域名，最多 50 项');
     p.noProxy = noProxy;
     p.proxyEnabled = Boolean(input.proxyEnabled ?? old?.proxyEnabled) && Boolean(p.proxyUrl);
+    p.proxyId = String(input.proxyId ?? old?.proxyId ?? '').trim();
+    if (p.proxyId) {
+      if (!/^[a-z0-9][a-z0-9_-]{0,39}$/.test(p.proxyId)) throw new HttpError(400, '代理 ID 格式不正确');
+      if (!(this.data.proxies || []).some(item => item.id === p.proxyId)) throw new HttpError(400, '所选代理不存在，请先在「代理」页面创建');
+      p.proxyEnabled = false; p.proxyUrl = ''; p.proxyUsername = ''; p.proxyPassword = ''; p.noProxy = [];
+    }
     if (!Number.isFinite(p.timeout) || p.timeout < 10 || p.timeout > 600) throw new HttpError(400, '超时应为 10–600 秒');
     if (!['chat', 'responses', 'both'].includes(p.protocol)) throw new HttpError(400, '无效的接口协议');
     const validateRemote = () => {

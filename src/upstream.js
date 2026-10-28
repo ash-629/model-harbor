@@ -11,7 +11,7 @@ import { chatToolPlan } from './chat-tools.js';
 import { responsesToolPlan, restoreResponsesResponse, responsesEventRewriter } from './responses-tools.js';
 import { optimizePayloadImages, imageOptimizationSettings, shouldOptimizeProviderImages } from './image-optimizer.js';
 import { createChatReasoningTracker, rememberChatReasoning, restoreCachedReasoning } from './reasoning.js';
-import { dispatcherFor } from './provider-proxy.js';
+import { dispatcherForProvider } from './provider-proxy.js';
 import { cliProxyHeaders, grokCredential } from './grok-oauth.js';
 
 export function extractUpstreamError(text) {
@@ -67,7 +67,7 @@ export async function upstreamFetch(store, p, path, body, signal, sessionId = ''
   let response;
   try {
     response = await fetch(target, { method: body ? 'POST' : 'GET', headers,
-      body: encodedBody, signal: signal ? AbortSignal.any([signal, timeout]) : timeout, redirect: 'error', dispatcher: dispatcherFor(p, target, value => store.unseal(value)) });
+      body: encodedBody, signal: signal ? AbortSignal.any([signal, timeout]) : timeout, redirect: 'error', dispatcher: dispatcherForProvider(store, p, target) });
   } catch (e) {
     throw new HttpError(signal?.aborted ? 499 : e.name === 'TimeoutError' ? 504 : 502, signal?.aborted ? '请求已取消' : e.name === 'TimeoutError' ? '上游响应超时' : '无法连接上游，请检查 Base URL、网络或证书');
   }

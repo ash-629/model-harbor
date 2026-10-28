@@ -209,7 +209,7 @@ async function load() {
   $('stat-models').textContent = state.models.length;
   $('base-url-openai').textContent = state.baseUrl || ''; $('base-url-anthropic').textContent = (state.baseUrl || '').replace(/\/v1\/?$/, ''); renderConnection();
   renderSelectors();
-  renderModels(); renderProviders(); renderLogs(); capability();
+  renderModels(); renderProviders(); renderProxies(); renderLogs(); capability();
 }
 function renderSelectors() {
   const selected = $('provider-filter').value;
@@ -232,10 +232,34 @@ function renderModels() {
   $('model-footer').textContent = t('共 {count} 个模型 · 仅显示已启用供应商的配置模型', {count: models.length});
   $('refresh-all').disabled = busy || !state.providers.some(p => p.enabled);
 }
+function proxyName(id) { return (state.proxies || []).find(item => item.id === id)?.name || id; }
+function renderProxies() {
+  const list = state.proxies || [];
+  $('proxies-empty').hidden = Boolean(list.length);
+  $('proxies-grid').innerHTML = list.map(px => `<article class="panel provider-card"><div class="provider-top"><div class="provider-mark">⇄</div><span class="status-pill ${px.enabled ? '' : 'off'}">${px.enabled ? t('已启用') : t('已停用')}</span></div><h3>${h(px.name)}</h3><code class="model-id">${h(px.id)}</code><p>${h(px.url)}</p><div class="provider-meta"><span>${px.hasPassword ? t('需要认证') : t('无认证')}</span><span>·</span><span>${t('{count} 个供应商在用', { count: (state.providers || []).filter(p => p.proxyId === px.id).length })}</span></div><div class="provider-actions"><button class="button ghost" data-proxy-test="${h(px.id)}" ${busy ? 'disabled' : ''}>${t('测试连通')}</button><button class="button ghost" data-proxy-edit="${h(px.id)}" ${busy ? 'disabled' : ''}>${t('编辑')}</button><button class="button ghost danger" data-proxy-delete="${h(px.id)}" ${busy ? 'disabled' : ''}>${t('删除')}</button></div></article>`).join('');
+}
+let proxyEditing = null;
+function openProxyEditor(id) {
+  proxyEditing = id || null;
+  $('proxy-form').reset(); errorBox('proxy-editor-error');
+  const px = id ? (state.proxies || []).find(item => item.id === id) : null;
+  $('proxy-editor-title').textContent = px ? t('编辑代理') : t('添加代理');
+  $('px-id').disabled = Boolean(px);
+  $('px-id').value = px?.id || '';
+  $('px-name').value = px?.name || '';
+  $('px-url').value = px?.url || '';
+  $('px-user').value = px?.username || '';
+  $('px-password').value = '';
+  $('px-clear').checked = false;
+  $('px-clear-label').hidden = !px?.hasPassword;
+  $('px-no-proxy').value = (px?.noProxy || []).join(', ');
+  $('px-enabled').checked = px ? px.enabled !== false : true;
+  $('proxy-dialog').showModal();
+}
 function renderProviders() {
   if (providerDrag) return;
   $('providers-empty').hidden = Boolean(state.providers.length);
-  $('providers-grid').innerHTML = state.providers.map(p => `<article class="panel provider-card" data-provider-row="${h(p.id)}"><div class="provider-top"><button type="button" class="provider-drag-handle" data-provider-drag="${h(p.id)}" aria-label="${h(t('拖动排序；方向键上下移动'))}" title="${h(t('拖动排序；方向键上下移动'))}" ${busy ? 'disabled' : ''}>⠿</button><div class="provider-mark">${p.type === 'nas-codex' ? '⌂' : p.type === 'claude-code' ? '✦' : h(p.name.slice(0, 1).toUpperCase())}</div><span class="status-pill ${p.enabled ? '' : 'off'}">${p.enabled ? t('已启用') : t('已停用')}</span></div><h3>${h(p.name)}</h3><code class="model-id">${h(p.id)} / ${p.type === 'nas-codex' ? (p.execution === 'ssh' ? 'Codex · SSH' : 'Codex · SSH + Docker') : p.type === 'claude-code' ? (p.execution === 'ssh' ? 'Claude · SSH' : 'Claude · SSH + Docker') : openCodeGoProvider(p) ? t('Chat + Responses · 自动路由') : h(p.protocol)}</code><p>${h(p.baseUrl || `${p.sshUser}@${p.sshHost}${p.execution === 'ssh' ? '' : ' · ' + p.container}`)}</p><div class="provider-meta"><span>${t('{count} 个模型', {count: p.models.length})}</span><span>·</span>${p.type === 'grok' ? `<span>·</span><span>${p.grok?.authorized ? t('已授权') : t('未授权')}</span>` : ''}<span>${p.lastSync ? t('同步于 {time}', {time: new Date(p.lastSync).toLocaleTimeString(getLanguage(), {hour:'2-digit',minute:'2-digit'})}) : t('尚未同步')}</span></div>${usageMarkup(p)}${p.type === 'grok' ? `<button class="button ghost" data-grok-oauth="${h(p.id)}" ${busy ? 'disabled' : ''}>${p.grok?.authorized ? t('重新授权') : t('授权')}</button>` : ''}<div class="provider-actions"><button class="button ghost" data-refresh="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('↻ 刷新模型')}</button><button class="button ghost" data-edit="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('编辑')}</button><button class="button ghost danger" data-delete="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('删除')}</button></div></article>`).join('');
+  $('providers-grid').innerHTML = state.providers.map(p => `<article class="panel provider-card" data-provider-row="${h(p.id)}"><div class="provider-top"><button type="button" class="provider-drag-handle" data-provider-drag="${h(p.id)}" aria-label="${h(t('拖动排序；方向键上下移动'))}" title="${h(t('拖动排序；方向键上下移动'))}" ${busy ? 'disabled' : ''}>⠿</button><div class="provider-mark">${p.type === 'nas-codex' ? '⌂' : p.type === 'claude-code' ? '✦' : h(p.name.slice(0, 1).toUpperCase())}</div><span class="status-pill ${p.enabled ? '' : 'off'}">${p.enabled ? t('已启用') : t('已停用')}</span></div><h3>${h(p.name)}</h3><code class="model-id">${h(p.id)} / ${p.type === 'nas-codex' ? (p.execution === 'ssh' ? 'Codex · SSH' : 'Codex · SSH + Docker') : p.type === 'claude-code' ? (p.execution === 'ssh' ? 'Claude · SSH' : 'Claude · SSH + Docker') : openCodeGoProvider(p) ? t('Chat + Responses · 自动路由') : h(p.protocol)}</code><p>${h(p.baseUrl || `${p.sshUser}@${p.sshHost}${p.execution === 'ssh' ? '' : ' · ' + p.container}`)}</p><div class="provider-meta"><span>${t('{count} 个模型', {count: p.models.length})}</span><span>·</span>${p.type === 'grok' ? `<span>·</span><span>${p.grok?.authorized ? t('已授权') : t('未授权')}</span>` : ''}${p.proxyId ? `<span>·</span><span>${t('代理：{name}', { name: proxyName(p.proxyId) })}</span>` : ''}<span>${p.lastSync ? t('同步于 {time}', {time: new Date(p.lastSync).toLocaleTimeString(getLanguage(), {hour:'2-digit',minute:'2-digit'})}) : t('尚未同步')}</span></div>${usageMarkup(p)}${p.type === 'grok' ? `<button class="button ghost" data-grok-oauth="${h(p.id)}" ${busy ? 'disabled' : ''}>${p.grok?.authorized ? t('重新授权') : t('授权')}</button>` : ''}<div class="provider-actions"><button class="button ghost" data-refresh="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('↻ 刷新模型')}</button><button class="button ghost" data-edit="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('编辑')}</button><button class="button ghost danger" data-delete="${h(p.id)}" ${busy ? 'disabled' : ''}>${t('删除')}</button></div></article>`).join('');
   renderGroups();
 }
 
@@ -377,7 +401,7 @@ function capability() {
   const model = state.models.find(m => m.id === $('test-model').value);
   $('test-capability').textContent = model?.source === 'nas-codex' || model?.source === 'codex-group' ? t('远程 Codex 支持客户端工具调用；由客户端执行工具，远端负责推理。') : model?.source === 'claude-code' ? t('Claude Code 支持客户端 function/custom 工具；由客户端执行操作，容器负责推理。') : model?.source === 'grok-code' ? t('Grok 支持客户端 function/custom 工具；由客户端执行操作，容器负责推理。') : '';
 }
-const views = new Set(['overview', 'providers', 'images', 'videos', 'logs', 'tools', 'settings']);
+const views = new Set(['overview', 'providers', 'proxies', 'images', 'videos', 'logs', 'tools', 'settings']);
 function viewFromLocation() {
   const name = location.hash.replace(/^#\/?/, '');
   return views.has(name) ? name : 'overview';
@@ -385,16 +409,17 @@ function viewFromLocation() {
 function view(name, { updateUrl = true } = {}) {
   if (!views.has(name)) name = 'overview';
   currentView = name;
-  document.querySelector('.stats').hidden = ['images', 'videos', 'tools', 'settings'].includes(name);
-  $('add-btn').hidden = ['images', 'videos', 'tools', 'settings'].includes(name);
+  document.querySelector('.stats').hidden = ['images', 'videos', 'tools', 'settings', 'proxies'].includes(name);
+  $('add-btn').hidden = ['images', 'videos', 'tools', 'settings', 'proxies'].includes(name);
   imageUI.setVisible(name === 'images');
   videoUI.setVisible(name === 'videos');
   document.querySelectorAll('.view').forEach(el => el.hidden = el.id !== name + '-view');
   document.querySelectorAll('.nav').forEach(el => el.classList.toggle('active', el.dataset.view === name));
-  const names = { videos: [t('生成视频'), t('让描述动起来。'), t('用 Grok 订阅生成短片，可带最多 3 张参考图。')], tools: [t('工具下载'), t('常用工具，一处获取。'), t('检查更新并通过 OpenWrt 代理缓存安装包。')], settings: [t('设置'), t('管理你的模型港。'), t('配置管理页面的登录方式。')], images: [t('生成图像'), t('描述你的想象。'), t('从一句话开始，把想法变成可以保存的图像。')], overview: [t('模型总览'), t('所有模型，一个入口。'), t('连接不同来源，在同一份模型列表里自由选择。')], providers: [t('供应商'), t('连接你的模型来源。'), t('统一管理 API 服务与远程 Codex。')], logs: [t('请求记录'), t('每一次调用，都有迹可循。'), t('检查路由结果、响应状态与请求耗时。')] };
+  const names = { videos: [t('生成视频'), t('让描述动起来。'), t('用 Grok 订阅生成短片，可带最多 3 张参考图。')], tools: [t('工具下载'), t('常用工具，一处获取。'), t('检查更新并通过 OpenWrt 代理缓存安装包。')], settings: [t('设置'), t('管理你的模型港。'), t('配置管理页面的登录方式。')], images: [t('生成图像'), t('描述你的想象。'), t('从一句话开始，把想法变成可以保存的图像。')], overview: [t('模型总览'), t('所有模型，一个入口。'), t('连接不同来源，在同一份模型列表里自由选择。')], providers: [t('供应商'), t('连接你的模型来源。'), t('统一管理 API 服务与远程 Codex。')], proxies: [t('代理'), t('集中管理出站代理。'), t('保存常用代理，供应商直接选用。')], logs: [t('请求记录'), t('每一次调用，都有迹可循。'), t('检查路由结果、响应状态与请求耗时。')] };
   [$('page-name').textContent, $('heading').textContent, $('subtitle').textContent] = names[name];
   if (name === 'settings') loadSettings();
   if (name === 'tools') loadTools(); else stopToolPoll();
+  if (name === 'proxies') renderProxies();
   if (name === 'providers') for (const p of state.providers) if ((p.type === 'nas-codex' || p.type === 'claude-code' || p.type === 'grok-code' || balanceProvider(p) || openCodeGoProvider(p)) && p.enabled) loadUsage(p.id);
   if (updateUrl && location.hash !== '#' + name) history.pushState({ view: name }, '', '#' + name);
 }
@@ -458,6 +483,18 @@ function typeFields() {
   $('p-codex').placeholder = grok ? '/home/dev/.local/bin/grok' : claude ? '/home/dev/.local/bin/claude' : '/home/ubuntu/.local/bin/codex';
 }
 
+function fillProxySelect(selected) {
+  const options = [`<option value="">${t('不使用代理')}</option>`]
+    .concat((state.proxies || []).map(item => `<option value="${h(item.id)}">${h(item.name)}</option>`))
+    .concat([`<option value="__custom">${t('自定义代理')}</option>`]);
+  $('p-proxy-id').innerHTML = options.join('');
+  $('p-proxy-id').value = selected;
+}
+function syncProxyMode() {
+  const custom = $('p-proxy-id').value === '__custom';
+  $('p-proxy-custom').hidden = !custom;
+  if (!custom) $('p-proxy-enabled').checked = false;
+}
 function openEditor(id) {
   editing = id || null; $('provider-form').reset(); errorBox('editor-error');
   const p = id ? state.providers.find(p => p.id === id) : null;
@@ -478,6 +515,8 @@ function openEditor(id) {
   $('clear-proxy-password-label').hidden = !p?.hasProxyPassword;
   $('p-no-proxy').value = (p?.noProxy || []).join(', ');
   $('p-grok-auth-mode').value = p?.grokAuthMode || 'oauth';
+  fillProxySelect(p ? (p.proxyId || (p.proxyUrl ? '__custom' : '')) : '');
+  syncProxyMode();
   if (p) {
     const fields = { 'p-name': 'name', 'p-id': 'id', 'p-url': 'baseUrl', 'p-protocol': 'protocol', 'p-host': 'sshHost', 'p-user': 'sshUser', 'p-ssh-port': 'sshPort', 'p-ssh-key': 'sshKeyPath', 'p-container': 'container', 'p-docker-path': 'dockerPath', 'p-timeout': 'timeout' };
     for (const [id, key] of Object.entries(fields)) $(id).value = p[key] ?? '';
@@ -494,6 +533,7 @@ function syncGrokMode() {
   $('p-url').placeholder = oauth ? 'https://cli-chat-proxy.grok.com/v1' : 'https://api.x.ai/v1';
 }
 $('p-grok-auth-mode').addEventListener('change', syncGrokMode);
+$('p-proxy-id').addEventListener('change', syncProxyMode);
 $('p-execution').addEventListener('change', typeFields);
 function syncOpenCodeGoPreset() {
   const selected = $('preset').value === 'opencode-go';
@@ -542,10 +582,23 @@ $('preset').addEventListener('change', () => {
 $('og-preset-open').addEventListener('click', event => {
   event.preventDefault(); openOpenCodeGo();
 });
+$('add-proxy').addEventListener('click', () => openProxyEditor());
+$('proxy-form').addEventListener('submit', async event => {
+  event.preventDefault(); if (busy) return;
+  const input = { id: $('px-id').value.trim(), name: $('px-name').value, url: $('px-url').value.trim(),
+    username: $('px-user').value.trim(), password: $('px-password').value, clearPassword: $('px-clear').checked,
+    noProxy: $('px-no-proxy').value.split(/[\n,，\s]+/).map(v => v.trim()).filter(Boolean), enabled: $('px-enabled').checked };
+  busy = true; $('save-proxy').disabled = true; errorBox('proxy-editor-error');
+  try {
+    await api('/proxies' + (proxyEditing ? '/' + proxyEditing : ''), { method: proxyEditing ? 'PUT' : 'POST', body: JSON.stringify(input) });
+    $('proxy-dialog').close(); await load(); toast(t('代理已保存'));
+  } catch (e) { errorBox('proxy-editor-error', e.message); }
+  finally { busy = false; $('save-proxy').disabled = false; }
+});
 $('provider-form').addEventListener('submit', async event => {
   event.preventDefault(); if (busy || $('preset').value === 'opencode-go') return;
   const input = { id: $('p-id').value.trim(), name: $('p-name').value, type: $('p-type').value, baseUrl: $('p-url').value.trim(), protocol: $('p-protocol').value, apiKey: $('p-key').value, clearApiKey: $('p-clear-key').checked, enabled: $('p-enabled').checked,
-    models: $('p-models').value.split(/[\n,，]/).map(m => m.trim()).filter(Boolean), timeout: Number($('p-timeout').value), sshHost: $('p-host').value.trim(), sshUser: $('p-user').value.trim(), sshPort: Number($('p-ssh-port').value || 22), sshKeyPath: $('p-ssh-key').value.trim(), container: $('p-container').value.trim(), dockerPath: $('p-docker-path').value.trim(), execution: $('p-execution').value, codexPath: $('p-type').value === 'nas-codex' ? $('p-codex').value.trim() : undefined, claudePath: $('p-type').value === 'claude-code' ? $('p-codex').value.trim() : undefined, proxyEnabled: $('p-proxy-enabled').checked, proxyUrl: $('p-proxy-url').value.trim(), proxyUsername: $('p-proxy-user').value.trim(), proxyPassword: $('p-proxy-password').value, clearProxyPassword: $('p-clear-proxy-password').checked, grokAuthMode: $('p-grok-auth-mode').value, noProxy: $('p-no-proxy').value.split(/[\n,，\s]+/).map(v => v.trim()).filter(Boolean) };
+    models: $('p-models').value.split(/[\n,，]/).map(m => m.trim()).filter(Boolean), timeout: Number($('p-timeout').value), sshHost: $('p-host').value.trim(), sshUser: $('p-user').value.trim(), sshPort: Number($('p-ssh-port').value || 22), sshKeyPath: $('p-ssh-key').value.trim(), container: $('p-container').value.trim(), dockerPath: $('p-docker-path').value.trim(), execution: $('p-execution').value, codexPath: $('p-type').value === 'nas-codex' ? $('p-codex').value.trim() : undefined, claudePath: $('p-type').value === 'claude-code' ? $('p-codex').value.trim() : undefined, proxyEnabled: $('p-proxy-enabled').checked, proxyUrl: $('p-proxy-url').value.trim(), proxyUsername: $('p-proxy-user').value.trim(), proxyPassword: $('p-proxy-password').value, clearProxyPassword: $('p-clear-proxy-password').checked, grokAuthMode: $('p-grok-auth-mode').value, proxyId: $('p-proxy-id').value === '__custom' ? '' : $('p-proxy-id').value, noProxy: $('p-no-proxy').value.split(/[\n,，\s]+/).map(v => v.trim()).filter(Boolean) };
   if (input.type === 'openai') input.tokenOptimization = { ...(state.providers.find(p => p.id === editing)?.tokenOptimization || {}), enabled: $('p-token-enabled').checked, captureStreamUsage: $('p-token-usage').checked };
   busy = true; saving = true; $('save-provider').disabled = true; $('save-provider').textContent = t('正在保存…'); errorBox('editor-error');
   try {
@@ -687,6 +740,23 @@ document.addEventListener('click', async event => {
   if (el.classList.contains('close-dialog')) el.closest('dialog').close();
   if (el.dataset.edit) openEditor(el.dataset.edit);
   if (el.dataset.grokOauth) openGrokOAuth(el.dataset.grokOauth);
+  if (el.dataset.proxyEdit) openProxyEditor(el.dataset.proxyEdit);
+  if (el.dataset.proxyTest && !busy) {
+    busy = true; renderProxies();
+    try {
+      const result = await api('/proxies/' + el.dataset.proxyTest + '/test', { method: 'POST', body: '{}' });
+      toast(result.ok ? t('代理可用（HTTP {status}，{ms} ms）', { status: result.status, ms: result.ms }) : t('代理不可用：{message}', { message: result.message || t('连接失败') }));
+    } catch (e) { errorBox('global-error', e.message); }
+    finally { busy = false; renderProxies(); }
+  }
+  if (el.dataset.proxyDelete && !busy) {
+    const px = (state.proxies || []).find(item => item.id === el.dataset.proxyDelete);
+    if (!px || !confirm(t('删除代理「{name}」？', { name: px.name }))) return;
+    busy = true;
+    try { await api('/proxies/' + px.id, { method: 'DELETE' }); await load(); toast(t('代理已删除')); }
+    catch (e) { errorBox('global-error', e.message); }
+    finally { busy = false; renderProxies(); }
+  }
   if (el.dataset.groupEdit) openGroupEditor(el.dataset.groupEdit);
   if (el.dataset.groupSync) syncGroup(el.dataset.groupSync);
   if (el.dataset.groupClear) clearGroupCooldowns(el.dataset.groupClear);
