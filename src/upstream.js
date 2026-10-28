@@ -11,6 +11,7 @@ import { chatToolPlan } from './chat-tools.js';
 import { responsesToolPlan, restoreResponsesResponse, responsesEventRewriter } from './responses-tools.js';
 import { optimizePayloadImages, imageOptimizationSettings, shouldOptimizeProviderImages } from './image-optimizer.js';
 import { createChatReasoningTracker, rememberChatReasoning, restoreCachedReasoning } from './reasoning.js';
+import { dispatcherFor } from './provider-proxy.js';
 
 export function extractUpstreamError(text) {
   let parsed; try { parsed = JSON.parse(text); } catch {}
@@ -61,8 +62,9 @@ export async function upstreamFetch(store, p, path, body, signal, sessionId = ''
   const requestBytes = encodedBody === undefined ? 0 : Buffer.byteLength(encodedBody, 'utf8');
   let response;
   try {
-    response = await fetch(`${p.baseUrl}/${path}`, { method: body ? 'POST' : 'GET', headers,
-      body: encodedBody, signal: signal ? AbortSignal.any([signal, timeout]) : timeout, redirect: 'error' });
+    const target = `${p.baseUrl}/${path}`;
+    response = await fetch(target, { method: body ? 'POST' : 'GET', headers,
+      body: encodedBody, signal: signal ? AbortSignal.any([signal, timeout]) : timeout, redirect: 'error', dispatcher: dispatcherFor(p, target, value => store.unseal(value)) });
   } catch (e) {
     throw new HttpError(signal?.aborted ? 499 : e.name === 'TimeoutError' ? 504 : 502, signal?.aborted ? '请求已取消' : e.name === 'TimeoutError' ? '上游响应超时' : '无法连接上游，请检查 Base URL、网络或证书');
   }

@@ -468,6 +468,13 @@ function openEditor(id) {
   $('clear-key-label').hidden = !p?.hasApiKey;
   $('p-token-enabled').checked = p?.tokenOptimization?.enabled === true;
   $('p-token-usage').checked = p?.tokenOptimization?.captureStreamUsage === true;
+  $('p-proxy-enabled').checked = p?.proxyEnabled === true;
+  $('p-proxy-url').value = p?.proxyUrl || '';
+  $('p-proxy-user').value = p?.proxyUsername || '';
+  $('p-proxy-password').value = '';
+  $('p-clear-proxy-password').checked = false;
+  $('clear-proxy-password-label').hidden = !p?.hasProxyPassword;
+  $('p-no-proxy').value = (p?.noProxy || []).join(', ');
   if (p) {
     const fields = { 'p-name': 'name', 'p-id': 'id', 'p-url': 'baseUrl', 'p-protocol': 'protocol', 'p-host': 'sshHost', 'p-user': 'sshUser', 'p-ssh-port': 'sshPort', 'p-ssh-key': 'sshKeyPath', 'p-container': 'container', 'p-docker-path': 'dockerPath', 'p-timeout': 'timeout' };
     for (const [id, key] of Object.entries(fields)) $(id).value = p[key] ?? '';
@@ -524,7 +531,7 @@ $('og-preset-open').addEventListener('click', event => {
 $('provider-form').addEventListener('submit', async event => {
   event.preventDefault(); if (busy || $('preset').value === 'opencode-go') return;
   const input = { id: $('p-id').value.trim(), name: $('p-name').value, type: $('p-type').value, baseUrl: $('p-url').value.trim(), protocol: $('p-protocol').value, apiKey: $('p-key').value, clearApiKey: $('p-clear-key').checked, enabled: $('p-enabled').checked,
-    models: $('p-models').value.split(/[\n,，]/).map(m => m.trim()).filter(Boolean), timeout: Number($('p-timeout').value), sshHost: $('p-host').value.trim(), sshUser: $('p-user').value.trim(), sshPort: Number($('p-ssh-port').value || 22), sshKeyPath: $('p-ssh-key').value.trim(), container: $('p-container').value.trim(), dockerPath: $('p-docker-path').value.trim(), execution: $('p-execution').value, codexPath: $('p-type').value === 'nas-codex' ? $('p-codex').value.trim() : undefined, claudePath: $('p-type').value === 'claude-code' ? $('p-codex').value.trim() : undefined };
+    models: $('p-models').value.split(/[\n,，]/).map(m => m.trim()).filter(Boolean), timeout: Number($('p-timeout').value), sshHost: $('p-host').value.trim(), sshUser: $('p-user').value.trim(), sshPort: Number($('p-ssh-port').value || 22), sshKeyPath: $('p-ssh-key').value.trim(), container: $('p-container').value.trim(), dockerPath: $('p-docker-path').value.trim(), execution: $('p-execution').value, codexPath: $('p-type').value === 'nas-codex' ? $('p-codex').value.trim() : undefined, claudePath: $('p-type').value === 'claude-code' ? $('p-codex').value.trim() : undefined, proxyEnabled: $('p-proxy-enabled').checked, proxyUrl: $('p-proxy-url').value.trim(), proxyUsername: $('p-proxy-user').value.trim(), proxyPassword: $('p-proxy-password').value, clearProxyPassword: $('p-clear-proxy-password').checked, noProxy: $('p-no-proxy').value.split(/[\n,，\s]+/).map(v => v.trim()).filter(Boolean) };
   if (input.type === 'openai') input.tokenOptimization = { ...(state.providers.find(p => p.id === editing)?.tokenOptimization || {}), enabled: $('p-token-enabled').checked, captureStreamUsage: $('p-token-usage').checked };
   busy = true; saving = true; $('save-provider').disabled = true; $('save-provider').textContent = t('正在保存…'); errorBox('editor-error');
   try {

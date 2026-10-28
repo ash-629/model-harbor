@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { tokenPolicy } from './api-token-policy.js';
+import { normalizeNoProxy, parseProxyUrl } from './provider-proxy.js';
 
 export class HttpError extends Error {
   constructor(status, message, code = 'invalid_request_error') { super(message); this.status = status; this.code = code; }
@@ -35,7 +36,7 @@ export class Store {
     fs.writeFileSync(this.file + '.tmp', JSON.stringify(this.data, null, 2), { mode: 0o600 });
     fs.renameSync(this.file + '.tmp', this.file);
   }
-  publicProvider(p) { const { apiKey, ...rest } = p; return { ...rest, hasApiKey: Boolean(apiKey || p.openCodeAuthId) }; }
+  publicProvider(p) { const { apiKey, proxyPassword, ...rest } = p; return { ...rest, hasApiKey: Boolean(apiKey || p.openCodeAuthId), hasProxyPassword: Boolean(proxyPassword) }; }
   list() { return this.data.providers.map(p => this.publicProvider(p)); }
   reorderProviders(ids) {
     const current = this.data.providers;
@@ -65,6 +66,16 @@ export class Store {
       protocol: input.protocol || 'chat', timeout: Number(input.timeout ?? old?.timeout ?? (type === 'nas-codex' ? 600 : 180)),
       updatedAt: new Date().toISOString(), lastSync: old?.lastSync || null
     };
+    const proxyUrl = parseProxyUrl(input.proxyUrl ?? old?.proxyUrl ?? '');
+    if (proxyUrl === null) throw new HttpError(400, '代理地址只支持 HTTP/HTTPS，且不能包含账号、查询或片段');
+    p.proxyUrl = proxyUrl;
+    p.proxyUsername = String(input.proxyUsername ?? old?.proxyUsername ?? '').trim();
+    if (p.proxyUsername.length > 128 || /[\x00-\x1f\x7f]/.test(p.proxyUsername)) throw new HttpError(400, '代理用户名应为 0–128 个可见字符');
+    p.proxyPassword = input.clearProxyPassword ? '' : input.proxyPassword ? this.seal(String(input.proxyPassword)) : old?.proxyPassword || '';
+    const noProxy = normalizeNoProxy(input.noProxy ?? old?.noProxy ?? []);
+    if (noProxy === null) throw new HttpError(400, '直连例外应为逗号分隔的域名，最多 50 项');
+    p.noProxy = noProxy;
+    p.proxyEnabled = Boolean(input.proxyEnabled ?? old?.proxyEnabled) && Boolean(p.proxyUrl);
     if (!Number.isFinite(p.timeout) || p.timeout < 10 || p.timeout > 600) throw new HttpError(400, '超时应为 10–600 秒');
     if (!['chat', 'responses', 'both'].includes(p.protocol)) throw new HttpError(400, '无效的接口协议');
     const validateRemote = () => {
