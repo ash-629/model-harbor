@@ -162,9 +162,24 @@ export async function grokCredential(store, provider, options = {}) {
 export class GrokOAuth {
   constructor(store, { fetchImpl = null, now = () => Date.now() } = {}) {
     this.store = store; this.fetchImpl = fetchImpl; this.now = now; this.sessions = new Map();
+    // Pending authorizations survive restarts: the PKCE verifier is useless
+    // without its matching state, and it is stored sealed like other secrets.
+    for (const [state, session] of Object.entries(this.store.readGrokPending?.() || {})) {
+      if (session && session.expires > this.now()) this.sessions.set(state, { ...session, restored: true });
+    }
+  }
+  persist() {
+    const value = {};
+    for (const [state, session] of this.sessions) {
+      if (session.expires <= this.now()) continue;
+      value[state] = { providerId: session.providerId, verifier: session.verifier, redirectUri: session.redirectUri, expires: session.expires, owner: session.owner };
+    }
+    this.store.writeGrokPending?.(value);
   }
   prune() {
-    for (const [state, session] of this.sessions) if (session.expires < this.now()) this.sessions.delete(state);
+    let removed = false;
+    for (const [state, session] of this.sessions) if (session.expires < this.now()) { this.sessions.delete(state); removed = true; }
+    if (removed) this.persist();
   }
   start(owner, providerId) {
     this.prune();
@@ -177,17 +192,29 @@ export class GrokOAuth {
     const nonce = b64url(crypto.randomBytes(16));
     const expires = this.now() + SESSION_TTL;
     this.sessions.set(state, { owner, providerId, verifier, redirectUri: GROK_REDIRECT_URI, expires, consumed: false });
+    this.persist();
     return { state, url: buildAuthorizeUrl({ state, challenge, nonce }), redirectUri: GROK_REDIRECT_URI, expiresAt: new Date(expires).toISOString() };
   }
   async exchange(owner, providerId, input, signal) {
     this.prune();
     const parsed = parseCallbackInput(input?.callback ?? input?.code ?? '');
-    if (!parsed.code) throw new HttpError(400, '请粘贴浏览器地址栏里的回调地址，或直接粘贴 code');
-    const state = parsed.state || String(input?.state || '').trim();
-    const session = this.sessions.get(state);
-    if (!session) throw new HttpError(400, '授权会话已过期，请重新开始授权');
-    if (session.owner !== owner || session.providerId !== providerId) throw new HttpError(404, '授权会话不存在，请重新开始授权');
-    if (session.consumed) throw new HttpError(409, '该授权回调已经使用过，请重新开始授权');
+    if (!parsed.code) throw new HttpError(400, '请粘贴授权码，或地址栏里的完整回调地址');
+    const requested = parsed.state || String(input?.state || '').trim();
+    let state = requested;
+    let session = requested ? this.sessions.get(requested) : null;
+    // A bare code carries no state. Use the newest pending session for this
+    // provider instead, so pasting just the code works.
+    if (!session) {
+      if (requested) throw new HttpError(400, '授权会话已过期，请重新开始授权');
+      const candidates = [...this.sessions.entries()]
+        .filter(([, value]) => value.providerId === providerId && !value.consumed && value.expires > this.now())
+        .sort((a, b) => b[1].expires - a[1].expires);
+      if (!candidates.length) throw new HttpError(400, '没有待完成的授权，请先点「开始授权」');
+      [state, session] = candidates[0];
+    }
+    if (!session.restored && (session.owner !== owner || session.providerId !== providerId)) throw new HttpError(404, '授权会话不存在，请重新开始授权');
+    if (session.providerId !== providerId) throw new HttpError(404, '授权会话不属于该供应商');
+    if (session.consumed) throw new HttpError(409, '该授权码已经使用过，请重新开始授权');
     session.consumed = true;
     const provider = this.store.get(providerId);
     const options = { signal };
@@ -206,6 +233,7 @@ export class GrokOAuth {
     saveCredential(this.store, authId, value);
     const saved = this.store.setGrokAuth(providerId, authId);
     this.sessions.delete(state);
+    this.persist();
     return { provider: saved, email: value.email || '', expiresAt: new Date(value.expires).toISOString() };
   }
 }

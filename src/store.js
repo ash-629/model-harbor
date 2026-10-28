@@ -210,6 +210,14 @@ export class Store {
     this.save();
     return this.publicProvider(p);
   }
+  readGrokPending() {
+    if (!this.data.grokPending) return {};
+    try { return JSON.parse(this.unseal(this.data.grokPending)); } catch { return {}; }
+  }
+  writeGrokPending(map) {
+    this.data.grokPending = map && Object.keys(map).length ? this.seal(JSON.stringify(map)) : '';
+    this.save();
+  }
   clearGrokAuth(id) {
     const p = this.get(id);
     if (p.grokAuthId && this.data.grokAuth) delete this.data.grokAuth[p.grokAuthId];

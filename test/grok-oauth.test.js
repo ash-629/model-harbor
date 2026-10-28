@@ -241,3 +241,28 @@ test('gateway chat requests reach the subscription proxy with CLI identity heade
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a bare authorization code uses the newest pending session and survives restarts', async () => {
+  const { dir, store } = tempStore();
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url: String(url), body: init.body });
+    return json(tokenPayload({ access_token: 'at-bare', refresh_token: 'rt-bare' }));
+  };
+  try {
+    store.upsert(providerInput());
+    const started = new GrokOAuth(store, { fetchImpl }).start('sess-1', 'grokx');
+    assert.ok(JSON.parse(store.unseal(store.data.grokPending))[started.state], 'pending session is persisted sealed');
+
+    // A fresh instance (as after a restart) restores the pending PKCE verifier.
+    const restarted = new GrokOAuth(store, { fetchImpl });
+    const result = await restarted.exchange('other-session', 'grokx', { callback: '7hqQxFDuZdJMwrVRpIUsVwIlZh-bare-code' });
+    assert.equal(result.provider.grok.authorized, true);
+    const form = new URLSearchParams(calls[0].body);
+    assert.equal(form.get('code'), '7hqQxFDuZdJMwrVRpIUsVwIlZh-bare-code');
+    assert.ok(form.get('code_verifier'));
+    assert.equal(store.data.grokPending, '');
+
+    await assert.rejects(restarted.exchange('other-session', 'grokx', { callback: 'another-code' }), /先点「开始授权」/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
