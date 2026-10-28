@@ -73,3 +73,31 @@ test('reasoning-only history retries the exact compaction decode error once', as
   assert.deepEqual(calls[1].input, [body.input[1]]);
   assert.equal(body.input[0].encrypted_content, 'foreign');
 });
+
+test('Grok OAuth retries a foreign compaction blob once without losing visible input', async t => {
+  const provider = {
+    id: 'grokx', name: 'Grok 订阅 (OAuth)', type: 'grok', grokAuthMode: 'oauth', grokAuthId: 'auth-1',
+    baseUrl: 'https://cli-chat-proxy.grok.com/v1', protocol: 'responses'
+  };
+  const store = {
+    data: { grokAuth: { 'auth-1': JSON.stringify({ access: 'at-live', refresh: 'rt-live', expires: Date.now() + 3600000 }) } },
+    unseal: value => value, seal: value => value, save() {}
+  };
+  const body = { model: 'grok-4.7', input: [{ type: 'compaction', encrypted_content: 'foreign-blob' }, { role: 'user', content: 'hi' }] };
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    const payload = JSON.parse(options.body); calls.push(payload);
+    return calls.length === 1
+      ? new Response(JSON.stringify({ error: { message: 'Could not decode the compaction blob. Ensure it is unmodified from the compact response.' } }), { status: 400 })
+      : new Response(JSON.stringify({ status: 'completed', output: [] }));
+  });
+  const res = {};
+  await route(store, provider, 'grok-4.7', body, 'responses', res);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].input[0].encrypted_content, 'foreign-blob');
+  assert.equal(calls[1].input[0].type, 'message');
+  assert.deepEqual(calls[1].input.at(-1), body.input.at(-1));
+  assert.equal(JSON.stringify(calls[1]).includes('encrypted_content'), false);
+  assert.deepEqual(res.apiMetrics.compactionFallback, { count: 1, missing: 1 });
+  assert.equal(body.input[0].encrypted_content, 'foreign-blob');
+});

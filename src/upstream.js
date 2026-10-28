@@ -180,7 +180,11 @@ export async function route(store, p, model, body, endpoint, res, signal, nasAge
   try {
     upstream = await upstreamFetch(store, p, native === 'chat' ? 'chat/completions' : 'responses', payload, signal, sessionId);
   } catch (error) {
-    const fallback = go && native === 'responses' && error.status === 400 && /Could not decode the compaction blob|Could not decrypt the provided encrypted_content/i.test(error.message) ? compactionFallback(payload) : null;
+    // Compaction ciphertext is bound to the provider that produced it. Grok
+    // (OAuth and Go) rejects blobs minted elsewhere, so retry once without
+    // them and keep the visible history.
+    const compactionRetry = (go || p.type === 'grok') && native === 'responses';
+    const fallback = compactionRetry && error.status === 400 && /Could not decode the compaction blob|Could not decrypt the provided encrypted_content/i.test(error.message) ? compactionFallback(payload) : null;
     if (!fallback || signal?.aborted) throw error;
     payload = fallback.payload;
     metrics.compactionFallback = { count: fallback.count, missing: fallback.missing };
