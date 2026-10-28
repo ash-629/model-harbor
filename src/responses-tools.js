@@ -117,6 +117,23 @@ export function responsesToolPlan(body, { dropHosted = false } = {}) {
   return { request, byAlias, originalTools, transformed, droppedHosted: [...droppedHosted], droppedArguments: [...droppedArguments] };
 }
 
+// cli-chat-proxy (Grok subscription) deserializes strictly: explicit nulls are
+// rejected, reasoning always needs a summary array, and message content must be
+// a string or a (possibly empty) array.
+function normalizeGrokItem(item) {
+  const out = { ...item };
+  if (out.type === 'reasoning') {
+    if (!Array.isArray(out.summary)) out.summary = [];
+    if (!Array.isArray(out.content)) delete out.content;
+    if (out.encrypted_content == null) delete out.encrypted_content;
+  } else if (out.type === 'message' && typeof out.content !== 'string' && !Array.isArray(out.content)) {
+    out.content = [];
+  }
+  if (out.id === null) delete out.id;
+  if (out.status === null) delete out.status;
+  return out;
+}
+
 // cli-chat-proxy (Grok subscription) rejects client-only item types, metadata
 // and previous_response_id. Custom tools are rewritten by responsesToolPlan.
 export function grokResponsesPlan(body) {
@@ -124,11 +141,13 @@ export function grokResponsesPlan(body) {
   let request = plan.request;
   let pruned = false;
   if (Array.isArray(request.input)) {
-    const input = request.input.filter(item => {
-      if (item && typeof item === 'object' && item.type !== 'item_reference') return true;
-      pruned = true;
-      return false;
-    });
+    const input = [];
+    for (const item of request.input) {
+      if (!item || typeof item !== 'object' || item.type === 'item_reference') { pruned = true; continue; }
+      const normalized = normalizeGrokItem(item);
+      if (JSON.stringify(normalized) !== JSON.stringify(item)) pruned = true;
+      input.push(normalized);
+    }
     if (pruned) request = { ...request, input };
   }
   if (request.metadata !== undefined) { const { metadata, ...rest } = request; request = rest; }

@@ -293,7 +293,12 @@ test('Grok Responses requests drop unsupported items and restore custom tools', 
       headers: { authorization: 'Bearer ' + gatewayKey, 'content-type': 'application/json' },
       body: JSON.stringify({
         model: 'grokx/grok-4.7',
-        input: [{ type: 'item_reference', id: 'msg_1' }, { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }],
+        input: [
+          { type: 'item_reference', id: 'msg_1' },
+          { type: 'reasoning', id: null, status: null, content: null, summary: [{ type: 'summary_text', text: 'prior work' }] },
+          { type: 'message', role: 'assistant', content: null },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }
+        ],
         tools: [{ type: 'custom', name: 'apply_patch', description: 'apply a patch', format: { type: 'grammar', syntax: 'lark', definition: 'start: /.+/' } }],
         metadata: { trace: 'x' },
         stream: false
@@ -301,7 +306,15 @@ test('Grok Responses requests drop unsupported items and restore custom tools', 
     });
     assert.equal(response.status, 200);
     assert.equal('metadata' in captured, false);
-    assert.equal(captured.input.length, 1);
+    assert.equal(captured.input.length, 3);
+    const [reasoning, assistant, user] = captured.input;
+    assert.equal(reasoning.type, 'reasoning');
+    assert.equal('content' in reasoning, false);
+    assert.equal('id' in reasoning, false);
+    assert.equal('status' in reasoning, false);
+    assert.deepEqual(reasoning.summary, [{ type: 'summary_text', text: 'prior work' }]);
+    assert.deepEqual(assistant.content, []);
+    assert.equal(user.content[0].text, 'hi');
     assert.equal(captured.tools[0].type, 'function');
     assert.equal(captured.tools[0].name, 'apply_patch');
     assert.deepEqual(captured.tools[0].parameters.properties.input, { type: 'string' });
