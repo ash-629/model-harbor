@@ -8,7 +8,7 @@ import { grokModels, sendGrok, GrokCodeBridge } from './grok-code.js';
 import { discoverOpenCodeGo, isOpenCodeGoProvider, openCodeSessionId, classifyOpenCodeGoModel, OPENCODE_GO_SESSION_HEADER, OPENCODE_GO_USER_AGENT } from './opencode-go.js';
 import { openCodeGoCredential } from './opencode-go-auth.js';
 import { chatToolPlan } from './chat-tools.js';
-import { responsesToolPlan, restoreResponsesResponse, responsesEventRewriter } from './responses-tools.js';
+import { responsesToolPlan, grokResponsesPlan, restoreResponsesResponse, responsesEventRewriter } from './responses-tools.js';
 import { optimizePayloadImages, imageOptimizationSettings, shouldOptimizeProviderImages } from './image-optimizer.js';
 import { createChatReasoningTracker, rememberChatReasoning, restoreCachedReasoning } from './reasoning.js';
 import { dispatcherForProvider } from './provider-proxy.js';
@@ -79,7 +79,7 @@ export async function upstreamFetch(store, p, path, body, signal, sessionId = ''
     // Interpret only a known public configuration error; never echo raw
     // upstream bodies, which can contain credentials or request content.
     let goDetail = '';
-    if (isOpenCodeGoProvider(p) && [400, 422].includes(response.status) && response.body) {
+    if ((isOpenCodeGoProvider(p) || p.type === 'grok') && [400, 422].includes(response.status) && response.body) {
       const reader = response.body.getReader(); let text = '';
       try {
         const decoder = new TextDecoder(); let bytes = 0;
@@ -97,7 +97,7 @@ export async function upstreamFetch(store, p, path, body, signal, sessionId = ''
       }
     } else await response.body?.cancel();
     let message = `上游 ${p.name} 返回 HTTP ${response.status}；请检查密钥、模型权限和接口协议`;
-    if (goDetail) message += `。OpenCode：${goDetail}`;
+    if (goDetail) message += `。上游详情：${goDetail}`;
     const err = response.status === 413
       ? new HttpError(413, `上游 ${p.name} 拒绝请求：实际转发 ${(requestBytes / (1024 * 1024)).toFixed(2)} MiB（${requestBytes} 字节），超过上游允许的请求大小。请在客户端压缩会话历史、减少附件，或新开会话携带任务摘要；提高模型港上限无法解除上游限制。`, 'upstream_request_too_large')
       : new HttpError(response.status, message, 'upstream_error');
@@ -151,7 +151,8 @@ export async function route(store, p, model, body, endpoint, res, signal, nasAge
   const reasoningEcho = native === 'chat' && (/deepseek/i.test(String(model)) || /deepseek/i.test(String(p.baseUrl || '')));
   const reasoningOptions = reasoningEcho ? { fillEmpty: true } : undefined;
   const toolPlan = bridge ? chatToolPlan(body) : undefined;
-  const nativeToolPlan = goResponsesNative && publicFamily === 'responses' ? responsesToolPlan(body, { dropHosted: true }) : undefined;
+  const nativeToolPlan = goResponsesNative && publicFamily === 'responses' ? responsesToolPlan(body, { dropHosted: true })
+    : p.type === 'grok' && publicFamily === 'responses' ? grokResponsesPlan(body) : undefined;
   let payload = { ...(bridge ? toChat(body, toolPlan, p.id, reasoningEcho ? { fillReasoning: true } : undefined) : chatToResp ? chatToResponses(body) : nativeToolPlan ? nativeToolPlan.request : body), model };
   if (native === 'chat') payload = restoreCachedReasoning(payload, p.id, reasoningOptions);
   if (go && native === 'chat') payload = normalizeChatToolMessages(payload);
@@ -214,7 +215,8 @@ export async function route(store, p, model, body, endpoint, res, signal, nasAge
     if (data.model) data.model = body.model;
     if (data.response?.model) data.response.model = body.model;
     if (data.choices?.some(c => c.finish_reason) || ['response.completed', 'response.incomplete'].includes(data.type)) terminal = true;
-    for (const emitted of rewrite ? rewrite(data) : [data]) await writeSSE(res, emitted, event.event || emitted.type);
+    // Rewritten events must carry their new name; the client dispatches on it.
+    for (const emitted of rewrite ? rewrite(data) : [data]) await writeSSE(res, emitted, emitted.type || event.event);
   }
   if (!terminal) throw new HttpError(502, '上游流意外结束，未收到完成标记');
   chatReasoningTracker?.flush();

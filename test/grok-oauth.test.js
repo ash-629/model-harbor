@@ -266,3 +266,113 @@ test('a bare authorization code uses the newest pending session and survives res
     await assert.rejects(restarted.exchange('other-session', 'grokx', { callback: 'another-code' }), /先点「开始授权」/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('Grok Responses requests drop unsupported items and restore custom tools', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'model-harbor-grok-resp-'));
+  const seeded = new Store(dir);
+  seeded.upsert(providerInput({ models: ['grok-4.7'] }));
+  seeded.setGrokAuth('grokx', 'auth-1');
+  seeded.data.grokAuth['auth-1'] = seeded.seal(JSON.stringify({ access: 'at-1', refresh: 'rt-1', expires: Date.now() + 600000, email: '' }));
+  seeded.save();
+  const gatewayKey = seeded.gatewayKey();
+  const { server } = createGateway({ dataDir: dir, publicUrl: 'http://192.0.2.10:8317', adminPassword: 'test-password' });
+  const base = await listen(server);
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  try {
+    globalThis.fetch = async (url, init = {}) => {
+      if (String(url).startsWith(base)) return originalFetch(url, init);
+      captured = JSON.parse(init.body);
+      return json({
+        id: 'resp_1', object: 'response', model: 'grok-4.7', status: 'completed',
+        output: [{ type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'apply_patch', arguments: '{"input":"*** Begin Patch"}' }]
+      });
+    };
+    const response = await originalFetch(base + '/v1/responses', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + gatewayKey, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'grokx/grok-4.7',
+        input: [{ type: 'item_reference', id: 'msg_1' }, { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }],
+        tools: [{ type: 'custom', name: 'apply_patch', description: 'apply a patch', format: { type: 'grammar', syntax: 'lark', definition: 'start: /.+/' } }],
+        metadata: { trace: 'x' },
+        stream: false
+      })
+    });
+    assert.equal(response.status, 200);
+    assert.equal('metadata' in captured, false);
+    assert.equal(captured.input.length, 1);
+    assert.equal(captured.tools[0].type, 'function');
+    assert.equal(captured.tools[0].name, 'apply_patch');
+    assert.deepEqual(captured.tools[0].parameters.properties.input, { type: 'string' });
+    const data = await response.json();
+    assert.equal(data.output[0].type, 'custom_tool_call');
+    assert.equal(data.output[0].input, '*** Begin Patch');
+
+    globalThis.fetch = async (url, init = {}) => {
+      if (String(url).startsWith(base)) return originalFetch(url, init);
+      return json({ error: 'Failed to deserialize the JSON body: tools[0].type: unknown variant `custom`' }, 422);
+    };
+    const failed = await originalFetch(base + '/v1/responses', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + gatewayKey, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'grokx/grok-4.7', input: 'hi', stream: false })
+    });
+    assert.equal(failed.status, 422);
+    const payload = await failed.json();
+    assert.match(payload.error.message, /上游详情/);
+    assert.match(payload.error.message, /unknown variant/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await close(server);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('streamed Grok custom tool calls keep the rewritten SSE event name', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'model-harbor-grok-sse-'));
+  const seeded = new Store(dir);
+  seeded.upsert(providerInput({ models: ['grok-4.7'] }));
+  seeded.setGrokAuth('grokx', 'auth-1');
+  seeded.data.grokAuth['auth-1'] = seeded.seal(JSON.stringify({ access: 'at-1', refresh: 'rt-1', expires: Date.now() + 600000, email: '' }));
+  seeded.save();
+  const gatewayKey = seeded.gatewayKey();
+  const { server } = createGateway({ dataDir: dir, publicUrl: 'http://192.0.2.10:8317', adminPassword: 'test-password' });
+  const base = await listen(server);
+  const originalFetch = globalThis.fetch;
+  try {
+    const events = [
+      { type: 'response.created', response: { id: 'resp_1', model: 'grok-4.7', output: [] } },
+      { type: 'response.output_item.added', output_index: 0, item: { id: 'fc_1', type: 'function_call', name: 'apply_patch', arguments: '', call_id: 'call_1', status: 'in_progress' } },
+      { type: 'response.function_call_arguments.delta', item_id: 'fc_1', output_index: 0, delta: '{"input":"*** Begin Patch"}' },
+      { type: 'response.function_call_arguments.done', item_id: 'fc_1', output_index: 0, arguments: '{"input":"*** Begin Patch"}' },
+      { type: 'response.output_item.done', output_index: 0, item: { id: 'fc_1', type: 'function_call', name: 'apply_patch', arguments: '{"input":"*** Begin Patch"}', call_id: 'call_1', status: 'completed' } },
+      { type: 'response.completed', response: { id: 'resp_1', model: 'grok-4.7', status: 'completed', output: [{ id: 'fc_1', type: 'function_call', name: 'apply_patch', arguments: '{"input":"*** Begin Patch"}', call_id: 'call_1' }] } }
+    ];
+    globalThis.fetch = async (url, init = {}) => {
+      if (String(url).startsWith(base)) return originalFetch(url, init);
+      const body = events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join('');
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    };
+    const response = await originalFetch(base + '/v1/responses', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + gatewayKey, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'grokx/grok-4.7',
+        input: 'hi',
+        tools: [{ type: 'custom', name: 'apply_patch', description: 'patch' }],
+        stream: true
+      })
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.match(text, /event: response\.custom_tool_call_input\.done/);
+    assert.match(text, /"type":"response\.custom_tool_call_input\.done"/);
+    assert.doesNotMatch(text, /event: response\.function_call_arguments\.done/);
+    assert.match(text, /"type":"custom_tool_call"/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await close(server);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

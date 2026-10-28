@@ -117,6 +117,25 @@ export function responsesToolPlan(body, { dropHosted = false } = {}) {
   return { request, byAlias, originalTools, transformed, droppedHosted: [...droppedHosted], droppedArguments: [...droppedArguments] };
 }
 
+// cli-chat-proxy (Grok subscription) rejects client-only item types, metadata
+// and previous_response_id. Custom tools are rewritten by responsesToolPlan.
+export function grokResponsesPlan(body) {
+  const plan = responsesToolPlan(body, { dropHosted: true });
+  let request = plan.request;
+  let pruned = false;
+  if (Array.isArray(request.input)) {
+    const input = request.input.filter(item => {
+      if (item && typeof item === 'object' && item.type !== 'item_reference') return true;
+      pruned = true;
+      return false;
+    });
+    if (pruned) request = { ...request, input };
+  }
+  if (request.metadata !== undefined) { const { metadata, ...rest } = request; request = rest; }
+  if (request.previous_response_id !== undefined) { const { previous_response_id, ...rest } = request; request = rest; }
+  return { ...plan, request, transformed: plan.transformed || pruned };
+}
+
 export function restoreResponsesItem(item, plan) {
   if (!item || !['function_call', 'custom_tool_call', 'tool_search_call'].includes(item.type)) return item;
   const t = plan.byAlias.get(item.name);
