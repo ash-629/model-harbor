@@ -4,6 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { tokenPolicy } from './api-token-policy.js';
 import { normalizeNoProxy, parseProxyUrl } from './provider-proxy.js';
+import { GROK_API_BASE_URL, GROK_CLI_BASE_URL, grokBaseAllowed } from './grok-config.js';
 
 export class HttpError extends Error {
   constructor(status, message, code = 'invalid_request_error') { super(message); this.status = status; this.code = code; }
@@ -36,7 +37,17 @@ export class Store {
     fs.writeFileSync(this.file + '.tmp', JSON.stringify(this.data, null, 2), { mode: 0o600 });
     fs.renameSync(this.file + '.tmp', this.file);
   }
-  publicProvider(p) { const { apiKey, proxyPassword, ...rest } = p; return { ...rest, hasApiKey: Boolean(apiKey || p.openCodeAuthId), hasProxyPassword: Boolean(proxyPassword) }; }
+  publicProvider(p) { const { apiKey, proxyPassword, ...rest } = p; return { ...rest, hasApiKey: Boolean(apiKey || p.openCodeAuthId), hasProxyPassword: Boolean(proxyPassword), ...(p.type === 'grok' ? { grok: this.grokStatus(p) } : {}) }; }
+  grokStatus(p) {
+    if (p.grokAuthMode !== 'oauth') return { mode: 'apiKey', authorized: false };
+    const sealed = p.grokAuthId ? this.data.grokAuth?.[p.grokAuthId] : '';
+    if (!sealed) return { mode: 'oauth', authorized: false };
+    try {
+      const value = JSON.parse(this.unseal(sealed));
+      if (value.invalid) return { mode: 'oauth', authorized: false, expired: true };
+      return { mode: 'oauth', authorized: true, email: value.email || '', expiresAt: value.expires ? new Date(value.expires).toISOString() : null };
+    } catch { return { mode: 'oauth', authorized: false }; }
+  }
   list() { return this.data.providers.map(p => this.publicProvider(p)); }
   reorderProviders(ids) {
     const current = this.data.providers;
@@ -55,7 +66,7 @@ export class Store {
     const old = oldId ? this.get(oldId) : null;
     if (!old && this.data.providers.some(p => p.id === id)) throw new HttpError(409, '供应商前缀已存在');
     const type = input.type || 'openai';
-    if (!['openai', 'nas-codex', 'claude-code', 'grok-code'].includes(type)) throw new HttpError(400, '未知供应商类型');
+    if (!['openai', 'nas-codex', 'claude-code', 'grok-code', 'grok'].includes(type)) throw new HttpError(400, '未知供应商类型');
     if (old && old.type !== type) throw new HttpError(400, '已有供应商的类型不可修改');
     const models = input.models ?? old?.models ?? [];
     if (!Array.isArray(models) || models.length > 2000 || models.some(m => typeof m !== 'string' || !m.trim() || m.length > 200 || /[\r\n\x00]/.test(m))) throw new HttpError(400, '模型列表应为有效模型 ID 数组（最多 2000 项）');
@@ -113,6 +124,22 @@ export class Store {
       p.dockerPath = String(input.dockerPath ?? old?.dockerPath ?? '/usr/local/bin/docker').trim();
       if (!/^\/[A-Za-z0-9_./-]+$/.test(p.dockerPath)) throw new HttpError(400, 'Docker 命令须为目标主机上的绝对路径');
       p.protocol = 'chat';
+    } else if (type === 'grok') {
+      p.grokAuthMode = String(input.grokAuthMode ?? old?.grokAuthMode ?? 'oauth');
+      if (!['oauth', 'apiKey'].includes(p.grokAuthMode)) throw new HttpError(400, 'Grok 认证方式只能是 OAuth 或 API Key');
+      const fallback = p.grokAuthMode === 'oauth' ? GROK_CLI_BASE_URL : GROK_API_BASE_URL;
+      let url; try { url = new URL(String(input.baseUrl ?? old?.baseUrl ?? fallback)); } catch { throw new HttpError(400, '请输入有效的 Grok Base URL'); }
+      if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) throw new HttpError(400, 'Grok Base URL 必须是 HTTPS，且不含认证、查询或片段');
+      if (!grokBaseAllowed(url.hostname)) throw new HttpError(400, 'Grok Base URL 只能是 cli-chat-proxy.grok.com 或 api.x.ai');
+      p.baseUrl = url.toString().replace(/\/+$/, '');
+      if (/\/(models|responses|chat\/completions)$/.test(p.baseUrl)) throw new HttpError(400, '请输入 Base URL，例如 https://cli-chat-proxy.grok.com/v1');
+      p.protocol = String(input.protocol ?? old?.protocol ?? 'both');
+      if (!['chat', 'responses', 'both'].includes(p.protocol)) throw new HttpError(400, '无效的接口协议');
+      p.tokenOptimization = tokenPolicy(input.tokenOptimization ?? old?.tokenOptimization);
+      if (p.grokAuthMode === 'oauth') {
+        p.apiKey = '';
+        if (old?.grokAuthId && old.grokAuthMode === 'oauth') p.grokAuthId = old.grokAuthId;
+      }
     } else {
       validateRemote();
       p.grokPath = String(input.grokPath ?? old?.grokPath ?? 'grok').trim();
@@ -124,7 +151,29 @@ export class Store {
     if (old) this.data.providers[this.data.providers.indexOf(old)] = p; else this.data.providers.push(p);
     this.save(); return this.publicProvider(p);
   }
-  remove(id) { this.get(id); this.data.providers = this.data.providers.filter(p => p.id !== id); this.save(); }
+  remove(id) {
+    const p = this.get(id);
+    this.data.providers = this.data.providers.filter(item => item.id !== id);
+    if (p.grokAuthId && this.data.grokAuth) delete this.data.grokAuth[p.grokAuthId];
+    this.save();
+  }
+  setGrokAuth(id, authId) {
+    const p = this.get(id);
+    this.data.grokAuth ||= {};
+    if (p.type !== 'grok') throw new HttpError(400, '仅 Grok 订阅供应商支持授权');
+    if (p.grokAuthId && p.grokAuthId !== authId && this.data.grokAuth) delete this.data.grokAuth[p.grokAuthId];
+    p.grokAuthId = authId;
+    p.updatedAt = new Date().toISOString();
+    this.save();
+    return this.publicProvider(p);
+  }
+  clearGrokAuth(id) {
+    const p = this.get(id);
+    if (p.grokAuthId && this.data.grokAuth) delete this.data.grokAuth[p.grokAuthId];
+    delete p.grokAuthId;
+    this.save();
+    return this.publicProvider(p);
+  }
   setModels(id, models) {
     const p = this.get(id);
     if (!Array.isArray(models) || models.length > 2000 || models.some(m => typeof m !== 'string' || !m || m.length > 200 || /[\r\n\x00]/.test(m))) throw new HttpError(502, '上游返回的模型列表格式不正确');

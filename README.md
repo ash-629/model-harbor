@@ -90,6 +90,20 @@ Codex 桥接要求客户端发送完整历史和 `store=false`。它不提供 `p
 
 目标环境需要已登录 Grok CLI、`python3` 和 `timeout`。网关使用固定 runner 和结构化输出桥接客户端工具；当前聊天桥接不是逐 token 透传。聊天图片会先由一次仅开启 `Read` 工具的 CLI 调用转写为文本（绕开 `--prompt-json` 单参数约 128 KB 的限制），再参与结构化输出；代价是每张图多一次 CLI 往返（约 8-12 秒），模型看到的是转写文本而非原始像素。Grok 视频和订阅生图在「生成视频」「生图」菜单中单独配置。
 
+### Grok 订阅 OAuth
+
+供应商 → 添加 → 快速选择「Grok 订阅 · OAuth 直连」。网关用 xAI 官方 OAuth（PKCE）取得订阅令牌，把 Responses 与 Chat Completions 转发到 `https://cli-chat-proxy.grok.com/v1`，不经过容器里的 Grok CLI。
+
+1. 自定模型前缀（例如 `grokx`），认证方式保持「订阅 OAuth」。
+2. 同一表单里配置出站代理。NAS 直连 xAI 会超时，通常填 `http://192.168.2.2:7890` 并填写代理用户名与密码。
+3. 保存后在供应商卡片点「授权」→「开始授权」，浏览器打开 xAI 授权页登录订阅账号。
+4. 授权完成后浏览器跳到 `http://127.0.0.1:56121/callback?...` 并提示无法访问，这是正常的。复制地址栏里的完整地址，粘贴回来点「完成授权」。
+5. 授权成功后点「刷新模型」获取账号可用模型。
+
+access / refresh 令牌使用 AES-256-GCM 加密保存在 `data/config.json` 的 `grokAuth` 中，管理接口只返回是否已授权与账号邮箱。access token 在过期前 60 秒自动续期；刷新令牌会轮换，新令牌先落盘再发起推理。令牌交换、续期、模型发现和推理都使用该供应商的出站代理。
+
+请求 `cli-chat-proxy` 时必须带官方 CLI 客户端标识头（`x-xai-token-auth`、`x-grok-client-version`、`x-grok-client-identifier` 等）。默认版本 `1.0.46`，可用 `MH_GROK_CLI_VERSION` 覆盖，低于 `1.0.13` 会被忽略。Base URL 只允许 `cli-chat-proxy.grok.com` 与 `api.x.ai`；认证方式选「xAI API Key」时默认使用 `https://api.x.ai/v1`。上游返回 401 时该供应商进入「需要重新授权」状态，不会反复重试。待完成的授权会话保存在内存中，有效期 10 分钟，重启后失效。
+
 ### OpenCode Go
 
 在「添加供应商」中选择「OpenCode Go · 浏览器授权」。授权后网关会创建或更新 `ocgo` 供应商，按模型自动选择 Chat 或 Responses 端点，并显示官方滚动用量。凭据在服务端加密保存，失效时需要重新授权。

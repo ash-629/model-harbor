@@ -23,6 +23,7 @@ import { grokUsage } from './grok-usage.js';
 import { authorizeOpenCodeGo, isOpenCodeGoProvider, classifyOpenCodeGoModel } from './opencode-go.js';
 import { openCodeGoUsage } from './opencode-go-usage.js';
 import { OpenCodeGoAuth } from './opencode-go-auth.js';
+import { GrokOAuth } from './grok-oauth.js';
 import { ToolDownloads } from './tools.js';
 import { mediaAPI } from './media-api.js';
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -72,6 +73,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
   const store = new Store(dataDir), sessions = new Map(), logs = [];
   const adminAuth = new AdminAuth(store, adminPassword);
   const openCodeAuth = new OpenCodeGoAuth(store);
+  const grokOAuth = new GrokOAuth(store);
   let settingsSaving = false;
   if (external && !adminAuth.configured) throw new Error('局域网部署必须设置 GATEWAY_ADMIN_PASSWORD 或已保存的管理密码');
   const imageProviders = new ImageProviders(store), imageJobs = new ImageJobs(store, imageProviders, dataDir);
@@ -227,6 +229,13 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
             await syncGroupCooldowns(store, group, nasAgent, controller.signal);
             return json(res, 200, store.publicGroup(group));
           }
+        }
+        const grokOAuthMatch = /^\/api\/providers\/([a-z0-9_-]+)\/grok\/oauth\/(start|exchange|revoke)$/.exec(pathname);
+        if (grokOAuthMatch && method === 'POST') {
+          const [, id, action] = grokOAuthMatch;
+          if (action === 'start') return json(res, 200, grokOAuth.start(sessionId, id));
+          if (action === 'revoke') return json(res, 200, store.clearGrokAuth(id));
+          return json(res, 200, await grokOAuth.exchange(sessionId, id, await readBody(req), controller.signal));
         }
         if (pathname === '/api/opencode-go/authorize' && method === 'POST') return json(res, 200, await authorizeOpenCodeGo(store, await readBody(req), { signal: controller.signal }));
         if (pathname === '/api/opencode-go/auth/start' && method === 'POST') return json(res, 200, await openCodeAuth.start(sessionId, await readBody(req), controller.signal));

@@ -12,6 +12,7 @@ import { responsesToolPlan, restoreResponsesResponse, responsesEventRewriter } f
 import { optimizePayloadImages, imageOptimizationSettings, shouldOptimizeProviderImages } from './image-optimizer.js';
 import { createChatReasoningTracker, rememberChatReasoning, restoreCachedReasoning } from './reasoning.js';
 import { dispatcherFor } from './provider-proxy.js';
+import { cliProxyHeaders, grokCredential } from './grok-oauth.js';
 
 export function extractUpstreamError(text) {
   let parsed; try { parsed = JSON.parse(text); } catch {}
@@ -51,7 +52,8 @@ export function compactionFallback(body) {
 export async function upstreamFetch(store, p, path, body, signal, sessionId = '') {
   const timeout = AbortSignal.timeout((p.timeout || 180) * 1000);
   const headers = { accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) };
-  const credential = isOpenCodeGoProvider(p) ? await openCodeGoCredential(store, p, { signal }) : { apiKey: store.unseal(p.apiKey) };
+  const credential = p.type === 'grok' ? await grokCredential(store, p, { signal })
+    : isOpenCodeGoProvider(p) ? await openCodeGoCredential(store, p, { signal }) : { apiKey: store.unseal(p.apiKey) };
   if (credential.apiKey) headers.authorization = `Bearer ${credential.apiKey}`;
   if (credential.orgId) headers['x-opencode-org-id'] = credential.orgId;
   if (isOpenCodeGoProvider(p)) {
@@ -60,15 +62,20 @@ export async function upstreamFetch(store, p, path, body, signal, sessionId = ''
   }
   const encodedBody = body ? JSON.stringify(body) : undefined;
   const requestBytes = encodedBody === undefined ? 0 : Buffer.byteLength(encodedBody, 'utf8');
+  const target = `${p.baseUrl}/${path}`;
+  if (p.type === 'grok') Object.assign(headers, cliProxyHeaders(new URL(target).hostname));
   let response;
   try {
-    const target = `${p.baseUrl}/${path}`;
     response = await fetch(target, { method: body ? 'POST' : 'GET', headers,
       body: encodedBody, signal: signal ? AbortSignal.any([signal, timeout]) : timeout, redirect: 'error', dispatcher: dispatcherFor(p, target, value => store.unseal(value)) });
   } catch (e) {
     throw new HttpError(signal?.aborted ? 499 : e.name === 'TimeoutError' ? 504 : 502, signal?.aborted ? '请求已取消' : e.name === 'TimeoutError' ? '上游响应超时' : '无法连接上游，请检查 Base URL、网络或证书');
   }
   if (!response.ok) {
+    if (p.type === 'grok' && response.status === 401) {
+      await response.body?.cancel();
+      throw new HttpError(401, 'Grok 订阅授权已失效，请重新授权', 'grok_needs_auth');
+    }
     // Interpret only a known public configuration error; never echo raw
     // upstream bodies, which can contain credentials or request content.
     let goDetail = '';
