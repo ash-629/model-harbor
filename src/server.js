@@ -20,6 +20,7 @@ import { VideoProviders } from './video-providers.js';
 import { VideoJobs } from './videos.js';
 import { grokVideoRunnerFile } from './grok-video.js';
 import { grokUsage } from './grok-usage.js';
+import { grokSubscriptionUsage } from './grok-billing.js';
 import { authorizeOpenCodeGo, isOpenCodeGoProvider, classifyOpenCodeGoModel } from './opencode-go.js';
 import { openCodeGoUsage } from './opencode-go-usage.js';
 import { OpenCodeGoAuth } from './opencode-go-auth.js';
@@ -260,6 +261,7 @@ export function createGateway({ dataDir = path.join(root, 'data'), port = 8317, 
           if (isOpenCodeGoProvider(provider)) return json(res, 200, await openCodeGoUsage(store, provider, controller.signal));
           if (provider.type === 'claude-code') return json(res, 200, await claudeUsage(provider, controller.signal));
           if (provider.type === 'grok-code') return json(res, 200, await grokUsage(provider, controller.signal));
+          if (provider.type === 'grok') return json(res, 200, await grokSubscriptionUsage(store, provider, controller.signal));
           if (provider.type === 'openai') return json(res, 200, await providerBalance(store, provider, controller.signal));
           return json(res, 200, await nasAgent.usage(provider, controller.signal));
         }

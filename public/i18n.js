@@ -570,6 +570,7 @@ Object.assign(messages, {
   'Grok 账号用量': 'Grok account usage',
   'Grok 用量按订阅账号共享；数据最多缓存 30 秒。': 'Grok usage is shared across the subscription account. Data is cached for up to 30 seconds.',
   '查看 Grok 的每周用量。': 'View Grok weekly usage.',
+  '查看 Grok 订阅的每周与每月用量。': 'View the Grok subscription weekly and monthly usage.',
 });
 
 const imageErrors = {

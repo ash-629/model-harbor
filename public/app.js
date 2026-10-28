@@ -102,14 +102,15 @@ function openCodeGoUsageMarkup(p) {
 function usageMarkup(p) {
   if (openCodeGoProvider(p)) return openCodeGoUsageMarkup(p);
   if (balanceProvider(p)) return balanceMarkup(p);
-  if (p.type !== 'nas-codex' && p.type !== 'claude-code' && p.type !== 'grok-code') return '';
-  const usage = usageById.get(p.id), data = usage?.data, claude = p.type === 'claude-code', grok = p.type === 'grok-code';
+  if (p.type !== 'nas-codex' && p.type !== 'claude-code' && p.type !== 'grok-code' && p.type !== 'grok') return '';
+  const usage = usageById.get(p.id), data = usage?.data, claude = p.type === 'claude-code', grok = p.type === 'grok-code' || p.type === 'grok';
   let body = '';
   if (data) {
     const buckets = data.buckets?.length ? data.buckets : [{id: claude ? 'claude' : grok ? 'grok' : 'codex', windows:[]}];
     body = buckets.map(bucket => {
       const windows = [...(bucket.windows || [])];
-      for (const durationMins of grok ? [10080] : [300, 10080]) if (!windows.some(w => w.durationMins === durationMins)) windows.push({durationMins, usedPercent:null});
+      const pad = p.type === 'grok' ? [] : grok ? [10080] : [300, 10080];
+      for (const durationMins of pad) if (!windows.some(w => w.durationMins === durationMins)) windows.push({durationMins, usedPercent:null});
       windows.sort((a,b) => (a.durationMins || Infinity) - (b.durationMins || Infinity));
       return `<div class="quota-bucket">${buckets.length > 1 || bucket.planType ? `<div class="quota-detail">${h(bucket.name || (bucket.id === 'codex' ? t('默认额度') : bucket.id))}${bucket.planType ? ' · ' + h(bucket.planType) : ''}</div>` : ''}${windows.map(usageWindow).join('')}</div>`;
     }).join('');
@@ -119,7 +120,7 @@ function usageMarkup(p) {
   }
   if (!claude && !grok) body += `<button class="button secondary quota-reset-button" data-reset-usage="${h(p.id)}" ${busy || usage?.loading || (!(data?.resetCredits > 0) && !pendingResetKey(p.id)) ? 'disabled' : ''}>${pendingResetKey(p.id) ? t('重试同一次重置') : t('重置额度')}</button>`;
   if (usage?.error) body = `<div class="notice error" role="alert">${h(translateError(usage.error))}</div>` + body;
-  return `<section class="provider-quota"><div class="quota-row"><strong>${t(claude ? 'Claude 账号用量' : grok ? 'Grok 账号用量' : 'Codex 账号用量')}</strong><button class="button ghost quota-refresh" data-usage="${h(p.id)}" ${usage?.loading ? 'disabled' : ''}>${usage?.loading ? t('查询中…') : data ? t('刷新用量') : t('查看用量')}</button></div>${body || `<div class="quota-detail">${usage?.loading ? t('正在读取账号额度…') : t(claude ? '查看 Claude 的 5 小时与每周用量。' : grok ? '查看 Grok 的每周用量。' : '查看用量、重置时间与可用重置次数。')}</div>`}</section>`;
+  return `<section class="provider-quota"><div class="quota-row"><strong>${t(claude ? 'Claude 账号用量' : grok ? 'Grok 账号用量' : 'Codex 账号用量')}</strong><button class="button ghost quota-refresh" data-usage="${h(p.id)}" ${usage?.loading ? 'disabled' : ''}>${usage?.loading ? t('查询中…') : data ? t('刷新用量') : t('查看用量')}</button></div>${body || `<div class="quota-detail">${usage?.loading ? t('正在读取账号额度…') : t(claude ? '查看 Claude 的 5 小时与每周用量。' : p.type === 'grok' ? '查看 Grok 订阅的每周与每月用量。' : grok ? '查看 Grok 的每周用量。' : '查看用量、重置时间与可用重置次数。')}</div>`}</section>`;
 }
 async function loadUsage(id, force = false) {
   const previous = usageById.get(id);
@@ -420,7 +421,7 @@ function view(name, { updateUrl = true } = {}) {
   if (name === 'settings') loadSettings();
   if (name === 'tools') loadTools(); else stopToolPoll();
   if (name === 'proxies') renderProxies();
-  if (name === 'providers') for (const p of state.providers) if ((p.type === 'nas-codex' || p.type === 'claude-code' || p.type === 'grok-code' || balanceProvider(p) || openCodeGoProvider(p)) && p.enabled) loadUsage(p.id);
+  if (name === 'providers') for (const p of state.providers) if ((p.type === 'nas-codex' || p.type === 'claude-code' || p.type === 'grok-code' || p.type === 'grok' || balanceProvider(p) || openCodeGoProvider(p)) && p.enabled) loadUsage(p.id);
   if (updateUrl && location.hash !== '#' + name) history.pushState({ view: name }, '', '#' + name);
 }
 let settingsLoading = false;
