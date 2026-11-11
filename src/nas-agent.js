@@ -544,7 +544,7 @@ export class NasAgentBridge {
       if (probe) {
         try {
           const thread = await rpc.call('thread/start', { model: ids[0], cwd: '/tmp', ephemeral: true, approvalPolicy: 'never', sandbox: 'read-only', dynamicTools: [], config: { 'features.shell_tool': false, 'features.apply_patch_freeform': false, 'features.apps': false, 'features.plugins': false, 'features.image_generation': false, 'features.multi_agent': false, web_search: 'disabled', mcp_servers: {} } });
-          await rpc.call('thread/inject_items', { threadId: thread.thread.id, items: [] });
+          await rpc.call('thread/inject_items', { threadId: thread.thread.id, items: historyItems([{ role: 'user', content: 'Model Harbor compatibility probe. No inference is requested.' }]) });
           capability.historyInjection = 'verified';
         } catch (e) { capability.historyInjection = e.code === 'codex_app_server_unsupported' ? 'unsupported' : 'failed'; }
       }
