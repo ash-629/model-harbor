@@ -6,6 +6,10 @@ COPY --chown=node:node package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --chown=node:node src ./src
 COPY --chown=node:node public ./public
+COPY --chown=node:node scripts ./scripts
+ARG BUILD_ID=development
+LABEL org.opencontainers.image.revision=$BUILD_ID
+ENV MH_BUILD_ID=$BUILD_ID
 USER node
 ENV HOST=0.0.0.0 PORT=8317 GATEWAY_DATA_DIR=/app/data
 EXPOSE 8317

@@ -1,13 +1,18 @@
 services:
   model-harbor:
-    build: .
+    image: model-harbor:${MH_RELEASE_TAG:-0.2.0}
+    build:
+      context: .
+      args:
+        BUILD_ID: ${MH_BUILD_ID:-development}
+    stop_grace_period: 75s
     restart: unless-stopped
     ports:
       - "127.0.0.1:8317:8317"
     environment:
       GATEWAY_PUBLIC_URL: ${GATEWAY_PUBLIC_URL:?Set GATEWAY_PUBLIC_URL in .env}
       GATEWAY_ADMIN_PASSWORD: ${GATEWAY_ADMIN_PASSWORD:?Set a strong password in .env}
-      GATEWAY_API_BODY_LIMIT_MB: ${GATEWAY_API_BODY_LIMIT_MB:-64}
+      GATEWAY_API_BODY_LIMIT_MB: ${GATEWAY_API_BODY_LIMIT_MB:-128}
     volumes:
       - ./data:/app/data
     cap_drop: [ALL]

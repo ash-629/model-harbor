@@ -1,6 +1,7 @@
 // AG-01..AG-05: native Codex app-server dynamic tools, executed by the API client.
 import { spawn } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
+import { retryBudget, retryDelay, markOutput, completeMetrics } from './request-runtime.js';
 import { HttpError } from './store.js';
 import { responseBase, openSSE, writeSSE, uid } from './protocol.js';
 import { runtimePrefix, codexExecutable, sshCommand } from './remote-codex.js';
@@ -14,6 +15,10 @@ const RPC_MESSAGE_LIMIT = 128 * 1024 * 1024;
 const rpcTooLarge = () => new HttpError(502, 'Remote Codex RPC message exceeds 128 MiB; compact history or reduce attachments', 'remote_message_too_large');
 const rpcDetail = value => String(value || '').replace(/Bearer\s+\S+/gi, 'Bearer [redacted]').replace(/\b(sk-[A-Za-z0-9_-]{6,})\b/g, '[redacted]').replace(/\s+/g, ' ').trim().slice(-500);
 const failed = detail => new HttpError(502, detail ? `远程 Codex 工具桥接失败：${rpcDetail(detail)}` : '远程 Codex 工具桥接失败，请检查登录、模型权限和 app-server 版本');
+// gpt-5.x on the ChatGPT backend reports capacity exhaustion as a plain error
+// event. It is transient: retry the same turn before failing the client task.
+const CAPACITY_PATTERN = /at capacity|overloaded|server is busy|capacity exceeded|模型.{0,8}(繁忙|满载|容量)/i;
+export const isCapacityDetail = detail => CAPACITY_PATTERN.test(String(detail || ''));
 const quote = s => "'" + String(s).replace(/'/g, "'\\''") + "'";
 // A coding turn can legitimately span many client tool rounds. Keep a hard
 // outer bound for abandoned processes, but do not cap normal work at 20 min.
@@ -80,7 +85,8 @@ function compactToolSpec(tool, descriptionLimit) {
 export function fitToolSpecs(specs, maxBytes = 900 * 1024) {
   const limit = Number.isFinite(maxBytes) ? Math.max(32 * 1024, maxBytes) : 900 * 1024;
   const originalBytes = Buffer.byteLength(JSON.stringify(specs));
-  for (const descriptionLimit of [800, 400, 200, 100, 50, 0]) {
+  // Try the untouched spec first; only lose text when the RPC budget requires it.
+  for (const descriptionLimit of [Infinity, 800, 400, 200, 100, 50, 0]) {
     const copy = specs.map(tool => compactToolSpec(tool, descriptionLimit));
     const bytes = Buffer.byteLength(JSON.stringify(copy));
     if (bytes <= limit) {
@@ -109,7 +115,7 @@ export function fitToolSpecs(specs, maxBytes = 900 * 1024) {
   });
 }
 
-const CORE_TOOL_NAME = /(apply_patch|read_file|write_file|list_dir|list_files|glob|grep|search|run_command|shell|exec|terminal|bash|powershell|edit|view|create_file|delete_file|move_file|todo|plan)/i;
+const CORE_TOOL_NAME = /(apply_patch|read_file|write_file|list_dir|list_files|glob|grep|search|run_command|exec_command|exec|write_stdin|shell|terminal|bash|powershell|view_image|edit|view|create_file|delete_file|move_file|todo|plan)/i;
 function toolMappingFor(mappings, spec) {
   return mappings?.get(spec.name) || { name: spec.name, type: 'function' };
 }
@@ -144,10 +150,14 @@ export function deferToolSpecs(specs, mappings, { mode = 'auto', minTools = 24, 
     if (eager.size >= minimum) break;
     eager.add(entry.spec.name);
   }
+  // The byte budget is soft: it may shrink the eager surface, but never below
+  // the configured minimum, otherwise a few large schemas silently push every
+  // tool behind tool_search (observed: minEager=6 collapsed to 1 eager).
   let eagerBytes = entries.filter(entry => eager.has(entry.spec.name)).reduce((sum, entry) => sum + entry.bytes, 0);
-  while (eagerBytes > options.maxEagerBytes) {
+  const eagerFloor = Math.min(minimum, eager.size);
+  while (eagerBytes > options.maxEagerBytes && eager.size > eagerFloor) {
     const candidates = entries.filter(entry => eager.has(entry.spec.name) && !coreTool(entry.mapping)).sort((a, b) => b.bytes - a.bytes);
-    if (!candidates.length || eager.size <= 1) break;
+    if (!candidates.length) break;
     eager.delete(candidates[0].spec.name);
     eagerBytes -= candidates[0].bytes;
   }
@@ -297,29 +307,60 @@ export function historyItem(item) {
   if (item.type === 'image_generation_call') return { type: 'image_generation_call', result: item.result || '', status: item.status || 'completed' };
   bad('远程历史不支持此输入项: ' + String(item.type || item.role).slice(0, 80));
 }
-// Reasoning items from earlier turns only cost tokens; the current tool loop keeps its own native state.
-const OLD_OUTPUT_LIMIT = 16 * 1024, RECENT_USER_TURNS = 2;
-const clipMiddle = (s, limit = OLD_OUTPUT_LIMIT) => s.length > limit ? s.slice(0, limit / 2) + '\n[... ' + (s.length - limit) + ' chars omitted ...]\n' + s.slice(-limit / 2) : s;
-const dropImages = parts => parts.map(p => p.type === 'input_image' ? { type: 'input_text', text: '[image omitted]' } : p);
-// Older turns keep their text, but images are replaced and huge tool outputs are clipped.
-function trimOld(item) {
-  if (item.type === 'message') return { ...item, content: dropImages(item.content) };
-  if (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') {
-    const output = typeof item.output === 'string' ? clipMiddle(item.output) : dropImages(item.output).map(p => p.type === 'input_text' ? { ...p, text: clipMiddle(p.text) } : p);
-    return { ...item, output };
-  }
-  return item;
+// History trimming is a cost trade-off, not a correctness feature. The old
+// fixed 16 KiB clip was silent and cut file contents, timestamps and logs that
+// multi-step pipelines depend on. Every trim is now configurable and logged.
+const DEFAULT_TOOL_CLIP = 512 * 1024;
+const DEFAULT_IMAGE_TURNS = 0; // 0 = keep every image in history.
+export function envNumber(name, fallback, min = 0) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) ? Math.max(min, Math.floor(value)) : fallback;
 }
-export function historyItems(input) {
+export function historyTrimSettings(overrides = {}) {
+  return {
+    toolClip: overrides.toolClip ?? envNumber('MH_HISTORY_TOOL_CLIP', DEFAULT_TOOL_CLIP),
+    imageTurns: overrides.imageTurns ?? envNumber('MH_HISTORY_IMAGE_TURNS', DEFAULT_IMAGE_TURNS),
+    keepReasoning: overrides.keepReasoning ?? process.env.MH_HISTORY_KEEP_REASONING === '1'
+  };
+}
+export const emptyTrimStats = () => ({ clipped: 0, omittedChars: 0, omittedImages: 0 });
+const clipMiddle = (text, limit, stats) => {
+  if (!limit || text.length <= limit) return text;
+  const keep = Math.floor(limit / 2), omitted = text.length - keep * 2;
+  stats.clipped++; stats.omittedChars += omitted;
+  return text.slice(0, keep) + '\n[... ' + omitted + ' chars omitted by model-harbor history trim ...]\n' + text.slice(-keep);
+};
+const dropImages = (parts, stats) => parts.map(part => {
+  if (part.type !== 'input_image') return part;
+  stats.omittedImages++;
+  return { type: 'input_text', text: '[image omitted by model-harbor history trim]' };
+});
+const isToolOutput = item => item?.type === 'function_call_output' || item?.type === 'custom_tool_call_output';
+export function historyItems(input, overrides = {}, stats = emptyTrimStats()) {
+  const settings = historyTrimSettings(overrides);
+  stats.clipped ??= 0; stats.omittedChars ??= 0; stats.omittedImages ??= 0;
+  stats.toolClip = settings.toolClip; stats.imageTurns = settings.imageTurns;
   const users = []; input.forEach((i, n) => { if (i?.role === 'user' && (!i.type || i.type === 'message')) users.push(n); });
-  const cutoff = users.length >= RECENT_USER_TURNS ? users.at(-RECENT_USER_TURNS) : 0;
+  // Tool outputs are clipped only before the last two user turns; images only
+  // when the deployment opts in with MH_HISTORY_IMAGE_TURNS=N.
+  const toolCutoff = users.length >= 2 ? users.at(-2) : 0;
+  const imageCutoff = settings.imageTurns > 0 && users.length >= settings.imageTurns ? users.at(-settings.imageTurns) : 0;
   return input.flatMap((i, n) => {
-    if (i?.type === 'reasoning') return [];
+    if (i?.type === 'reasoning') return settings.keepReasoning ? [historyItem(i)].filter(Boolean) : [];
     const h = historyItem(i);
-    return h ? [n < cutoff ? trimOld(h) : h] : [];
+    if (!h) return [];
+    if (h.type === 'message') return [n < imageCutoff ? { ...h, content: dropImages(h.content, stats) } : h];
+    if (isToolOutput(h) && n < toolCutoff) {
+      const output = typeof h.output === 'string'
+        ? clipMiddle(h.output, settings.toolClip, stats)
+        : dropImages(h.output, stats).map(part => part.type === 'input_text' ? { ...part, text: clipMiddle(part.text, settings.toolClip, stats) } : part);
+      return [{ ...h, output }];
+    }
+    return [h];
   });
 }
-export const isToolOutput = item => item?.type === 'function_call_output' || item?.type === 'custom_tool_call_output';
 const CONTINUE_AFTER_TOOL = 'The client has returned the tool result above. Continue the current task from that result. Do not repeat tool calls that already completed unless the result shows they failed.';
 const continuationInput = () => [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: CONTINUE_AFTER_TOOL }] }];
 export function currentTurnInput(input) {
@@ -473,11 +514,11 @@ export class NasAgentBridge {
     this.toolWaitMs = Number.isFinite(toolWaitMs) && toolWaitMs > 0 ? Math.max(idleMs, toolWaitMs) : Math.max(idleMs, 30 * 60 * 1000);
     this.deferTools = deferTools; this.deferMinTools = deferMinTools; this.deferMinBytes = deferMinBytes;
     this.deferGroupSize = deferGroupSize; this.deferMaxEager = deferMaxEager; this.deferMaxEagerBytes = deferMaxEagerBytes; this.deferMinEager = deferMinEager;
-    this.usageReaders = new Set(); this.usageCache = new Map(); this.usageGeneration = 0;
+    this.capabilities = new Map(); this.usageReaders = new Set(); this.usageCache = new Map(); this.usageGeneration = 0;
   }
   dispose(s) { clearTimeout(s.idle); s.rpc.close(); this.sessions.delete(s); for (const [id, value] of this.calls) if (value === s) this.calls.delete(id); }
   close() { for (const s of [...this.sessions]) this.dispose(s); for (const rpc of this.usageReaders) rpc.close(); this.completedCalls.clear(); this.usageCache.clear(); }
-  async models(p, signal) {
+  async models(p, signal, { probe = false } = {}) {
     if (p.type !== 'nas-codex') throw new HttpError(400, '仅 Codex 供应商支持模型发现');
     if (signal?.aborted) throw new HttpError(499, '请求已取消');
     if (this.usageReaders.size >= 4) throw new HttpError(429, '远程 Codex 检索引擎繁忙，请稍后重试');
@@ -486,7 +527,7 @@ export class NasAgentBridge {
     const timer = setTimeout(() => { timedOut = true; rpc.close(); }, 25000);
     const abort = () => rpc.close(); signal?.addEventListener('abort', abort, { once: true });
     try {
-      await rpc.call('initialize', { clientInfo: { name: 'model_harbor', version: '0.1.0' }, capabilities: { experimentalApi: true } });
+      const initialized = await rpc.call('initialize', { clientInfo: { name: 'model_harbor', version: '0.1.0' }, capabilities: { experimentalApi: true } });
       rpc.send({ method: 'initialized', params: {} });
       const ids = []; let cursor = null;
       do {
@@ -499,6 +540,15 @@ export class NasAgentBridge {
         cursor = page.nextCursor || null;
       } while (cursor);
       if (!ids.length) throw new HttpError(502, 'Codex 没有返回可用模型，请检查账号权限和登录状态', 'codex_models_empty');
+      const capability = { provider: p.id, cli: 'Codex', version: String(initialized?.userAgent || '').match(/\d+\.\d+\.\d+(?:[-.\w]*)?/)?.[0] || null, modelList: 'verified', historyInjection: this.capabilities.get(p.id)?.historyInjection || 'unknown', checkedAt: new Date().toISOString() };
+      if (probe) {
+        try {
+          const thread = await rpc.call('thread/start', { model: ids[0], cwd: '/tmp', ephemeral: true, approvalPolicy: 'never', sandbox: 'read-only', dynamicTools: [], config: { 'features.shell_tool': false, 'features.apply_patch_freeform': false, 'features.apps': false, 'features.plugins': false, 'features.image_generation': false, 'features.multi_agent': false, web_search: 'disabled', mcp_servers: {} } });
+          await rpc.call('thread/inject_items', { threadId: thread.thread.id, items: [] });
+          capability.historyInjection = 'verified';
+        } catch (e) { capability.historyInjection = e.code === 'codex_app_server_unsupported' ? 'unsupported' : 'failed'; }
+      }
+      this.capabilities.set(p.id, capability);
       return [...new Set(ids)];
     } catch (e) {
       if (e instanceof HttpError) throw e;
@@ -555,9 +605,16 @@ export class NasAgentBridge {
       throw new HttpError(502, '重置结果尚未确认；请使用同一次操作重试，避免重复消耗次数。');
     } finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); rpc.close(); this.usageReaders.delete(rpc); this.resetInFlight = false; }
   }
-  async run(p, model, rawBody, endpoint, signal, onEvent) {
+  async run(p, model, rawBody, endpoint, signal, onEvent, options = {}) {
     const body = agentInput(rawBody, endpoint), { input, outputs, budget } = validateAgent(body), { specs, mappings, webSearch } = toolSpecs(body.tools, body.tool_choice);
-    const signature = JSON.stringify([p, model, specs, budget, webSearch]);
+    // Tool schemas legitimately change between rounds (tool_search returns
+    // deferred definitions), but the native thread is still valid. Rebuild only
+    // when the tool name set changes; otherwise every tool search would discard
+    // the session and re-inject trimmed history.
+    const toolNames = specs.map(spec => spec.type === 'namespace'
+      ? spec.name + '[' + (spec.tools || []).map(tool => tool.name).sort().join(',') + ']'
+      : spec.name).sort().join('|');
+    const signature = JSON.stringify([p, model, webSearch, toolNames]);
     for (const output of outputs.slice(-1)) {
       const previous = this.completedCalls.get(output.call_id);
       if (input.filter(i => i.type !== 'reasoning').at(-1) === output && previous && previous.signature === signature && previous.output === JSON.stringify(output) && Date.now() - previous.at < this.idleMs) return structuredClone(previous.response);
@@ -577,7 +634,7 @@ export class NasAgentBridge {
       if (this.sessions.size >= this.maxSessions) throw new HttpError(429, '远程工具会话已满，请稍后重试');
       s = { rpc: new RPC(this.launch(p)), signature, mappings, busy: false, reconstructed: isToolOutput(lastItem) };
       this.sessions.add(s);
-    }
+    } else s.mappings = mappings;
     clearTimeout(s.idle); s.busy = true; let resumed;
     const finish = response => {
       if (resumed) {
@@ -592,6 +649,20 @@ export class NasAgentBridge {
     let context = '';
     try {
       if (signal?.aborted) throw new HttpError(408, '请求已取消');
+      let streamedText = false, turnParams = null, capacityRetries = 0;
+      const sharedBudget = options.retryBudget || retryBudget();
+      const maxCapacityRetries = sharedBudget.remaining;
+      const capacityBackoffMs = envNumber('MH_CAPACITY_BACKOFF_MS', 2000);
+      const retryTurn = async (detail, label) => {
+        if (streamedText || !turnParams || capacityRetries >= maxCapacityRetries) return false;
+        capacityRetries++;
+        const delay = capacityBackoffMs * capacityRetries;
+        console.warn(`[model-harbor] ${label}; retry ${capacityRetries}/${maxCapacityRetries} in ${delay}ms: ${rpcDetail(detail)}`);
+        if (!await retryDelay(sharedBudget, capacityBackoffMs, signal)) return false;
+        sharedBudget.attempts++;
+        await s.rpc.call('turn/start', turnParams);
+        return true;
+      };
       const response = budgetResponse(responseBase(rawBody.model), budget); response.tools = body.tools || []; response.tool_choice = body.tool_choice || 'auto'; response.parallel_tool_calls = false;
       if (s.reconstructed) response.metadata = { ...(response.metadata || {}), model_harbor_session: 'reconstructed_after_tool_result' };
       if (webSearch.unsupportedContentTypes) response.metadata = {...response.metadata, model_harbor_unsupported_search_content_types: webSearch.unsupportedContentTypes.join(',')};
@@ -629,9 +700,12 @@ export class NasAgentBridge {
           thread = await s.rpc.call('thread/start', { ...threadParams, dynamicTools: fitToolSpecs(specs, maxToolBytes) });
         }
         s.threadId = thread.thread.id;
-        const history = historyItems(s.reconstructed ? input : input.slice(0, -1));
+        const trimStats = {};
+        const history = historyItems(s.reconstructed ? input : input.slice(0, -1), {}, trimStats);
         const current = currentTurnInput(s.reconstructed ? continuationInput() : input);
-        context = `tools=${specs.length}, toolBytes=${Buffer.byteLength(JSON.stringify(specs))}, eager=${deferred.stats.eager}, deferred=${deferred.stats.deferred}, namespaces=${deferred.stats.namespaces}, history=${history.length}${s.reconstructed ? ', reconstructed=true' : ''}`;
+        if (trimStats.clipped || trimStats.omittedImages) console.log(`[model-harbor] history trimmed: ${trimStats.clipped} tool output(s), ${trimStats.omittedChars} chars omitted, ${trimStats.omittedImages} image(s) dropped (clip=${trimStats.toolClip}, imageTurns=${trimStats.imageTurns})`);
+        console.log(`[model-harbor] request model=${model} tools=${specs.length} eager=${deferred.stats.eager} deferred=${deferred.stats.deferred} history=${history.length} trimmed=${trimStats.clipped}/${trimStats.omittedChars}/${trimStats.omittedImages}${s.reconstructed ? ' reconstructed=true' : ''}`);
+        context = `tools=${specs.length}, toolBytes=${Buffer.byteLength(JSON.stringify(specs))}, eager=${deferred.stats.eager}, deferred=${deferred.stats.deferred}, namespaces=${deferred.stats.namespaces}, history=${history.length}, trimmed=${trimStats.clipped}/${trimStats.omittedChars}/${trimStats.omittedImages}${s.reconstructed ? ', reconstructed=true' : ''}`;
         if (s.reconstructed) console.warn('[model-harbor] reconstructing native history: tool result arrived without a live app-server session');
         if (deferred.stats.deferred) console.log(`[model-harbor] deferLoading: ${deferred.stats.eager} eager, ${deferred.stats.deferred} deferred in ${deferred.stats.namespaces} namespaces`);
         if (history.length) {
@@ -648,22 +722,29 @@ export class NasAgentBridge {
           }
         }
         const turnInput = s.legacyTranscript ? [{ type: 'text', text: JSON.stringify(s.legacyTranscript) }, ...current.filter(item => item.type === 'image')] : current;
-        await s.rpc.call('turn/start', { threadId: s.threadId, input: turnInput, ...(body.reasoning?.effort || body.reasoning_effort ? { effort: body.reasoning?.effort || body.reasoning_effort } : {}) });
+        turnParams = { threadId: s.threadId, input: turnInput, ...(body.reasoning?.effort || body.reasoning_effort ? { effort: body.reasoning?.effort || body.reasoning_effort } : {}) };
+        await s.rpc.call('turn/start', turnParams);
       }
       while (true) {
         const event = await s.rpc.next(), params = event.params || {};
-        if (event.method === 'item/started' && params.item?.type === 'agentMessage') {
+        if (event.method === 'item/started' && params.item?.type === 'webSearch') {
+          streamedText = true; if (onEvent) await onEvent({ type: 'irreversible' });
+        } else if (event.method === 'item/started' && params.item?.type === 'agentMessage') {
           if (onEvent) await onEvent({ type: 'message_started', item: params.item });
         } else if (event.method === 'item/agentMessage/delta' && typeof params.delta === 'string') {
+          if (params.delta) streamedText = true;
           if (onEvent) await onEvent({ type: 'text_delta', itemId: params.itemId, delta: params.delta });
         } else if (event.method === 'item/completed' && params.item?.type === 'agentMessage') {
           const text = params.item.text;
+          if (text) streamedText = true;
           const item = text ? { id: params.item.id || uid('msg_'), type: 'message', role: 'assistant', status: 'completed', ...(params.item.phase ? { phase: params.item.phase } : {}), content: [{ type: 'output_text', text, annotations: [], logprobs: [] }] } : null;
           if (item) response.output.push(item);
           if (onEvent) await onEvent({ type: 'message_done', item });
         } else if (event.method === 'item/completed' && params.item?.type === 'webSearch') {
           if (webSearch.mode === 'disabled') throw failed();
-          response.output.push(searchItem(params.item));
+          streamedText = true; // A native search must never be replayed by capacity retry.
+          const item = searchItem(params.item); response.output.push(item);
+          if (onEvent) await onEvent({ type: 'search_done', item });
         } else if (event.method === 'item/tool/call' && event.id !== undefined) {
           const callName = String(params.tool || ''), shortName = callName.includes('.') ? callName.slice(callName.lastIndexOf('.') + 1) : callName;
           const tool = s.mappings.get(callName) || s.mappings.get(shortName);
@@ -682,6 +763,7 @@ export class NasAgentBridge {
           const status = params.turn?.status || (event.method === 'turn/failed' ? 'failed' : '');
           if (status !== 'completed') {
             const detail = String(params.turn?.error?.message || params.error?.message || '').slice(0, 400);
+            if (isCapacityDetail(detail) && await retryTurn(detail, 'upstream model at capacity')) continue;
             if (/context window|contextWindow|too many tokens|token limit/i.test(detail)) throw new HttpError(413, '远程 Codex 上下文已超出模型窗口；请压缩历史或减少附件', 'remote_context_window_exceeded');
             throw new HttpError(502, detail ? '远程 Codex 回合失败：' + detail : '远程 Codex 回合失败，请检查登录、模型权限和 CLI 日志', 'codex_turn_failed');
           }
@@ -693,6 +775,7 @@ export class NasAgentBridge {
         } else if (event.method === 'error' && !params.willRetry) {
           const detail = String(params.message || params.error?.message || JSON.stringify(params || {})).slice(0, 500);
           console.error('[model-harbor] app-server error event:', rpcDetail(detail));
+          if (isCapacityDetail(detail) && await retryTurn(detail, 'upstream model at capacity')) continue;
           throw failed(detail);
         } else if (event.id !== undefined && event.method) {
           // Unexpected approval/local tool requests are refused, never auto-approved.
@@ -702,6 +785,7 @@ export class NasAgentBridge {
         }
       }
     } catch (e) {
+      e.capacityRetryHandled = true;
       this.dispose(s);
       if (e instanceof HttpError && e.message === '远程 Codex 工具桥接失败，请检查登录、模型权限和 app-server 版本' && context) e.message += `（${context}）`;
       throw e;
@@ -720,87 +804,100 @@ export function agentChat(response) {
 }
 
 export async function sendAgent(bridge, p, model, body, endpoint, res, signal, options = {}) {
-  if (!body.stream) { const response = await bridge.run(p, model, body, endpoint, signal); return endpoint === 'responses' ? response : agentChat(response); }
-  const normalized = agentInput(body, endpoint); validateAgent(normalized); const toolPlan = toolSpecs(normalized.tools, normalized.tool_choice);
-  const deferred = options.deferOpen === true;
-  if (!deferred) openSSE(res);
-  let seq = 0;
-  const emit = (type, fields) => writeSSE(res, { type, sequence_number: seq++, ...fields }, type);
-  const initial = budgetResponse(responseBase(body.model), outputBudget(normalized));
-  if (!deferred && endpoint === 'responses') { await emit('response.created', { response: initial }); await emit('response.in_progress', { response: initial }); }
-  let heartbeat = null;
-  if (!deferred) { heartbeat = setInterval(() => { if (!res.destroyed) res.write(': keepalive\n\n'); }, 15000); heartbeat.unref(); }
-  const streamed = new Set(), live = new Map();
+  if (!body.stream) {
+    const response = await bridge.run(p, model, body, endpoint, signal, undefined, options);
+    completeMetrics(res, response); if (response.output?.length) markOutput(res);
+    return endpoint === 'responses' ? response : agentChat(response);
+  }
+  const normalized = agentInput(body, endpoint); validateAgent(normalized); toolSpecs(normalized.tools, normalized.tool_choice);
+  res.apiRetrySafe = true;
+  // A single public stream survives pre-output account failover. Headers,
+  // response.created and keepalives do not commit the selected account.
+  if (!res.agentStream) {
+    openSSE(res);
+    res.agentStream = { seq: 0, initial: budgetResponse(responseBase(body.model), outputBudget(normalized)) };
+    if (endpoint === 'responses') {
+      for (const type of ['response.created', 'response.in_progress']) await writeSSE(res, { type, sequence_number: res.agentStream.seq++, response: res.agentStream.initial }, type);
+    }
+  }
+  const stream = res.agentStream, initial = stream.initial;
+  const emit = (type, fields) => writeSSE(res, { type, sequence_number: stream.seq++, ...fields }, type);
+  const chatBase = { id: initial.id, object: 'chat.completion.chunk', created: initial.created_at, model: body.model };
+  const heartbeat = setInterval(() => { if (!res.destroyed && !res.writableEnded && res.writableLength < 65536) res.write(': keepalive\n\n'); }, 15000); heartbeat.unref();
+  const live = new Map(), emitted = new Set();
   const ensureMessage = async item => {
-    if (!item?.id) return null;
     let state = live.get(item.id);
     if (!state) {
       state = { index: live.size, text: '', message: { id: item.id, type: 'message', role: 'assistant', status: 'in_progress', content: [{ type: 'output_text', text: '', annotations: [], logprobs: [] }] } };
-      live.set(item.id, state); streamed.add(item.id);
-      await emit('response.output_item.added', { output_index: state.index, item: structuredClone(state.message) });
-      await emit('response.content_part.added', { item_id: item.id, output_index: state.index, content_index: 0, part: { ...state.message.content[0], text: '' } });
+      live.set(item.id, state);
+      if (endpoint === 'responses') {
+        await emit('response.output_item.added', { output_index: state.index, item: structuredClone(state.message) });
+        await emit('response.content_part.added', { item_id: item.id, output_index: state.index, content_index: 0, part: { ...state.message.content[0], text: '' } });
+      }
     }
     return state;
   };
   const onEvent = async event => {
-    if (endpoint !== 'responses') return;
-    if (event.type === 'message_started') { await ensureMessage(event.item); return; }
-    if (event.type === 'text_delta') {
+    if (event.type === 'irreversible') { res.apiOutputStarted = true; return; }
+    if (event.type === 'message_started') return; // Empty item is not committed output.
+    if (event.type === 'text_delta' && event.delta) {
+      markOutput(res);
       const state = await ensureMessage({ id: event.itemId });
-      if (!state) return;
       state.text += event.delta; state.message.content[0].text = state.text;
-      await emit('response.output_text.delta', { item_id: event.itemId, output_index: state.index, content_index: 0, delta: event.delta, logprobs: [] });
-      return;
-    }
-    if (event.type === 'message_done' && event.item) {
-      const state = await ensureMessage({ id: event.item.id });
-      if (!state) return;
-      state.text = event.item.content?.[0]?.text ?? state.text;
-      state.message.content[0].text = state.text; state.message.status = 'completed';
-      if (event.item.phase) state.message.phase = event.item.phase;
-      const meta = { output_index: state.index, item_id: event.item.id };
-      await emit('response.output_text.done', { ...meta, content_index: 0, text: state.text, logprobs: [] });
-      await emit('response.content_part.done', { ...meta, content_index: 0, part: state.message.content[0] });
-      await emit('response.output_item.done', { output_index: state.index, item: state.message });
+      if (endpoint === 'responses') await emit('response.output_text.delta', { item_id: event.itemId, output_index: state.index, content_index: 0, delta: event.delta, logprobs: [] });
+      else await writeSSE(res, { ...chatBase, choices: [{ index: 0, delta: { role: 'assistant', content: event.delta }, finish_reason: null }] });
+    } else if (event.type === 'message_done' && event.item) {
+      markOutput(res);
+      const state = await ensureMessage(event.item), text = event.item.content?.[0]?.text ?? state.text;
+      // Some CLI versions emit only item/completed, without text deltas.
+      if (!state.text && text) {
+        if (endpoint === 'responses') await emit('response.output_text.delta', { item_id: event.item.id, output_index: state.index, content_index: 0, delta: text, logprobs: [] });
+        else await writeSSE(res, { ...chatBase, choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: null }] });
+      }
+      state.text = text; state.message = event.item; emitted.add(event.item.id);
+      if (endpoint === 'responses') {
+        const meta = { output_index: state.index, item_id: event.item.id, content_index: 0 };
+        await emit('response.output_text.done', { ...meta, text, logprobs: [] });
+        await emit('response.content_part.done', { ...meta, part: event.item.content[0] });
+        await emit('response.output_item.done', { output_index: state.index, item: event.item });
+      }
+    } else if (event.type === 'search_done') {
+      markOutput(res);
+      const index = live.size; live.set(event.item.id, { index }); emitted.add(event.item.id);
+      if (endpoint === 'responses') {
+        await emit('response.output_item.added', { output_index: index, item: { ...event.item, status: 'in_progress' } });
+        for (const status of ['in_progress', 'searching', 'completed']) await emit('response.web_search_call.' + status, { output_index: index, item_id: event.item.id });
+        await emit('response.output_item.done', { output_index: index, item: event.item });
+      }
     }
   };
-  // Native web search can emit a separate output item before the final message;
-  // keep that path buffered so its output indices remain stable.
-  const liveText = !deferred && endpoint === 'responses' && toolPlan.webSearch.mode === 'disabled';
   let response;
-  try { response = await bridge.run(p, model, body, endpoint, signal, liveText ? onEvent : undefined); }
+  try { response = await bridge.run(p, model, body, endpoint, signal, onEvent, options); }
   finally { clearInterval(heartbeat); }
-  if (deferred) {
-    openSSE(res);
-    if (endpoint === 'responses') { await emit('response.created', { response: initial }); await emit('response.in_progress', { response: initial }); }
-  }
-  response.id = initial.id;
+  completeMetrics(res, response); response.id = initial.id;
   if (endpoint === 'responses') {
-    for (let index = 0; index < response.output.length; index++) {
-      const item = response.output[index], meta = { output_index: index, item_id: item.id };
-      if (item.type === 'message' && streamed.has(item.id)) continue;
-      const tool = item.type !== 'message';
-      await emit('response.output_item.added', { output_index: index, item: tool ? { ...item, status: 'in_progress', ...(item.type === 'custom_tool_call' ? { input: '' } : ['tool_search_call','web_search_call'].includes(item.type) ? {} : { arguments: '' }) } : { ...item, status: 'in_progress', content: [] } });
-      if (item.type === 'web_search_call') {
-        for (const status of ['in_progress','searching','completed']) await emit('response.web_search_call.' + status, meta);
-      } else if (tool && item.type !== 'tool_search_call') {
-        const custom = item.type === 'custom_tool_call', stem = custom ? 'response.custom_tool_call_input' : 'response.function_call_arguments', field = custom ? 'input' : 'arguments';
-        await emit(stem + '.delta', { ...meta, delta: item[field] }); await emit(stem + '.done', { ...meta, [field]: item[field], name: item.name });
-      } else if (!tool) {
-        const part = item.content[0];
-        await emit('response.content_part.added', { ...meta, content_index: 0, part: { ...part, text: '' } });
-        await emit('response.output_text.delta', { ...meta, content_index: 0, delta: part.text, logprobs: [] });
-        await emit('response.output_text.done', { ...meta, content_index: 0, text: part.text, logprobs: [] });
-        await emit('response.content_part.done', { ...meta, content_index: 0, part });
+    for (const item of response.output) {
+      if (emitted.has(item.id)) continue;
+      if (item.type === 'message') { await onEvent({ type: 'message_done', item }); continue; }
+      if (item.type === 'web_search_call') { await onEvent({ type: 'search_done', item }); continue; }
+      markOutput(res);
+      const index = live.size; live.set(item.id, { index });
+      const meta = { output_index: index, item_id: item.id }, custom = item.type === 'custom_tool_call', field = custom ? 'input' : 'arguments';
+      await emit('response.output_item.added', { output_index: index, item: { ...item, status: 'in_progress', ...(item.type === 'tool_search_call' ? {} : { [field]: '' }) } });
+      if (item.type !== 'tool_search_call') {
+        const stem = custom ? 'response.custom_tool_call_input' : 'response.function_call_arguments';
+        await emit(stem + '.delta', { ...meta, delta: item[field] });
+        await emit(stem + '.done', { ...meta, [field]: item[field], name: item.name });
       }
       await emit('response.output_item.done', { output_index: index, item });
     }
     await emit('response.completed', { response });
   } else {
-    const chat = agentChat(response), { message, finish_reason } = chat.choices[0], base = { id: chat.id, object: 'chat.completion.chunk', created: chat.created, model: chat.model };
-    await writeSSE(res, { ...base, choices: [{ index: 0, delta: { ...message, ...(message.tool_calls ? { tool_calls: message.tool_calls.map((t, index) => ({ ...t, index })) } : {}) }, finish_reason: null }] });
-    await writeSSE(res, { ...base, choices: [{ index: 0, delta: {}, finish_reason }] });
-    if (chat.usage) await writeSSE(res, { ...base, choices: [], usage: chat.usage });
+    for (const item of response.output) if (item.type === 'message' && !emitted.has(item.id)) await onEvent({ type: 'message_done', item });
+    const chat = agentChat(response), { message, finish_reason } = chat.choices[0];
+    if (message.tool_calls) { markOutput(res); await writeSSE(res, { ...chatBase, choices: [{ index: 0, delta: { tool_calls: message.tool_calls.map((t, index) => ({ ...t, index })) }, finish_reason: null }] }); }
+    await writeSSE(res, { ...chatBase, choices: [{ index: 0, delta: {}, finish_reason }] });
+    if (chat.usage) await writeSSE(res, { ...chatBase, choices: [], usage: chat.usage });
     await writeSSE(res, '[DONE]');
   }
   res.end(); return null;

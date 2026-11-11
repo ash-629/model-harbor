@@ -205,7 +205,9 @@ async function api(path, options = {}, retried = false) {
   const data = await response.json(); if (!response.ok) throw new Error(data.error?.message || t('请求失败')); return data;
 }
 async function load() {
-  state = await api('/config');
+  const [config, diagnostics] = await Promise.all([api('/config'), api('/diagnostics')]);
+  state = { ...config, diagnostics };
+  document.querySelector('.version').textContent = 'v' + diagnostics.version;
   $('stat-providers').textContent = state.providers.filter(p => p.enabled).length;
   $('stat-models').textContent = state.models.length;
   $('base-url-openai').textContent = state.baseUrl || ''; $('base-url-anthropic').textContent = (state.baseUrl || '').replace(/\/v1\/?$/, ''); renderConnection();
@@ -392,11 +394,24 @@ async function moveGroupMember(groupId, memberId, delta) {
 function tokenMetricsMarkup(m) {
   if (!m) return '';
   const u = m.usage, val = n => Number.isFinite(n) ? n.toLocaleString(getLanguage()) : '—';
-  return `<div class="muted small">${h(t('输入 / 输出 / 缓存'))}: ${val(u?.inputTokens)} / ${val(u?.outputTokens)} / ${val(u?.cachedInputTokens)}<br>${h(t('请求体积'))}: ${val(m.before?.requestBytes)} → ${val(m.after?.requestBytes)} B</div>`;
+  return `<div class="muted small">${h(t('输入 / 输出 / 缓存'))}: ${val(u?.inputTokens)} / ${val(u?.outputTokens)} / ${val(u?.cachedInputTokens)}<br>${h(m.provider || '')} · ${h(t('首字耗时'))}: ${val(m.firstTokenMs)} ms · ${h(t('重试次数'))}: ${val(m.retries)}${m.reconstructed ? ' · ' + h(t('会话已重建')) : ''}<br>${h(m.completion || '')}</div>`;
 }
+function renderDiagnostics() {
+  const d = state.diagnostics; if (!d) return;
+  const ms = n => Number.isFinite(n) ? (n / 1000).toFixed(2) + ' s' : '—';
+  $('diagnostics').innerHTML = `<article class="panel diagnostic-card"><strong>${t('部署状态')}</strong><p>v${h(d.version)} · ${h(d.build)}</p><p>${h(t(d.draining ? '正在排空任务' : '运行中'))} · ${d.activeRequests} ${t('进行中')}</p>${d.journalError ? `<p class="notice error">${h(d.journalError)}</p>` : ''}</article>` +
+    (d.stats || []).map(v => `<article class="panel diagnostic-card"><strong>${h(t('最近 {hours} 小时', {hours:v.hours}))}</strong><p>${v.requests} ${t('次请求')} · ${v.succeeded} ${t('成功')} · ${v.cancelled} ${t('已取消')}</p><p>${t('首字耗时')} P50 / P95: ${ms(v.firstTokenP50)} / ${ms(v.firstTokenP95)}</p><p>${t('输入 / 输出 / 缓存')}: ${v.inputTokens} / ${v.outputTokens} / ${v.cachedInputTokens}</p><small>${h(t('有用量数据：{known}/{total}', {known:v.usageKnown,total:v.requests}))}</small></article>`).join('') +
+    state.providers.filter(p => p.type === 'nas-codex').map(p => { const c = d.capabilities.find(c => c.provider === p.id); return `<article class="panel diagnostic-card"><strong>${h(p.name)} · Codex CLI</strong><p>${h(c?.version || t('未检测'))}</p><p>model/list: ${h(c?.modelList || 'unknown')}<br>thread/inject_items: ${h(c?.historyInjection || 'unknown')}</p><button class="button ghost" data-capability-probe="${h(p.id)}">${t('检测兼容性')}</button></article>`; }).join('');
+}
+$('diagnostics').addEventListener('click', async event => {
+  const button = event.target.closest('[data-capability-probe]'); if (!button) return; button.disabled = true;
+  try { await api('/providers/' + button.dataset.capabilityProbe + '/capabilities', { method: 'POST' }); await load(); }
+  catch (e) { errorBox('global-error', e.message); } finally { button.disabled = false; }
+});
 function renderLogs() {
+  renderDiagnostics();
   $('logs-empty').hidden = Boolean(state.logs.length);
-  $('logs-body').innerHTML = state.logs.map(l => `<tr><td>${h(new Date(l.time).toLocaleTimeString(getLanguage()))}</td><td><code>${h(l.model)}</code>${l.error ? `<div class="log-error">${h(translateError(l.error))}</div>` : ''}</td><td>${h(l.endpoint)}${tokenMetricsMarkup(l.tokenMetrics)}</td><td><span class="source-badge ${l.status === 200 ? '' : 'bridge-badge'}">${l.status}</span></td><td>${(l.duration / 1000).toFixed(2)} s</td></tr>`).join('');
+  $('logs-body').innerHTML = state.logs.map(l => `<tr><td>${h(new Date(l.time).toLocaleTimeString(getLanguage()))}</td><td><code>${h(l.sourceIp || 'unknown')}</code></td><td><code>${h(l.model)}</code>${l.errorCode ? `<div class="log-error">${h(l.errorCode)}</div>` : ''}<div class="small muted">${h(l.requestId || '')}</div></td><td>${h(l.endpoint)}${tokenMetricsMarkup(l.tokenMetrics)}</td><td><span class="source-badge ${l.status === 200 ? '' : 'bridge-badge'}">${l.status}</span></td><td>${(l.duration / 1000).toFixed(2)} s</td></tr>`).join('');
 }
 function capability() {
   const model = state.models.find(m => m.id === $('test-model').value);

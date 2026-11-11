@@ -1,4 +1,5 @@
 // F-03/F-05: upstream requests, streaming backpressure, cancellation and sanitized failures.
+import { retryBudget, retryDelay, outputStarted } from './request-runtime.js';
 import { HttpError } from './store.js';
 import { optimizeApiPayload, tokenPolicy, usageMetrics, requestStats } from './api-token-policy.js';
 import { toChat, fromChat, bridgeStream, sseEvents, openSSE, writeSSE, chatToResponses, responsesToChat, responsesStreamToChat, normalizeChatToolMessages } from './protocol.js';
@@ -121,7 +122,7 @@ export async function discover(store, p, signal, nasAgent) {
 export async function route(store, p, model, body, endpoint, res, signal, nasAgent, claudeBridge = defaultClaudeBridge, requestSessionId = '', grokBridge = defaultGrokBridge, options = {}) {
   if (p.type === 'nas-codex') {
     if (!nasAgent) throw new HttpError(502, 'Codex 官方 app-server 桥接未初始化', 'codex_bridge_unavailable');
-    res.apiMetrics = { provider: p.id, protocol: 'chat', usage: null, completion: 'pending' };
+    res.apiMetrics = { provider: p.id, protocol: endpoint, usage: null, completion: 'pending' };
     return sendAgent(nasAgent, p, model, body, endpoint, res, signal, options);
   }
   if (p.type === 'claude-code') {
@@ -232,9 +233,29 @@ export async function route(store, p, model, body, endpoint, res, signal, nasAge
 const QUOTA_PATTERN = /usage limit|quota|额度|用量上限|已用完|超出额度|insufficient_quota|billing hard limit|credit balance/i;
 const RATE_PATTERN = /rate limit|too many requests|请求过于频繁/i;
 
+const CAPACITY_PATTERN = /at capacity|overloaded|server is busy|capacity exceeded|模型.{0,8}(繁忙|满载|容量)/i;
+
 export function isQuotaError(error) {
   const text = `${error?.message || ''} ${error?.code || ''}`;
   return QUOTA_PATTERN.test(text) || RATE_PATTERN.test(text);
+}
+
+// Transient upstream capacity is retryable and never quarantines an account
+// for the full quota window.
+export function isCapacityError(error) {
+  const text = `${error?.message || ''} ${error?.code || ''}`;
+  return CAPACITY_PATTERN.test(text);
+}
+
+async function withCapacityRetry(run, { budget, delayMs, res, signal }) {
+  for (;;) {
+    if (signal?.aborted) throw new HttpError(499, '请求已取消');
+    budget.attempts++;
+    try { return await run(); }
+    catch (error) {
+      if (!isCapacityError(error) || error.capacityRetryHandled || outputStarted(res) || signal?.aborted || !await retryDelay(budget, delayMs, signal)) throw error;
+    }
+  }
 }
 
 function cooldownKind(error) {
@@ -247,12 +268,12 @@ function withTimeout(promise, ms) {
   return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), ms); })]).finally(() => clearTimeout(timer));
 }
 
-export async function markGroupCooldown(store, group, provider, error, nasAgent) {
+export async function markGroupCooldown(store, group, provider, error, nasAgent, signal) {
   const now = Date.now(), kind = cooldownKind(error);
   let until = now + (kind === 'rate' ? 60 * 1000 : 30 * 60 * 1000);
   if (kind === 'quota' && nasAgent?.usage) {
     try {
-      const usage = await withTimeout(nasAgent.usage(provider, undefined, true), 8000);
+      const usage = await withTimeout(nasAgent.usage(provider, signal ? AbortSignal.any([signal, AbortSignal.timeout(8000)]) : AbortSignal.timeout(8000), true), 8000);
       const windows = (usage?.buckets || []).flatMap(bucket => bucket.windows || []);
       const exhausted = windows.filter(w => Number(w.usedPercent) >= 100 && Number(w.resetsAt) > 0);
       if (exhausted.length) until = Math.max(now + 60 * 1000, ...exhausted.map(w => Number(w.resetsAt) * 1000));
@@ -265,7 +286,11 @@ export async function markGroupCooldown(store, group, provider, error, nasAgent)
 export async function routeWithFailover(store, resolved, body, endpoint, res, signal, nasAgent, claudeBridge = defaultClaudeBridge, requestSessionId = '', grokBridge = defaultGrokBridge) {
   const group = resolved.group || null;
   const candidates = resolved.candidates?.length ? resolved.candidates : [{ provider: resolved.provider, model: resolved.model }];
-  if (!group) return route(store, resolved.provider, resolved.model, body, endpoint, res, signal, nasAgent, claudeBridge, requestSessionId, grokBridge);
+  const budget = retryBudget();
+  const capacityDelayMs = Math.max(0, Number(process.env.MH_CAPACITY_BACKOFF_MS ?? 1500) || 0);
+  const retryOptions = { budget, delayMs: capacityDelayMs, res, signal };
+  res.retryBudget = budget;
+  if (!group) return withCapacityRetry(() => route(store, resolved.provider, resolved.model, body, endpoint, res, signal, nasAgent, claudeBridge, requestSessionId, grokBridge, { retryBudget: budget }), retryOptions);
   const deferred = candidates.length > 1;
   const skipped = [];
   const trail = [];
@@ -275,17 +300,22 @@ export async function routeWithFailover(store, resolved, body, endpoint, res, si
     const cooldown = store.groupCooldown(group.id, provider.id);
     if (cooldown) { skipped.push({ provider, until: Number(cooldown.until) }); continue; }
     try {
-      const output = await route(store, provider, model, body, endpoint, res, signal, nasAgent, claudeBridge, requestSessionId, grokBridge, { deferOpen: deferred });
+      const output = await withCapacityRetry(() => route(store, provider, model, body, endpoint, res, signal, nasAgent, claudeBridge, requestSessionId, grokBridge, { deferOpen: deferred, retryBudget: budget }), retryOptions);
       store.clearGroupCooldown(group.id, provider.id);
       if (trail.length && res.apiMetrics) res.apiMetrics.failover = trail;
       return output;
     } catch (error) {
-      const quota = isQuotaError(error);
+      const quota = isQuotaError(error), capacity = !quota && isCapacityError(error);
       if (quota) {
-        const until = await markGroupCooldown(store, group, provider, error, nasAgent);
-        trail.push({ provider: provider.id, until });
+        const until = await markGroupCooldown(store, group, provider, error, nasAgent, signal);
+        trail.push({ provider: provider.id, until, kind: quota ? 'quota' : 'capacity' });
+      } else if (capacity) {
+        const until = Date.now() + 60 * 1000;
+        store.setGroupCooldown(group.id, provider.id, { until, kind: 'rate', at: new Date().toISOString(), error: String(error?.message || '').slice(0, 200) });
+        trail.push({ provider: provider.id, until, kind: quota ? 'quota' : 'capacity' });
       }
-      if (!quota || res.headersSent || index >= candidates.length - 1) throw error;
+      if (res.apiMetrics) res.apiMetrics.failover = trail;
+      if ((!quota && !capacity) || outputStarted(res) || signal?.aborted || index >= candidates.length - 1) throw error;
       lastError = error;
     }
   }

@@ -1,3 +1,4 @@
+import { createMediaControls } from './media-controls.js';
 // I-01/I-02/I-05/I-06: natural-language image workspace, provider editor and durable history.
 import { t, getLanguage, translateError } from './i18n.js';
 const $ = id => document.getElementById(id);
@@ -10,6 +11,7 @@ export function createImageUI({ api, toast }) {
   let providers = [], jobs = [], visible = false, loading = false, submitting = false, saving = false, editing = null, poll;
   let references = [], uploading = false;
   const checks = new Set();
+  const controls = createMediaControls({ kind: 'image', api, reload: load, error, toast });
   const errorMessages = new Map();
   function error(id, message) {
     errorMessages.set(id, message || ''); $(id).hidden = !message; $(id).textContent = translateError(message || '');
@@ -18,15 +20,15 @@ export function createImageUI({ api, toast }) {
     if (loading) { await loading; if (force) return load(); return; }
     loading = (async () => {
       try {
-        const [p, j] = await Promise.all([api('/image/providers'), api('/image/jobs')]);
-        providers = p.providers; jobs = j.jobs; render();
+        const [p, j] = await Promise.all([api('/image/providers'), api('/image/jobs' + controls.query())]);
+        providers = p.providers; jobs = j.jobs; controls.renderPage(j); render();
       } catch (e) { error('image-error', e.message); }
     })();
     try { await loading; } finally { loading = false; schedule(); }
   }
   function schedule() {
     clearTimeout(poll);
-    if (visible && jobs.some(active)) poll = setTimeout(() => load(), 2500);
+    if (visible && (controls.active || jobs.some(active))) poll = setTimeout(() => load(), 2500);
   }
   function setVisible(value) { visible = value; if (visible) load(); else clearTimeout(poll); }
   function providerNote() {
@@ -39,6 +41,7 @@ export function createImageUI({ api, toast }) {
     $('image-prompt').maxLength = p?.type === 'minimax' ? 1500 : 16000;
   }
   function render() {
+    controls.render();
     const selected = $('image-provider').value, enabled = providers.filter(p => p.enabled);
     $('image-provider').innerHTML = enabled.length ? enabled.map(p => `<option value="${h(p.id)}">${h(p.name)}</option>`).join('') : `<option value="">${t('请先配置生图服务商')}</option>`;
     if (enabled.some(p => p.id === selected)) $('image-provider').value = selected;
@@ -49,10 +52,10 @@ export function createImageUI({ api, toast }) {
     $('image-providers-list').innerHTML = providers.map(p => `<article class="image-provider-item"><div class="image-provider-top"><strong>${h(p.name)}</strong><span class="status-pill ${p.enabled ? '' : 'off'}">${t(p.enabled ? '已启用' : '已停用')}</span></div><p>${typeName(p)} · ${h(p.model || t('默认模型'))}</p><div class="image-provider-actions"><button class="button ghost" data-image-check="${h(p.id)}" ${checks.has(p.id) ? 'disabled' : ''}>${t(checks.has(p.id) ? '检查中…' : '检查配置')}</button><button class="button ghost" data-image-edit="${h(p.id)}">${t('编辑')}</button><button class="button ghost danger" data-image-delete="${h(p.id)}">${t('删除')}</button></div></article>`).join('');
     $('image-jobs-empty').hidden = Boolean(jobs.length);
     $('image-jobs').innerHTML = jobs.map(job => {
-      const status = { queued: t('排队中'), running: t('生成中'), completed: t('已完成'), failed: t('生成失败') }[job.status] || job.status;
+      const status = { queued: t('排队中'), running: t('生成中'), completed: t('已完成'), failed: t('生成失败'), cancelled: t('已取消') }[job.status] || job.status;
       const dimensions = job.width && job.height ? `${job.width} × ${job.height}` : '';
       const elapsed = job.finishedAt && job.startedAt ? ` · ${Math.max(0, (Date.parse(job.finishedAt) - Date.parse(job.startedAt)) / 1000).toFixed(0)} s` : '';
-      return `<article class="panel image-job"><div class="image-job-preview ${active(job) ? 'image-in-progress' : ''}">${job.imageUrl ? `<a href="${h(job.imageUrl)}" target="_blank" rel="noopener"><img src="${h(job.imageUrl)}" loading="lazy" alt="${h(job.prompt)}"></a>` : `<span aria-hidden="true">${job.status === 'failed' ? '×' : '▧'}</span><p>${h(status)}</p>${job.status === 'queued' ? `<small>${t('等待前面的任务完成')}</small>` : ''}`}</div><div class="image-job-body"><div class="image-job-heading"><span class="source-badge ${job.status === 'failed' ? 'bridge-badge' : ''}">${h(status)}</span><small>${h(new Date(job.createdAt).toLocaleString(getLanguage()))}</small></div><p class="image-job-prompt">${h(job.prompt)}</p><p class="muted small">${h(providerDisplayName(job.providerName))} · ${h(job.model || 'Codex')} · ${h(job.aspect)}${job.referenceCount ? ' · ' + h(t('{count} 张参考图', {count: job.referenceCount})) : ''}${dimensions ? ' · ' + dimensions : ''}${elapsed}</p>${job.error ? `<div class="notice error">${h(translateError(job.error))}</div>` : ''}<div class="image-job-actions">${job.imageUrl ? `<a class="button secondary" href="${h(job.imageUrl)}?download=1" download>${t('下载原图 ↓')}</a>` : ''}<button class="button ghost" data-image-reuse="${h(job.id)}">${t('复用描述')}</button></div></div></article>`;
+      return `<article class="panel image-job"><div class="image-job-preview ${active(job) ? 'image-in-progress' : ''}">${job.imageUrl ? `<a href="${h(job.imageUrl)}" target="_blank" rel="noopener"><img src="${h(job.imageUrl)}" loading="lazy" alt="${h(job.prompt)}"></a>` : `<span aria-hidden="true">${job.status === 'failed' ? '×' : '▧'}</span><p>${h(status)}</p>${job.status === 'queued' ? `<small>${t('等待前面的任务完成')}</small>` : ''}`}</div><div class="image-job-body"><div class="image-job-heading"><span class="source-badge ${job.status === 'failed' ? 'bridge-badge' : ''}">${h(status)}</span><small>${h(new Date(job.createdAt).toLocaleString(getLanguage()))}</small></div><p class="image-job-prompt">${h(job.prompt)}</p><p class="muted small">${h(providerDisplayName(job.providerName))} · ${h(job.model || 'Codex')} · ${h(job.aspect)}${job.referenceCount ? ' · ' + h(t('{count} 张参考图', {count: job.referenceCount})) : ''}${dimensions ? ' · ' + dimensions : ''}${elapsed}</p>${job.error ? `<div class="notice error">${h(translateError(job.error))}</div>` : ''}${controls.actions(job)}<div class="image-job-actions">${job.imageUrl ? `<a class="button secondary" href="${h(job.imageUrl)}?download=1" download>${t('下载原图 ↓')}</a>` : ''}<button class="button ghost" data-image-reuse="${h(job.id)}">${t('复用描述')}</button></div></div></article>`;
     }).join('');
     for (const [id, message] of errorMessages) $(id).textContent = translateError(message);
     $('image-save-provider').textContent = t(saving ? '正在保存…' : '保存生图配置');

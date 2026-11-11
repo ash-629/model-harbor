@@ -69,7 +69,8 @@ export function fromResponses(r,model){
 export async function sendMessages(body,res,invoke){
  const request=toResponses(body);if(!body.stream)return fromResponses(await invoke(request,res),body.model);
  const sink=new PassThrough();sink.writeHead=()=>{};sink.flushHeaders=()=>{};
- sink.apiOptimizationDisabled=res.apiOptimizationDisabled;
+ sink.apiOptimizationDisabled=res.apiOptimizationDisabled;sink.requestStarted=res.requestStarted;
+ Object.defineProperty(sink,'retryBudget',{get:()=>res.retryBudget,set:value=>{res.retryBudget=value;}});
  Object.defineProperty(sink,'apiMetrics',{get:()=>res.apiMetrics,set:value=>{res.apiMetrics=value;}});
  const producer=Promise.resolve().then(()=>invoke(request,sink)).then(()=>{if(!sink.writableEnded)sink.end();},e=>sink.destroy(e));
  let opened=false,messageStarted=false,terminal=false,index=0;const blocks=new Map();

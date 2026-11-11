@@ -15,10 +15,10 @@ const tools = [{ type: 'namespace', name: 'functions', tools: [
   { type: 'custom', name: 'apply_patch', format: { type: 'grammar', syntax: 'lark', definition: 'start: /.+/s' } },
   { type: 'function', name: 'read_file', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
 ] }];
-function fakeLaunch({ hang = false, malformed = false, webSearch = false, echoInput = false, streamText = false, errorEvent = null, unknownTool = false } = {}) {
+function fakeLaunch({ hang = false, malformed = false, webSearch = false, echoInput = false, streamText = false, errorEvent = null, unknownTool = false, capacityOnce = null, capacityAfterText = false } = {}) {
   const children = [], exchanges = []; let counter = 0;
   const launch = () => {
-    const child = new EventEmitter(), serial = ++counter; let specs, step = 0;
+    const child = new EventEmitter(), serial = ++counter; let specs, step = 0, capacityFired = false;
     child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.killed = false;
     const emit = value => queueMicrotask(() => child.stdout.write(JSON.stringify(value) + '\n'));
     const completed = text => {
@@ -28,7 +28,8 @@ function fakeLaunch({ hang = false, malformed = false, webSearch = false, echoIn
         for (const delta of String(text).match(/.{1,4}/g) || []) emit({ method: 'item/agentMessage/delta', params: { itemId: id, delta } });
       }
       emit({ method: 'item/completed', params: { item: { type: 'agentMessage', id, text, phase: 'final_answer' } } });
-      emit({ method: 'turn/completed', params: { turn: { status: 'completed' } } });
+      if (capacityAfterText) emit({ method: 'error', params: { message: 'Selected model is at capacity', willRetry: false } });
+      else emit({ method: 'turn/completed', params: { turn: { status: 'completed' } } });
     };
     const flatten = value => (value || []).flatMap(spec => spec.type === 'namespace' ? spec.tools.map(tool => ({ ...tool, namespace: spec.name })) : [{ ...spec, namespace: null }]);
     const call = () => {
@@ -45,7 +46,7 @@ function fakeLaunch({ hang = false, malformed = false, webSearch = false, echoIn
         else if (request.method === 'thread/start') { specs = request.params.dynamicTools; emit({ id: request.id, result: { thread: { id: 'thread' } } }); }
         else if (request.method === 'thread/inject_items') emit({ id: request.id, result: {} });
         else if (request.method === 'model/list') emit({ id: request.id, result: { data: [{ id: 'model', hidden: false }, { id: 'hidden-model', hidden: true }], nextCursor: null } });
-        else if (request.method === 'turn/start') { if (echoInput) emit({ method: 'item/started', params: { item: { type: 'userMessage', content: request.params.input } } }); emit({ id: request.id, result: { turn: { id: 'turn' } } }); if (errorEvent) { emit({ method: 'error', params: { message: errorEvent, willRetry: false } }); continue; } if (unknownTool) { emit({ id: 'rpc-bad', method: 'item/tool/call', params: { threadId: 'thread', turnId: 'turn', callId: 'bad', tool: 'client_missing_0', arguments: {} } }); continue; } if (webSearch) emit({method:'item/completed',params:{item:{type:'webSearch',id:'ws_test',query:'Python official',action:{type:'search',queries:['Python official'],query:'Python official'}}}}); call(); }
+        else if (request.method === 'turn/start') { if (echoInput) emit({ method: 'item/started', params: { item: { type: 'userMessage', content: request.params.input } } }); emit({ id: request.id, result: { turn: { id: 'turn' } } }); if (capacityOnce && !capacityFired) { capacityFired = true; emit({ method: 'error', params: { message: capacityOnce, willRetry: false } }); continue; } if (errorEvent) { emit({ method: 'error', params: { message: errorEvent, willRetry: false } }); continue; } if (unknownTool) { emit({ id: 'rpc-bad', method: 'item/tool/call', params: { threadId: 'thread', turnId: 'turn', callId: 'bad', tool: 'client_missing_0', arguments: {} } }); continue; } if (webSearch) emit({method:'item/completed',params:{item:{type:'webSearch',id:'ws_test',query:'Python official',action:{type:'search',queries:['Python official'],query:'Python official'}}}}); call(); }
         else if (request.result) { assert.equal(request.result.contentItems[0].text, step ? 'READ_OK' : 'PATCH_OK'); step++; call(); }
       }
       done();
@@ -237,14 +238,18 @@ test('deferToolSpecs leaves small tool sets unchanged and can be forced', () => 
  assert.ok(forced.specs.some(s => s.type === 'namespace'));
 });
 
-test('deferToolSpecs caps eager schema bytes and moves large non-core tools to namespaces', () => {
+test('deferToolSpecs applies the eager byte cap but never drops below the eager floor', () => {
  const raw = Array.from({ length: 7 }, (_, i) => ({ type: 'function', name: 'tool_' + i, description: 'd'.repeat(20000), parameters: { type: 'object', properties: { x: { type: 'string' } } } }));
  const mapped = toolSpecs(raw);
  const result = deferToolSpecs(mapped.specs, mapped.mappings, { mode: 'always', groupSize: 12, minEager: 4, maxEagerBytes: 32 * 1024 });
- const eagerBytes = result.specs.filter(s => s.type === 'function').reduce((n, s) => n + Buffer.byteLength(JSON.stringify(s)), 0);
- assert.ok(eagerBytes <= 32 * 1024);
+ assert.equal(result.stats.eager, 4, 'the floor wins over the soft byte budget');
  assert.ok(result.stats.deferred > 0);
  assert.ok(result.specs.some(s => s.type === 'namespace'));
+
+ const many = Array.from({ length: 13 }, (_, i) => ({ type: 'function', name: (i === 0 ? 'exec_command' : 'tool_' + i), description: 'd'.repeat(6000), parameters: { type: 'object', properties: { x: { type: 'string', description: 'x'.repeat(6000) } } } }));
+ const wideMapped = toolSpecs(many);
+ const wide = deferToolSpecs(wideMapped.specs, wideMapped.mappings, { mode: 'always', minEager: 6, maxEagerBytes: 64 * 1024 });
+ assert.equal(wide.stats.eager, 6, 'large schemas must not collapse the eager surface to one tool');
 });
 
 test('fitToolSpecs preserves deferred namespaces and deferLoading flags', () => {
@@ -376,14 +381,18 @@ test('model discovery uses the official app-server model/list endpoint', async (
   } finally { bridge.close(); }
 });
 
-test('tool specs always drop schema metadata and cap long descriptions, even under the size limit', () => {
+test('tool specs always drop schema metadata; descriptions shrink only when the RPC budget requires it', () => {
  const specs = [{ type: 'function', name: 'probe', description: 'd'.repeat(5000), inputSchema: { type: 'object', title: 'T', examples: [1], properties: { a: { type: 'string', default: 'x', description: 'p'.repeat(5000) } } } }];
- const fitted = fitToolSpecs(specs, 900 * 1024);
- assert.equal(fitted[0].description.length, 800);
- assert.equal(fitted[0].inputSchema.title, undefined);
- assert.equal(fitted[0].inputSchema.properties.a.default, undefined);
- assert.equal(fitted[0].inputSchema.properties.a.description.length, 800);
- assert.equal(fitted[0].inputSchema.properties.a.type, 'string');
+ const roomy = fitToolSpecs(specs, 900 * 1024);
+ assert.equal(roomy[0].description.length, 5000, 'description survives when it fits');
+ assert.equal(roomy[0].inputSchema.title, undefined, 'metadata is always dropped');
+ assert.equal(roomy[0].inputSchema.properties.a.default, undefined);
+ assert.equal(roomy[0].inputSchema.properties.a.description.length, 5000);
+ assert.equal(roomy[0].inputSchema.properties.a.type, 'string');
+ const huge = [{ type: 'function', name: 'probe', description: 'd'.repeat(600000), inputSchema: { type: 'object', properties: { a: { type: 'string', description: 'p'.repeat(600000) } } } }];
+ const tight = fitToolSpecs(huge, 900 * 1024);
+ assert.equal(tight[0].description.length, 800, 'oversized catalogs still fall back to the 800-char cap');
+ assert.equal(tight[0].inputSchema.properties.a.description.length, 800);
 });
 
 test('history injection drops earlier reasoning items but keeps messages', () => {
@@ -392,31 +401,100 @@ test('history injection drops earlier reasoning items but keeps messages', () =>
  assert.equal(items[0].type, 'message');
 });
 
-test('history trimming replaces old images and clips old huge tool outputs but keeps recent turns intact', () => {
- const big = 'a'.repeat(40000), img = { type: 'input_image', image_url: 'data:image/png;base64,AAAA' };
- const input = [
-  { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'old' }, img] },
-  { type: 'function_call', call_id: 'c1', name: 'x', arguments: '{}' },
-  { type: 'function_call_output', call_id: 'c1', output: big },
-  { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'mid' }, img] },
-  { type: 'function_call_output', call_id: 'c2', output: big },
-  { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'new' }, img] }
- ];
- const items = historyItems(input);
- assert.equal(items[0].content[1].text, '[image omitted]');
- assert.ok(items[2].output.length < 20000 && items[2].output.includes('chars omitted'));
- assert.equal(items[3].content[1].type, 'input_image');
- assert.equal(items[4].output.length, 40000);
- assert.equal(items[5].content[1].type, 'input_image');
+test('history trimming is opt-in and keeps 40 KB tool outputs plus every image by default', () => {
+  const big = 'a'.repeat(40000), img = { type: 'input_image', image_url: 'data:image/png;base64,AAAA' };
+  const input = [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'old' }, img] },
+    { type: 'function_call', call_id: 'c1', name: 'x', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'c1', output: big },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'mid' }, img] },
+    { type: 'function_call_output', call_id: 'c2', output: big },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'new' }, img] }
+  ];
+  const stats = {};
+  const items = historyItems(input, {}, stats);
+  assert.equal(items[0].content[1].type, 'input_image', 'images survive by default');
+  assert.equal(items[2].output.length, 40000, '40 KB output survives the 512 KB default');
+  assert.equal(items[4].output.length, 40000);
+  assert.equal(items[5].content[1].type, 'input_image');
+  assert.equal(stats.clipped, 0);
+  assert.equal(stats.omittedImages, 0);
+
+  const legacyStats = {};
+  const legacy = historyItems(input, { toolClip: 16 * 1024, imageTurns: 2 }, legacyStats);
+  assert.equal(legacy[0].content[1].text, '[image omitted by model-harbor history trim]');
+  assert.ok(legacy[2].output.length < 20000 && legacy[2].output.includes('chars omitted'));
+  assert.equal(legacy[3].content[1].type, 'input_image');
+  assert.equal(legacy[4].output.length, 40000);
+  assert.equal(legacy[5].content[1].type, 'input_image');
+  assert.equal(legacyStats.omittedImages, 1);
+  assert.ok(legacyStats.omittedChars > 0);
 });
 
-test('custom tool format hint survives description truncation', () => {
+test('MH_HISTORY_TOOL_CLIP is honoured and 0 disables clipping', () => {
+  const previous = process.env.MH_HISTORY_TOOL_CLIP;
+  const input = [
+    { type: 'message', role: 'user', content: 'old' },
+    { type: 'function_call_output', call_id: 'c', output: 'x'.repeat(90000) },
+    { type: 'message', role: 'user', content: 'mid' },
+    { type: 'message', role: 'user', content: 'new' }
+  ];
+  try {
+    process.env.MH_HISTORY_TOOL_CLIP = '10000';
+    const clipped = historyItems(input);
+    assert.ok(clipped[1].output.includes('chars omitted'));
+    process.env.MH_HISTORY_TOOL_CLIP = '0';
+    const full = historyItems(input);
+    assert.equal(full[1].output.length, 90000);
+  } finally {
+    if (previous === undefined) delete process.env.MH_HISTORY_TOOL_CLIP; else process.env.MH_HISTORY_TOOL_CLIP = previous;
+  }
+});
+
+test('capacity errors retry the same native turn before failing the task', async () => {
+  const fake = fakeLaunch({ capacityOnce: 'Selected model is at capacity. Please try a different model.' }), bridge = new NasAgentBridge({ launch: fake.launch });
+  const previous = process.env.MH_CAPACITY_BACKOFF_MS;
+  process.env.MH_CAPACITY_BACKOFF_MS = '0';
+  try {
+    const response = await bridge.run(p, 'model', { model: 'nas/model', input: [{ role: 'user', content: 'hello' }], tools }, 'responses');
+    assert.equal(response.status, 'completed');
+    assert.equal(fake.exchanges.filter(e => e.method === 'turn/start').length, 2, 'the failed turn is retried');
+    assert.equal(fake.children.length, 1, 'retry keeps the same app-server session');
+  } finally {
+    if (previous === undefined) delete process.env.MH_CAPACITY_BACKOFF_MS; else process.env.MH_CAPACITY_BACKOFF_MS = previous;
+    bridge.close();
+  }
+});
+
+test('schema enrichment without new tool names reuses the native session', async () => {
+  const fake = fakeLaunch(), bridge = new NasAgentBridge({ launch: fake.launch });
+  try {
+    const body = { model: 'nas/model', input: [{ role: 'user', content: 'Create and read result.txt' }], tools };
+    const first = await bridge.run(p, 'model', body, 'responses');
+    const call = first.output.find(i => i.type === 'custom_tool_call');
+    const enriched = [{ type: 'namespace', name: 'functions', tools: [
+      { type: 'custom', name: 'apply_patch', description: 'now with more docs', format: { type: 'grammar', syntax: 'lark', definition: 'start: /.+/s' } },
+      { type: 'function', name: 'read_file', description: 'read a file', parameters: { type: 'object', properties: { path: { type: 'string' }, encoding: { type: 'string' } }, required: ['path'] } }
+    ] }];
+    const continuation = { model: 'nas/model', tools: enriched, input: [...body.input, ...first.output, { type: 'custom_tool_call_output', call_id: call.call_id, output: 'PATCH_OK' }] };
+    const second = await bridge.run(p, 'model', continuation, 'responses');
+    assert.equal(second.metadata?.model_harbor_session, undefined, 'no reconstruction metadata');
+    assert.equal(fake.children.length, 1, 'schema enrichment must not rebuild the session');
+    assert.equal(second.output[0].name, 'read_file');
+  } finally { bridge.close(); }
+});
+
+test('fitToolSpecs keeps full descriptions when the catalog fits and truncates only under pressure', () => {
  const specs = toolSpecs([{ type: 'custom', name: 'apply_patch', description: 'D'.repeat(2000), format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' } }]).specs;
- const fitted = fitToolSpecs(specs, 900 * 1024);
- assert.ok(fitted[0].description.includes('MUST follow this format'));
- assert.ok(fitted[0].description.includes('start: begin_patch'));
- assert.equal(fitted[0].formatHint, undefined);
- assert.ok(fitted[0].description.startsWith('Client tool'));
+ const roomy = fitToolSpecs(specs, 900 * 1024);
+ assert.ok(roomy[0].description.includes('D'.repeat(2000)), 'full description survives when it fits');
+ assert.ok(roomy[0].description.includes('MUST follow this format'));
+ assert.ok(roomy[0].description.includes('start: begin_patch'));
+ assert.equal(roomy[0].formatHint, undefined);
+ const wide = toolSpecs([{ type: 'custom', name: 'apply_patch', description: 'D'.repeat(200000), format: { type: 'grammar', syntax: 'lark', definition: 'start: begin_patch hunk+ end_patch' } }]).specs;
+ const narrow = fitToolSpecs(wide, 64 * 1024);
+ assert.ok(narrow[0].description.length < 200000, 'tight budget still truncates');
+ assert.ok(narrow[0].description.includes('start: begin_patch'), 'format hint survives truncation');
 });
 
 test('app-server error events keep their upstream detail', async () => {
@@ -431,4 +509,43 @@ test('unknown app-server tool calls report the requested name', async () => {
   const b = new NasAgentBridge({ launch: fake.launch });
   await assert.rejects(b.run(p, 'model', { model: 'm', input: [{ role: 'user', content: 'hi' }] }, 'responses'), e => e.status === 502 && /unregistered tool: client_missing_0/.test(e.message));
   b.close();
+});
+
+
+test('route and native capacity retries share one budget, including account failover', async () => {
+  const { routeWithFailover } = await import('../src/upstream.js');
+  const { Store } = await import('../src/store.js');
+  const fake = fakeLaunch({ errorEvent: 'Selected model is at capacity' }), bridge = new NasAgentBridge({ launch: fake.launch });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mh-budget-'));
+  const previous = process.env.MH_CAPACITY_BACKOFF_MS; process.env.MH_CAPACITY_BACKOFF_MS = '0';
+  try {
+    const store = new Store(dir);
+    for (const id of ['one', 'two']) store.upsert({ ...p, id, models: ['model'], execution: 'ssh-docker' });
+    store.upsertGroup({ id: 'group', name: 'group', members: ['one', 'two'] });
+    const res = {};
+    await assert.rejects(routeWithFailover(store, store.resolve('group/model'), { model: 'group/model', input: 'hi' }, 'responses', res, undefined, bridge), /capacity/);
+    assert.equal(fake.exchanges.filter(e => e.method === 'turn/start').length, 4, 'one initial attempt per account and TWO shared retries, never nine attempts per account');
+    assert.equal(res.retryBudget.retries, 2);
+    assert.equal(fake.children.length, 2, 'native retries reuse the same process');
+  } finally { bridge.close(); if (previous === undefined) delete process.env.MH_CAPACITY_BACKOFF_MS; else process.env.MH_CAPACITY_BACKOFF_MS = previous; fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('compatibility probe verifies native methods without starting inference', async () => {
+  const fake = fakeLaunch(), bridge = new NasAgentBridge({ launch: fake.launch });
+  try {
+    await bridge.models(p, undefined, { probe: true });
+    assert.equal(bridge.capabilities.get('nas').modelList, 'verified');
+    assert.equal(bridge.capabilities.get('nas').historyInjection, 'verified');
+    assert.equal(fake.exchanges.filter(e => e.method === 'turn/start').length, 0);
+    assert.ok(fake.children.every(c => c.killed));
+  } finally { bridge.close(); }
+});
+
+
+test('completed text without deltas also prevents a native capacity replay', async () => {
+  const fake = fakeLaunch({ capacityAfterText: true }), bridge = new NasAgentBridge({ launch: fake.launch });
+  try {
+    await assert.rejects(bridge.run(p, 'model', { model: 'nas/model', input: 'hi' }, 'responses'), /capacity/);
+    assert.equal(fake.exchanges.filter(e => e.method === 'turn/start').length, 1);
+  } finally { bridge.close(); }
 });

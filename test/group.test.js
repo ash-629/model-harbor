@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Store, HttpError } from '../src/store.js';
-import { isQuotaError, routeWithFailover } from '../src/upstream.js';
+import { isQuotaError, isCapacityError, routeWithFailover } from '../src/upstream.js';
 
 function tempStore() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'model-harbor-group-'));
@@ -105,6 +105,32 @@ test('non-quota errors are not retried and all-cooling groups report exhaustion'
   assert.ok(store.groupCooldown('codex', 'nas2'));
   await assert.rejects(routeWithFailover(store, store.resolve('codex/gpt-6.1-sol'), { model: 'codex/gpt-6.1-sol', messages: [] }, 'chat/completions', {}, undefined, exhausted), /额度暂不可用/);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('capacity errors retry briefly and then fail over to the next account', async () => {
+  const { store, dir } = tempStore();
+  addCodex(store, 'nas');
+  addCodex(store, 'nas2');
+  store.upsertGroup({ id: 'codex', name: 'Codex 组', members: ['nas', 'nas2'] });
+  const previous = process.env.MH_CAPACITY_BACKOFF_MS;
+  process.env.MH_CAPACITY_BACKOFF_MS = '0';
+  const calls = [];
+  const agent = fakeAgent({
+    nas: () => { calls.push('nas'); throw new HttpError(502, '远程 Codex 工具桥接失败：Selected model is at capacity. Please try a different model.'); },
+    nas2: (p, model) => { calls.push('nas2'); return response('nas2', model); }
+  });
+  try {
+    const output = await routeWithFailover(store, store.resolve('codex/gpt-6.1-sol'), { model: 'codex/gpt-6.1-sol', messages: [{ role: 'user', content: 'hi' }] }, 'chat/completions', {}, undefined, agent);
+    assert.equal(output.choices[0].message.content, 'from nas2');
+    assert.deepEqual(calls, ['nas', 'nas', 'nas', 'nas2'], 'two retries before failover');
+    const cooldown = store.groupCooldown('codex', 'nas');
+    assert.ok(cooldown && Number(cooldown.until) - Date.now() <= 61 * 1000, 'capacity cooldown is short');
+    assert.equal(isCapacityError(new HttpError(502, 'Selected model is at capacity.')), true);
+    assert.equal(isCapacityError(new HttpError(502, 'insufficient_quota')), false);
+  } finally {
+    if (previous === undefined) delete process.env.MH_CAPACITY_BACKOFF_MS; else process.env.MH_CAPACITY_BACKOFF_MS = previous;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('quota classifier distinguishes quota and rate limits', () => {

@@ -1,3 +1,4 @@
+import { MediaJobControls } from './media-jobs.js';
 // G-03: durable Grok video jobs and bounded local output storage.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -6,9 +7,9 @@ import { HttpError } from './store.js';
 import { fromBase64 } from './images.js';
 import { grokVideoRun, videoInfo, videoAspects, videoDurations, videoResolutions } from './grok-video.js';
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
-export class VideoJobs {
+export class VideoJobs extends MediaJobControls {
   constructor(store, providers, dir, { execute } = {}) {
-    this.store = store; this.providers = providers; this.dir = path.join(dir, 'videos');
+    super();    this.store = store; this.providers = providers; this.dir = path.join(dir, 'videos');
     this.jobs = new Map(); this.queue = []; this.active = false; this.controllers = new Set();
     this.execute = execute || (async (p, job, signal) => {
       const data = await grokVideoRun(p, 'generate', job, signal);
@@ -17,6 +18,7 @@ export class VideoJobs {
       return { bytes, ext: data.ext || 'mp4' };
     });
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    this.initControls();
     for (const file of fs.readdirSync(this.dir)) {
       if (!file.endsWith('.json') || !uuid.test(file.slice(0, -5))) continue;
       let job; try { job = JSON.parse(fs.readFileSync(path.join(this.dir, file), 'utf8')); } catch { continue; }
@@ -32,6 +34,7 @@ export class VideoJobs {
   list() { return [...this.jobs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map(job => this.public(job)); }
   get(id) { const job = uuid.test(id) && this.jobs.get(id); if (!job) throw new HttpError(404, 'Video task not found'); return job; }
   create(input) {
+    this.assertAccepting();
     const p = structuredClone(this.providers.get(input.providerId));
     if (!p.enabled) throw new HttpError(400, 'Video provider is disabled');
     const prompt = typeof input.prompt === 'string' ? input.prompt.trim() : '';
@@ -53,13 +56,13 @@ export class VideoJobs {
     if (this.queue.length >= 10) throw new HttpError(429, 'Video queue is full. Wait for a task to finish.');
     const job = { id: crypto.randomUUID(), providerId: p.id, providerName: p.name, providerType: p.type, model: p.model, prompt, aspect, duration, resolution,
       references: validated, referenceCount: validated.length, status: 'queued', createdAt: new Date().toISOString() };
-    this.jobs.set(job.id, job); this.save(job); this.queue.push({ p, job }); queueMicrotask(() => this.pump()); return this.public(job);
+    this.rememberReferences(job); this.jobs.set(job.id, job); this.save(job); this.queue.push({ p, job }); queueMicrotask(() => this.pump()); return this.public(job);
   }
   async pump() {
-    if (this.active) return; this.active = true;
+    if (this.active || this.stopped) return; this.active = true;
     try {
-      while (this.queue.length) {
-        const { p, job } = this.queue.shift(), controller = new AbortController(); this.controllers.add(controller);
+      while (this.queue.length && !this.stopped) {
+        const { p, job } = this.queue.shift(), controller = new AbortController(); this.controllers.add(controller); this.jobControllers.set(job.id, controller);
         const timer = setTimeout(() => controller.abort(), (p.timeout + 20) * 1000);
         job.status = 'running'; job.startedAt = new Date().toISOString(); this.save(job);
         try {
@@ -69,9 +72,9 @@ export class VideoJobs {
           fs.writeFileSync(path.join(this.dir, job.id + '.' + info.ext), output.bytes, { mode: 0o600, flag: 'wx' });
           Object.assign(job, info, { status: 'completed', bytes: output.bytes.length });
         } catch (e) {
-          job.status = 'failed'; job.error = controller.signal.aborted ? 'Video generation timed out' : e instanceof HttpError ? e.message : 'Video generation failed. Check provider settings and network connectivity.';
+          job.status = job.cancelRequested ? 'cancelled' : 'failed'; job.error = this.stopped ? '服务重启中断了任务；结果尚未确认，请检查后手动重试。' : job.cancelRequested ? '任务已取消；上游可能已执行，请检查后再重试。' : controller.signal.aborted ? 'Video generation timed out' : e instanceof HttpError ? e.message : 'Video generation failed. Check provider settings and network connectivity.';
         } finally {
-          delete job.references; clearTimeout(timer); this.controllers.delete(controller); job.finishedAt = new Date().toISOString(); this.save(job);
+          delete job.references; clearTimeout(timer); this.controllers.delete(controller); this.jobControllers.delete(job.id); job.finishedAt = new Date().toISOString(); this.save(job);
         }
       }
     } finally { this.active = false; }
@@ -87,7 +90,7 @@ export class VideoJobs {
     const p = this.providers.get(id);
     return grokVideoRun(p, 'check', null, AbortSignal.timeout(45000));
   }
-  close() { for (const controller of this.controllers) controller.abort(); this.queue = []; }
+
 }
 function imageInfoForReference(bytes) {
   if (bytes.length >= 24 && bytes.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))) return { mime: 'image/png' };

@@ -5,7 +5,7 @@ import { messages, setLanguage, getLanguage, t, translateError } from '../public
 
 test('translations cover the static Chinese UI and translated dynamic messages', () => {
   const html = fs.readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
-  const script = ['app.js', 'image-ui.js'].map(file => fs.readFileSync(new URL('../public/' + file, import.meta.url), 'utf8')).join('\n');
+  const script = ['app.js', 'image-ui.js', 'video-ui.js', 'media-controls.js'].map(file => fs.readFileSync(new URL('../public/' + file, import.meta.url), 'utf8')).join('\n');
   const chinese = /[\u4e00-\u9fff]/;
   const strings = [
     ...[...html.matchAll(/>([^<>]+)</g)].map(m => m[1].trim()),

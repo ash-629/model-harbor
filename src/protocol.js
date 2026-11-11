@@ -1,3 +1,4 @@
+import { markOutput } from './request-runtime.js';
 // F-06, R-04: stateless Responses -> Chat bridge (text, images, function tools).
 import crypto from 'node:crypto';
 import { HttpError } from './store.js';
@@ -273,6 +274,7 @@ export function openSSE(res) {
   res.flushHeaders();
 }
 export async function writeSSE(res, data, event) {
+  if (data && typeof data === 'object' && ((data.type?.endsWith('.delta') && data.delta) || data.choices?.some(c => c.delta?.content || c.delta?.tool_calls) || data.type === 'response.output_item.added' && data.item?.type !== 'message')) markOutput(res);
   if (res.destroyed) throw new Error('Client disconnected');
   const frame = (event ? `event: ${event}\n` : '') + `data: ${typeof data === 'string' ? data : JSON.stringify(data)}\n\n`;
   if (!res.write(frame)) await new Promise((resolve, reject) => {

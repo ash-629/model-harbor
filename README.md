@@ -128,7 +128,8 @@ access / refresh 令牌使用 AES-256-GCM 加密保存在 `data/config.json` 的
 
 - Codex 工具较多或 schema 较大时可启用 DeferLoading，把非核心工具延迟到 namespace；通过 `MH_DEFER_TOOLS` 等环境变量控制。
 - OpenCode Go 可在转发前压缩历史 data: 图片；` 供应商可选启用工具描述和旧工具结果裁剪。
-- app-server 会话失效或工具目录变化时，网关可以重建临时线程并注入可读历史，继续处理工具结果。
+- app-server 会话失效或工具目录变化时，网关可以重建临时线程并注入可读历史，继续处理工具结果；工具 schema 变化但工具名不变时复用原会话。
+- Codex 历史裁剪已默认放宽：单条工具结果 512 KB 内原样保留，历史图片默认不丢弃，命中裁剪时日志打印 `history trimmed` 及省略字符数。
 - DeepSeek 思考模式的工具回合会补齐客户端缺失的 reasoning_content；不可恢复的原始推理不会被伪造。
 - Grok/OpenCode 的上游协议差异会在网关内部做定向转换，并保留客户端可用的工具调用契约。
 
@@ -148,6 +149,12 @@ access / refresh 令牌使用 AES-256-GCM 加密保存在 `data/config.json` 的
 | `MH_TOOL_WAIT_SECONDS` | 1800 | 客户端工具结果等待时限 |
 | `MH_IMAGE_OPTIMIZATION` | opencode | 图片压缩：off / opencode / all |
 | `MH_DEFER_TOOLS` | auto | Codex 工具延迟加载：off / auto / always |
+| `MH_DEFER_MIN_EAGER` | 4（部署 6） | 常驻（非延迟）工具数量下限 |
+| `MH_HISTORY_TOOL_CLIP` | 524288 | 历史工具结果保留字符数，0 = 不裁剪 |
+| `MH_HISTORY_IMAGE_TURNS` | 0 | 历史图片保留最近 N 个用户轮次，0 = 全部保留 |
+| `MH_HISTORY_KEEP_REASONING` | 0 | 1 = 重建历史时保留 reasoning 项 |
+| `MH_CAPACITY_RETRIES` | 2 | 上游 at capacity 时同一回合重试次数 |
+| `MH_CAPACITY_BACKOFF_MS` | 2000 | at capacity 重试退避基数（毫秒） |
 
 完整示例见 `。工具下载代理使用 `MH_TOOL_PROXY`（兼容 `TOOL_DOWNLOAD_PROXY`）。
 
@@ -177,3 +184,17 @@ Node 回归测试覆盖管理鉴权、供应商 CRUD、协议转换、SSE、工�
 ~~~
 
 测试使用模拟上游和临时数据，不调用真实模型或真实账号。字体许可证见 `public/FONT-LICENSE.txt`。
+
+
+## Reliability and operations (0.2.0)
+
+- Codex capacity retries share a request-wide budget (`MH_CAPACITY_RETRIES`, default 2). Each account can receive its initial attempt; the group shares at most two additional attempts. Native retries reuse the same process. Retry backoff is cancellable and bounded by `MH_RETRY_WINDOW_SECONDS` (default 30). No account switching or capacity replay occurs after model output or native search execution.
+- Account groups stream Responses and Chat text as it arrives. A single SSE connection and response ID survive failures before output, with keepalives during inference. Client tools still execute on the client.
+- The request page shows the build ID, active requests, 24-hour/7-day summaries, first-output latency, usage coverage, actual provider, retries, and session reconstruction. The journal stores no prompt, tool body, raw upstream error or credential. Retention is bounded by 7 days, 5,000 rows and 8 MiB; the table shows the latest 100 rows. These are retained-window summaries, not unlimited traffic totals. Unknown usage is not reported as zero consumption.
+- Codex compatibility checks use `initialize`, `model/list`, `thread/start`, and empty `thread/inject_items` without starting model inference. CLI versions absent from initialization are shown as unknown, and method checks report verified/unsupported/failed independently. Run these checks before CLI upgrades.
+- Image/video history supports pagination, cancellation, explicit retry, keeping works, individual/selected deletion and cleanup previews. Cleanup only deletes the exact previewed set; active and kept tasks are protected. Existing works are never automatically deleted. New task reference images are stored separately for 7 days for manual retries; kept tasks retain their references. Old tasks without stored references require re-upload. Cancellation or interrupted generation cannot establish whether upstream quota was consumed; retries always require a deliberate user action.
+- SIGTERM/SIGINT stop admission, let active requests and media work finish for up to `MH_SHUTDOWN_SECONDS` (default 60), abort remaining work, and flush diagnostics. Interrupted tasks are marked failed with an explicit manual retry path; there is no automatic generation replay. Compose allows 75 seconds for shutdown. Authenticated operations endpoints `/api/operations/drain` and `/api/operations/resume` support deployment preparation; `/api/diagnostics` reports active work.
+- Build with `--build-arg BUILD_ID=<release-or-commit>` and an immutable image tag. `/health` reports version/build and draining state. The Docker context includes only runtime source, public assets, scripts and package manifests; runtime data, SSH credentials and old source backups are excluded. Keep backups outside the build context and never replace `data/`, `ssh/`, or private environment files during a release.
+- `npm run check` validates all JavaScript and Python source syntax; `npm test` includes HTTP streaming/failover, cancellation, protocol compatibility, journal persistence and media lifecycle regressions. GitHub Actions runs both on Node 22.
+
+The NAS remains the only maintained deployment. Publishing uses a disposable source-only checkout; it contains no runtime data or credentials and does not run a local gateway. Codex tool/history/image trimming remains disabled in the existing production baseline.

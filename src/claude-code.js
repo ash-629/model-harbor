@@ -1,4 +1,5 @@
 // CT-01..CT-06: official Claude CLI structured client-tool bridge over SSH.
+import { completeMetrics, markOutput } from './request-runtime.js';
 import { spawn } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { HttpError } from './store.js';
@@ -56,6 +57,7 @@ export class ClaudeCodeBridge {
   }
 }
 export async function sendClaude(bridge,p,model,body,endpoint,res,signal){
+  res.apiMetrics = { provider: p.id, protocol: endpoint, completion: 'pending', usage: null };
   // Validate before opening SSE, then keep long CLI calls alive. Structured
   // tool calls are emitted only after the completed result passes validation.
   const context=claudeContext(body,endpoint);claudeSchema(context);
@@ -63,6 +65,7 @@ export async function sendClaude(bridge,p,model,body,endpoint,res,signal){
   const emit=(type,fields)=>writeSSE(res,{type,sequence_number:sequence++,...fields},type);
   if(body.stream){openSSE(res);heartbeat=setInterval(()=>{if(!res.destroyed)res.write(': keepalive\n\n');},15000);heartbeat.unref();}
   let response;try{response=await bridge.run(p,model,body,endpoint,signal);}finally{clearInterval(heartbeat);}
+  completeMetrics(res, response); if (response.output?.length) markOutput(res);
   if(!body.stream)return endpoint==='responses'?response:agentChat(response);
   if(endpoint==='responses'){
     const initial={...response,status:'in_progress',output:[],usage:null};

@@ -1,3 +1,4 @@
+import { createMediaControls } from './media-controls.js';
 // G-04/G-05: video workspace for Grok subscription generation with up to 3 references.
 import { t, translateError } from './i18n.js';
 const $ = id => document.getElementById(id);
@@ -6,6 +7,7 @@ const active = job => ['queued', 'running'].includes(job.status);
 export function createVideoUI({ api, toast }) {
   let providers = [], jobs = [], visible = false, loading = false, submitting = false, checking = false, poll;
   let references = [], uploading = false;
+  const controls = createMediaControls({ kind: 'video', api, reload: load, error, toast });
   const errorMessages = new Map();
   function error(id, message) {
     errorMessages.set(id, message || ''); $(id).hidden = !message; $(id).textContent = translateError(message || '');
@@ -14,15 +16,15 @@ export function createVideoUI({ api, toast }) {
     if (loading) { await loading; if (force) return load(); return; }
     loading = (async () => {
       try {
-        const [p, j] = await Promise.all([api('/video/providers'), api('/video/jobs')]);
-        providers = p.providers; jobs = j.jobs; render();
+        const [p, j] = await Promise.all([api('/video/providers'), api('/video/jobs' + controls.query())]);
+        providers = p.providers; jobs = j.jobs; controls.renderPage(j); render();
       } catch (e) { error('video-error', e.message); }
     })();
     try { await loading; } finally { loading = false; schedule(); }
   }
   function schedule() {
     clearTimeout(poll);
-    if (visible && jobs.some(active)) poll = setTimeout(() => load(), 3000);
+    if (visible && (controls.active || jobs.some(active))) poll = setTimeout(() => load(), 3000);
   }
   function setVisible(value) { visible = value; if (visible) load(); else clearTimeout(poll); }
   function provider() { return providers.find(p => p.id === $('video-provider').value); }
@@ -32,6 +34,7 @@ export function createVideoUI({ api, toast }) {
     $('video-submit').disabled = submitting || uploading || !p?.enabled;
   }
   function render() {
+    controls.render();
     const selected = $('video-provider').value, enabled = providers.filter(p => p.enabled);
     $('video-provider').innerHTML = enabled.length ? enabled.map(p => `<option value="${h(p.id)}">${h(p.name)}</option>`).join('') : `<option value="">${t('请先配置视频服务商')}</option>`;
     if (enabled.some(p => p.id === selected)) $('video-provider').value = selected;
@@ -41,10 +44,10 @@ export function createVideoUI({ api, toast }) {
     $('video-providers-list').innerHTML = providers.map(p => `<article class="image-provider-item"><div class="image-provider-top"><strong>${h(p.name)}</strong><span class="status-pill ${p.enabled ? '' : 'off'}">${t(p.enabled ? '已启用' : '已停用')}</span></div><p>Grok · ${h(p.model || 'grok-4.7')} · ${h(p.execution === 'ssh-docker' ? 'SSH + Docker' : p.execution === 'ssh' ? 'SSH' : 'Local')}</p><div class="image-provider-actions"><button class="button ghost" data-video-check="${h(p.id)}" ${checking ? 'disabled' : ''}>${t(checking ? '检查中…' : '检查配置')}</button></div></article>`).join('');
     $('video-jobs-empty').hidden = Boolean(jobs.length);
     $('video-jobs').innerHTML = jobs.map(job => {
-      const status = { queued: t('排队中'), running: t('生成中'), completed: t('已完成'), failed: t('生成失败') }[job.status] || job.status;
+      const status = { queued: t('排队中'), running: t('生成中'), completed: t('已完成'), failed: t('生成失败'), cancelled: t('已取消') }[job.status] || job.status;
       const elapsed = job.finishedAt && job.startedAt ? ` · ${Math.max(0, (Date.parse(job.finishedAt) - Date.parse(job.startedAt)) / 1000).toFixed(0)} s` : '';
       const preview = job.videoUrl ? `<video src="${h(job.videoUrl)}" controls preload="metadata" aria-label="${h(job.prompt)}"></video>` : `<span aria-hidden="true">${job.status === 'failed' ? '×' : '▷'}</span><p>${h(status)}</p>${job.status === 'queued' ? `<small>${t('等待前面的任务完成')}</small>` : ''}`;
-      return `<article class="panel image-job"><div class="image-job-preview ${active(job) ? 'image-in-progress' : ''}">${preview}</div><div class="image-job-body"><div class="image-job-heading"><strong>${h(status)}</strong><small>${h(job.aspect)} · ${job.duration}s · ${h(job.resolution)}${elapsed}</small></div><div class="image-job-prompt">${h(job.prompt)}</div>${job.error ? `<div class="notice error">${h(translateError(job.error))}</div>` : ''}<div class="image-job-actions"><span class="small">${h(job.providerName || '')} · ${job.referenceCount || 0} ${t('张参考图')}</span><div>${job.videoUrl ? `<a class="button ghost" href="${h(job.videoUrl)}?download=1" download>${t('下载视频')}</a>` : ''}<button class="button ghost" data-video-reuse="${h(job.id)}">${t('复用描述')}</button></div></div></div></article>`;
+      return `<article class="panel image-job"><div class="image-job-preview ${active(job) ? 'image-in-progress' : ''}">${preview}</div><div class="image-job-body"><div class="image-job-heading"><strong>${h(status)}</strong><small>${h(job.aspect)} · ${job.duration}s · ${h(job.resolution)}${elapsed}</small></div><div class="image-job-prompt">${h(job.prompt)}</div>${job.error ? `<div class="notice error">${h(translateError(job.error))}</div>` : ''}${controls.actions(job)}<div class="image-job-actions"><span class="small">${h(job.providerName || '')} · ${job.referenceCount || 0} ${t('张参考图')}</span><div>${job.videoUrl ? `<a class="button ghost" href="${h(job.videoUrl)}?download=1" download>${t('下载视频')}</a>` : ''}<button class="button ghost" data-video-reuse="${h(job.id)}">${t('复用描述')}</button></div></div></div></article>`;
     }).join('');
     renderReferences();
   }
